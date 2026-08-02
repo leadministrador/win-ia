@@ -266,15 +266,24 @@ def parse_race(soup, numero):
 
     # Buscar la tabla de participantes: la primera que tenga columna 'Ejemplar'
     # y filas con enlaces a /ejemplares/.
+    # Se recorre en orden: todo lo que aparezca DESPUES de un titulo
+    # 'RETIRADOS' corresponde a caballos que no corren.
     participants = []
     tablas_vistas = set()
+    en_retirados = False
     for node in nodes:
+        texto_nodo = clean(node.get_text(" ")) if hasattr(node, "get_text") else ""
         if getattr(node, "name", None) != "table":
+            # Un titulo/celda corto que diga RETIRADOS marca el corte.
+            if re.fullmatch(r"RETIRADOS?", texto_nodo, re.I):
+                en_retirados = True
             continue
         if id(node) in tablas_vistas:
             continue
         tablas_vistas.add(id(node))
         filas = _parse_participants_table(node)
+        for fila in filas:
+            fila["retirado"] = en_retirados
         if filas:
             participants.extend(filas)
 
@@ -286,14 +295,6 @@ def parse_race(soup, numero):
         vistos.add(p["nombre"])
         unicos.append(p)
     participants = unicos
-
-    # Marcar los retirados: aparecen bajo un titulo 'RETIRADOS'.
-    m_ret = re.search(r"RETIRADOS?\s*(.{0,1200})$", block, re.I | re.S)
-    if m_ret:
-        cola = m_ret.group(1)
-        for p in participants:
-            if re.search(re.escape(p["nombre"]), cola, re.I):
-                p["retirado"] = True
 
     return {
         "carrera": numero,
