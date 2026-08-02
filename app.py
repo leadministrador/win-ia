@@ -103,19 +103,154 @@ def extract_races_from_meeting(soup):
             races.append({"numero": int(m.group(1)), "titulo": clean(h.get_text(" "))})
     return races
 
+def _cell_text(cell):
+    return clean(cell.get_text(" ", strip=True))
+
+
+def _map_headers(header_cells):
+    """
+    Mapea los encabezados de la tabla a indices de columna.
+    La tabla del Stud Book usa: P | O | Ejemplar | S | P | E | Kg | Jockey | Kg |
+    Entrenador | Caballeriza | Cpos | Acum. | Pago
+    Hay DOS columnas 'Kg': la anterior al jockey es el peso corporal del animal,
+    la posterior es el peso que lleva encima (la que importa para el analisis).
+    """
+    idx = {}
+    kg_positions = []
+    for i, cell in enumerate(header_cells):
+        h = _cell_text(cell).lower().rstrip(".")
+        if h == "ejemplar" and "nombre" not in idx:
+            idx["nombre"] = i
+        elif h == "jockey" and "jockey" not in idx:
+            idx["jockey"] = i
+        elif h == "entrenador" and "entrenador" not in idx:
+            idx["entrenador"] = i
+        elif h == "caballeriza" and "caballeriza" not in idx:
+            idx["caballeriza"] = i
+        elif h == "o" and "numero" not in idx:
+            idx["numero"] = i
+        elif h == "p" and "puesto" not in idx:
+            idx["puesto"] = i          # el primer 'P' es el puesto final
+        elif h == "e" and "edad" not in idx:
+            idx["edad"] = i
+        elif h == "s" and "sexo" not in idx:
+            idx["sexo"] = i
+        elif h == "kg":
+            kg_positions.append(i)
+        elif h in ("cpos", "cuerpos"):
+            idx["cuerpos"] = i
+        elif h == "pago":
+            idx["pago"] = i
+
+    # Resolver cual de los dos 'Kg' es el peso que lleva encima.
+    jockey_i = idx.get("jockey")
+    if kg_positions:
+        if jockey_i is not None:
+            despues = [k for k in kg_positions if k > jockey_i]
+            antes = [k for k in kg_positions if k < jockey_i]
+            if despues:
+                idx["peso"] = despues[0]
+            if antes:
+                idx["peso_corporal"] = antes[-1]
+        if "peso" not in idx:
+            idx["peso"] = kg_positions[-1]
+    return idx
+
+
+def _find_header_row(table):
+    """Devuelve las celdas del encabezado, sea <th> o la primera fila."""
+    for tr in table.find_all("tr"):
+        ths = tr.find_all("th")
+        if ths:
+            return ths
+    first = table.find("tr")
+    return first.find_all(["th", "td"]) if first else []
+
+
+def _parse_participants_table(table):
+    """Lee una tabla de participantes y devuelve la lista de caballos."""
+    header_cells = _find_header_row(table)
+    if not header_cells:
+        return []
+    idx = _map_headers(header_cells)
+    if "nombre" not in idx:
+        return []
+
+    participants = []
+    header_texts = {_cell_text(c).lower() for c in header_cells}
+
+    for tr in table.find_all("tr"):
+        cells = tr.find_all("td")
+        if not cells or len(cells) <= idx["nombre"]:
+            continue
+        # saltear la fila de encabezado si vino como td
+        if {_cell_text(c).lower() for c in cells} & header_texts == {
+            _cell_text(c).lower() for c in cells
+        }:
+            continue
+
+        name_cell = cells[idx["nombre"]]
+        link = name_cell.find("a", href=True)
+        name = clean(link.get_text(" ")) if link else _cell_text(name_cell)
+        if not name:
+            continue
+
+        def col(key):
+            i = idx.get(key)
+            if i is None or i >= len(cells):
+                return ""
+            return _cell_text(cells[i])
+
+        peso = col("peso").replace(",", ".")
+        peso = peso if re.fullmatch(r"\d{2}(\.\d)?", peso or "") else ""
+
+        numero_raw = col("numero")
+        numero = int(numero_raw) if numero_raw.isdigit() else None
+
+        puesto_raw = col("puesto")
+        puesto = int(puesto_raw) if puesto_raw.isdigit() else None
+
+        detalle_partes = [
+            f"Jockey: {col('jockey')}" if col("jockey") else "",
+            f"Entrenador: {col('entrenador')}" if col("entrenador") else "",
+            f"Caballeriza: {col('caballeriza')}" if col("caballeriza") else "",
+            f"Edad: {col('edad')}" if col("edad") else "",
+            f"Sexo: {col('sexo')}" if col("sexo") else "",
+        ]
+
+        participants.append({
+            "numero": numero,
+            "nombre": name,
+            "perfil": urljoin(BASE, link["href"]) if link else "",
+            "jockey": col("jockey"),
+            "entrenador": col("entrenador"),
+            "caballeriza": col("caballeriza"),
+            "edad": col("edad"),
+            "sexo_tabla": col("sexo"),
+            "peso": peso,
+            "peso_corporal": col("peso_corporal"),
+            "puesto": puesto,
+            "detalle": " · ".join(p for p in detalle_partes if p)[:700],
+            "retirado": False,
+        })
+
+    return participants
+
+
 def parse_race(soup, numero):
     heading = None
     pat = re.compile(rf"^{numero}\s*[º°ª]?\s*Carrera\b", re.I)
-    for h in soup.find_all(["h2","h3"]):
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
         if pat.search(clean(h.get_text(" "))):
             heading = h
             break
     if not heading:
         return None
 
+    # Recolectar todo lo que va desde este encabezado hasta el de la carrera siguiente.
     nodes = []
     for node in heading.find_all_next():
-        if node is not heading and node.name in ["h2","h3"] and re.search(
+        if node is not heading and node.name in ["h1", "h2", "h3", "h4"] and re.search(
             r"\d+\s*[º°ª]?\s*Carrera\b", clean(node.get_text(" ")), re.I
         ):
             break
@@ -129,26 +264,36 @@ def parse_race(soup, numero):
         m = re.search(pattern, block, re.I)
         return clean(m.group(1)) if m else ""
 
-    participants, seen = [], set()
-    for a in nodes:
-        if getattr(a, "name", None) != "a":
+    # Buscar la tabla de participantes: la primera que tenga columna 'Ejemplar'
+    # y filas con enlaces a /ejemplares/.
+    participants = []
+    tablas_vistas = set()
+    for node in nodes:
+        if getattr(node, "name", None) != "table":
             continue
-        href = a.get("href", "")
-        name = clean(a.get_text(" "))
-        if "/ejemplares/" not in href or not name or name in seen:
+        if id(node) in tablas_vistas:
             continue
-        seen.add(name)
-        context = clean(a.parent.get_text(" ", strip=True)) if a.parent else name
-        n = re.search(r"(?:^|\s)(\d{1,2})\s+" + re.escape(name), context, re.I)
-        kg = re.findall(r"\b(\d{2}(?:[.,]\d)?)\b", context)
-        participants.append({
-            "numero": int(n.group(1)) if n else None,
-            "nombre": name,
-            "perfil": urljoin(BASE, href),
-            "detalle": context[:700],
-            "peso": kg[-1].replace(",", ".") if kg else "",
-            "retirado": False
-        })
+        tablas_vistas.add(id(node))
+        filas = _parse_participants_table(node)
+        if filas:
+            participants.extend(filas)
+
+    # Deduplicar por nombre conservando el orden de aparicion.
+    vistos, unicos = set(), []
+    for p in participants:
+        if p["nombre"] in vistos:
+            continue
+        vistos.add(p["nombre"])
+        unicos.append(p)
+    participants = unicos
+
+    # Marcar los retirados: aparecen bajo un titulo 'RETIRADOS'.
+    m_ret = re.search(r"RETIRADOS?\s*(.{0,1200})$", block, re.I | re.S)
+    if m_ret:
+        cola = m_ret.group(1)
+        for p in participants:
+            if re.search(re.escape(p["nombre"]), cola, re.I):
+                p["retirado"] = True
 
     return {
         "carrera": numero,
@@ -160,6 +305,7 @@ def parse_race(soup, numero):
         "categoria": get(r"Categoria:\s*(.+?)(?:Premios|PROGRAMA|RESULTADOS|$)"),
         "participantes": participants
     }
+
 
 def enrich_horse(horse):
     profile = horse.get("perfil", "")
@@ -199,16 +345,45 @@ def score_horse(h, context):
         reasons.append("debutante o historial limitado: se mantiene sin penalización fuerte")
     if any(x in campaign for x in ["palermo","san isidro","la plata"]):
         score += 4; reasons.append("experiencia en hipódromos principales")
-    if h.get("peso"):
-        try:
-            kg = float(h["peso"])
-            if kg <= 56: score += 3; reasons.append("peso competitivo")
-        except: pass
+    # Peso relativo al resto de la carrera (no un umbral fijo).
+    peso_propio = _to_float(h.get("peso"))
+    pesos_carrera = [
+        _to_float(x.get("peso"))
+        for x in context.get("participantes", [])
+        if _to_float(x.get("peso")) is not None
+    ]
+    if peso_propio is not None and len(pesos_carrera) >= 2:
+        promedio = sum(pesos_carrera) / len(pesos_carrera)
+        diferencia = promedio - peso_propio
+        if diferencia >= 1.5:
+            score += 5
+            reasons.append(f"lleva {diferencia:.1f} kg menos que el promedio de la carrera")
+        elif diferencia <= -1.5:
+            score -= 3
+            reasons.append(f"lleva {abs(diferencia):.1f} kg más que el promedio de la carrera")
+
+    # Puestos recientes leidos de la campaña (1º, 2º, 3º en las ultimas salidas).
+    victorias = len(re.findall(r"\b1\s*[º°]", " ".join(acts)))
+    podios = len(re.findall(r"\b[123]\s*[º°]", " ".join(acts)))
+    if victorias:
+        score += min(10, victorias * 4)
+        reasons.append(f"{victorias} victoria(s) en su campaña reciente")
+    if podios > victorias:
+        score += min(6, (podios - victorias) * 2)
+        reasons.append(f"{podios} llegada(s) entre los tres primeros")
+
     if context.get("pista_dia") in ["Pesada","Barrosa","Húmeda"] and any(
         x in (campaign+" "+detail) for x in ["pesada","barrosa","húmeda","humeda"]
     ):
         score += 7; reasons.append("antecedente compatible con la pista del día")
     return round(max(1, min(99, score)), 1), reasons
+
+
+def _to_float(value):
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_text(value):
