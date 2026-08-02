@@ -799,11 +799,15 @@ function renderCompetidores(participantes){
     const row = document.createElement('div');
     row.className = 'comp-item';
     const numDisplay = cp.numero != null ? cp.numero : (idx+1);
+    const subtitulo = cp.retirado
+      ? 'RETIRADO — no corre'
+      : [cp.jockey, cp.entrenador].filter(Boolean).join(' · ') || 'Sin datos de jockey';
+    row.style.opacity = cp.retirado ? '0.45' : '1';
     row.innerHTML = `
-      <div class="silk" style="background:${silks[idx % silks.length]}">${numDisplay}</div>
+      <div class="silk" style="background:${cp.retirado ? '#999' : silks[idx % silks.length]}">${numDisplay}</div>
       <div>
         <div class="comp-nombre">${cp.nombre}</div>
-        <div class="comp-jinete">${cp.retirado ? 'Retirado' : (cp.actuaciones ? cp.actuaciones.length + ' carreras en campaña' : 'Cargando campaña…')}</div>
+        <div class="comp-jinete">${subtitulo}</div>
       </div>
       <div class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</div>`;
     row.onclick = ()=> abrirFicha(cp, idx);
