@@ -670,3 +670,246 @@ def analizar():
         ranked.append({**h,"score":score,"motivos":reasons})
     ranked.sort(key=lambda x:x["score"], reverse=True)
     top = ranked[:4]
+    total = sum(x["score"] for x in top) or 1
+    for x in top:
+        x["probabilidad_relativa"] = round(x["score"]/total*100,1)
+
+    # Guardar el pronostico y, si la carrera ya se corrio, comparar en el acto.
+    ya_corrida = any(h.get("puesto") for h in horses)
+    try:
+        registrar_pronostico(
+            url=data.get("url",""),
+            numero=data.get("numero"),
+            fecha=data.get("fecha",""),
+            hipodromo=data.get("hipodromo",""),
+            top=top,
+            participantes=horses,
+            pesos=pesos,
+            ya_corrida=ya_corrida,
+        )
+    except Exception:
+        pass  # que un fallo al guardar nunca rompa el pronostico al usuario
+
+    return jsonify(ok=True,ranking=top,confianza=round(top[0]["score"],1),
+                   ya_corrida=ya_corrida)
+
+
+def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
+                         pesos, ya_corrida):
+    """
+    Guarda lo que predijo la app. Si la carrera ya tiene puestos reales,
+    calcula el acierto y ajusta el algoritmo automaticamente.
+    """
+    if not url or numero is None:
+        return
+
+    predichos = [x["nombre"] for x in top]
+    resultado = None
+    acierto_ganador = None
+    aciertos_top4 = None
+
+    if ya_corrida:
+        llegados = sorted(
+            [h for h in participantes if h.get("puesto")],
+            key=lambda h: h["puesto"]
+        )
+        resultado = [h["nombre"] for h in llegados[:4]]
+        if resultado:
+            acierto_ganador = 1 if predichos[0] == resultado[0] else 0
+            aciertos_top4 = len(set(predichos) & set(resultado))
+
+    con = db()
+    con.execute("""
+        INSERT INTO pronosticos(url,numero,fecha,hipodromo,ranking,resultado,
+                                acierto_ganador,aciertos_top4,pesos_usados,
+                                creado_en,comparado_en)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(url,numero) DO UPDATE SET
+          resultado=COALESCE(excluded.resultado, pronosticos.resultado),
+          acierto_ganador=COALESCE(excluded.acierto_ganador, pronosticos.acierto_ganador),
+          aciertos_top4=COALESCE(excluded.aciertos_top4, pronosticos.aciertos_top4),
+          comparado_en=COALESCE(excluded.comparado_en, pronosticos.comparado_en)
+    """, (
+        url, int(numero), fecha, hipodromo,
+        json.dumps(predichos, ensure_ascii=False),
+        json.dumps(resultado, ensure_ascii=False) if resultado else None,
+        acierto_ganador, aciertos_top4,
+        json.dumps(pesos, ensure_ascii=False),
+        datetime.now().isoformat(timespec="seconds"),
+        datetime.now().isoformat(timespec="seconds") if resultado else None,
+    ))
+    con.commit()
+    con.close()
+
+    if resultado:
+        ajustar_algoritmo()
+
+
+def ajustar_algoritmo():
+    """
+    Compara todos los pronosticos ya resueltos y afina los pesos.
+    Metodo conservador: mueve cada peso de a poco segun si viene acertando
+    mejor o peor que el promedio historico. Nunca hace saltos bruscos.
+    """
+    con = db()
+    filas = con.execute("""
+        SELECT acierto_ganador, aciertos_top4, pesos_usados
+        FROM pronosticos WHERE resultado IS NOT NULL
+        ORDER BY id DESC LIMIT 200
+    """).fetchall()
+    con.close()
+
+    if len(filas) < 10:
+        return  # con menos de 10 carreras no hay con que aprender
+
+    recientes = filas[:30]
+    historico = filas
+
+    tasa_reciente = sum(f["aciertos_top4"] or 0 for f in recientes) / (len(recientes) * 4)
+    tasa_historica = sum(f["aciertos_top4"] or 0 for f in historico) / (len(historico) * 4)
+
+    pesos = cargar_pesos()
+    # Si lo reciente va peor que el historico, se explora un poco mas.
+    # Si va mejor, se refuerza la direccion actual. Paso chico: 3%.
+    direccion = 1.0 if tasa_reciente >= tasa_historica else -1.0
+    paso = 0.03 * direccion
+
+    for clave in pesos:
+        nuevo = pesos[clave] * (1 + paso)
+        limite = abs(PESOS_INICIALES[clave]) * 2.5
+        if PESOS_INICIALES[clave] >= 0:
+            pesos[clave] = max(0.0, min(limite, nuevo))
+        else:
+            pesos[clave] = min(0.0, max(-limite, nuevo))
+
+    guardar_pesos(pesos)
+
+# ============================================================
+# PANEL DE ADMIN — solo accesible con la clave ADMIN_KEY.
+# El usuario comun no ve nada de esto.
+# ============================================================
+
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+def es_admin():
+    if not ADMIN_KEY:
+        return False
+    enviada = request.args.get("clave", "") or request.headers.get("X-Admin-Key", "")
+    return enviada == ADMIN_KEY
+
+@app.get("/admin")
+def admin_panel():
+    if not es_admin():
+        return "Acceso restringido.", 403
+    return render_template("admin.html")
+
+@app.get("/api/admin/rendimiento")
+def admin_rendimiento():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    total = con.execute("SELECT COUNT(*) c FROM pronosticos").fetchone()["c"]
+    resueltos = con.execute(
+        "SELECT COUNT(*) c FROM pronosticos WHERE resultado IS NOT NULL"
+    ).fetchone()["c"]
+    stats = con.execute("""
+        SELECT
+          SUM(acierto_ganador) ganadores,
+          SUM(aciertos_top4) aciertos,
+          COUNT(*) n
+        FROM pronosticos WHERE resultado IS NOT NULL
+    """).fetchone()
+    ultimos = con.execute("""
+        SELECT fecha, hipodromo, numero, ranking, resultado,
+               acierto_ganador, aciertos_top4, comparado_en
+        FROM pronosticos WHERE resultado IS NOT NULL
+        ORDER BY id DESC LIMIT 40
+    """).fetchall()
+    pesos_actuales = con.execute(
+        "SELECT clave, valor, actualizado_en FROM algoritmo ORDER BY clave"
+    ).fetchall()
+    con.close()
+
+    n = stats["n"] or 0
+    return jsonify(
+        ok=True,
+        total_pronosticos=total,
+        carreras_comparadas=resueltos,
+        acierto_ganador_pct=round((stats["ganadores"] or 0) / n * 100, 1) if n else None,
+        acierto_top4_pct=round((stats["aciertos"] or 0) / (n * 4) * 100, 1) if n else None,
+        pesos=[dict(p) for p in pesos_actuales] or [
+            {"clave": k, "valor": v, "actualizado_en": "inicial"}
+            for k, v in PESOS_INICIALES.items()
+        ],
+        ultimas=[{
+            "fecha": u["fecha"],
+            "hipodromo": u["hipodromo"],
+            "numero": u["numero"],
+            "predicho": json.loads(u["ranking"]),
+            "real": json.loads(u["resultado"]) if u["resultado"] else [],
+            "acerto_ganador": bool(u["acierto_ganador"]),
+            "aciertos_top4": u["aciertos_top4"],
+        } for u in ultimos],
+    )
+
+
+@app.get("/api/videos")
+def videos():
+    horse = request.args.get("caballo","").strip()
+    if not horse:
+        return jsonify(ok=False,error="Falta el caballo."),400
+    query = f'{horse} carrera caballo Argentina'
+    if not YOUTUBE_API_KEY:
+        return jsonify(ok=True,modo="busqueda",url="https://www.youtube.com/results?search_query="+quote_plus(query),videos=[])
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {"part":"snippet","q":query,"type":"video","maxResults":5,"key":YOUTUBE_API_KEY}
+    r = requests.get(url,params=params,timeout=20)
+    r.raise_for_status()
+    items = [{
+        "id":x["id"]["videoId"],
+        "titulo":x["snippet"]["title"],
+        "miniatura":x["snippet"]["thumbnails"]["medium"]["url"]
+    } for x in r.json().get("items",[])]
+    return jsonify(ok=True,modo="api",videos=items)
+
+@app.post("/api/guardar")
+def guardar():
+    data = request.get_json(silent=True) or {}
+    if not all(data.get(k) for k in ["fecha","hipodromo","numero","participantes"]):
+        return jsonify(ok=False,error="Faltan datos."),400
+    con = db()
+    con.execute("""
+    INSERT INTO carreras(fecha,hipodromo,numero,premio,distancia,superficie,
+    estado_publicado,condicion,pista_dia,clima,viento,retiros,observaciones,
+    participantes,analisis,resultado_real,creado_en)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(fecha,hipodromo,numero) DO UPDATE SET
+    pista_dia=excluded.pista_dia,clima=excluded.clima,viento=excluded.viento,
+    retiros=excluded.retiros,observaciones=excluded.observaciones,
+    participantes=excluded.participantes,analisis=excluded.analisis,
+    creado_en=excluded.creado_en
+    """,(
+      data["fecha"],data["hipodromo"],int(data["numero"]),data.get("premio",""),
+      data.get("distancia"),data.get("superficie",""),data.get("estado_publicado",""),
+      data.get("condicion",""),data.get("pista_dia",""),data.get("clima",""),
+      data.get("viento",""),json.dumps(data.get("retiros",[]),ensure_ascii=False),
+      data.get("observaciones",""),json.dumps(data["participantes"],ensure_ascii=False),
+      json.dumps(data.get("analisis",{}),ensure_ascii=False),"",
+      datetime.now().isoformat(timespec="seconds")
+    ))
+    con.commit(); con.close()
+    return jsonify(ok=True,mensaje="Carrera y análisis guardados.")
+
+@app.get("/api/historial")
+def historial():
+    con=db()
+    rows=con.execute("""SELECT id,fecha,hipodromo,numero,premio,pista_dia,clima,
+    analisis,resultado_real FROM carreras ORDER BY fecha DESC,numero""").fetchall()
+    con.close()
+    return jsonify(ok=True,carreras=[dict(x) for x in rows])
+
+init_db()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
