@@ -522,8 +522,9 @@
     border-top-color:var(--bronce); border-radius:50%;
     animation:girar .7s linear infinite; flex-shrink:0;
   }
-  /* --- Buscador de caballo --- */
+  /* --- Buscador de caballo con autocompletado --- */
   .buscador-caja{ padding:4px 0; }
+  .buscador-envoltura{ position:relative; }
   .buscador-fila{ display:flex; gap:9px; }
   .buscador-fila input{
     flex:1; font-family:'Archivo',sans-serif; font-size:16px;
@@ -532,22 +533,43 @@
     min-width:0;
   }
   .buscador-fila input:focus{ outline:2px solid var(--bronce); outline-offset:-1px; }
-  .buscador-fila button{
-    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
-    background:var(--verde-turf); color:var(--hueso); border:none;
-    padding:13px 22px; border-radius:5px; cursor:pointer; flex-shrink:0;
+  .limpiar{
+    position:absolute; right:14px; top:13px; background:none; border:none;
+    font-size:17px; opacity:.35; cursor:pointer; display:none; padding:0;
   }
-  .buscador-fila button:hover{ background:var(--verde-turf-2); }
-  .resultado-item{
-    display:flex; align-items:center; gap:12px;
-    border:1px solid var(--pergamino-2); background:var(--hueso);
-    padding:13px 15px; border-radius:5px; margin-top:9px; cursor:pointer;
+  .limpiar.visible{ display:block; }
+  .limpiar:hover{ opacity:.8; }
+  .sugerencias{
+    margin-top:9px; border:1px solid var(--pergamino-2); border-radius:5px;
+    background:var(--hueso); max-height:340px; overflow-y:auto; display:none;
   }
-  .resultado-item:hover{ border-color:var(--bronce); }
-  .resultado-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:16px; }
-  .resultado-detalle{
-    font-family:'Space Mono',monospace; font-size:11px; opacity:.62;
-    margin-top:3px; line-height:1.4;
+  .sugerencias.visible{ display:block; }
+  .sug-item{
+    padding:11px 14px; cursor:pointer;
+    border-bottom:1px solid var(--pergamino-2);
+  }
+  .sug-item:last-child{ border-bottom:none; }
+  .sug-item:hover, .sug-item.activo{ background:var(--pergamino); }
+  .sug-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:15.5px; }
+  .sug-nombre b{ color:var(--carmin); }
+  .sug-detalle{
+    font-family:'Space Mono',monospace; font-size:10.5px; opacity:.6;
+    margin-top:2px; line-height:1.4;
+  }
+  .sug-exacto{ background:#f7f0e0; border-left:3px solid var(--bronce); }
+  .sug-etiqueta{
+    display:inline-block; font-family:'Space Mono',monospace; font-size:9px;
+    text-transform:uppercase; letter-spacing:.08em; background:var(--bronce);
+    color:#fff; padding:2px 6px; border-radius:3px; margin-left:7px;
+    vertical-align:2px;
+  }
+  .sug-estado{
+    padding:13px 14px; font-family:'Space Mono',monospace; font-size:12px;
+    opacity:.65; display:flex; align-items:center; gap:9px;
+  }
+  .ayuda{
+    font-family:'Space Mono',monospace; font-size:11px; opacity:.5;
+    margin-top:9px; line-height:1.5;
   }
   .proxima-caja{
     background:var(--verde-turf); color:var(--hueso);
@@ -666,12 +688,14 @@
       </div>
       <div class="step-body">
         <div class="buscador-caja">
-          <div class="buscador-fila">
-            <input type="text" id="q-caballo" placeholder="Por ejemplo: Amiguita"
-                   onkeydown="if(event.key==='Enter') buscarCaballo()">
-            <button onclick="buscarCaballo()">Buscar</button>
+          <div class="buscador-envoltura">
+            <div class="buscador-fila">
+              <input type="text" id="q-caballo" placeholder="Empezá a escribir…" autocomplete="off">
+              <button class="limpiar" id="limpiar-caballo" onclick="limpiarBuscador()">✕</button>
+            </div>
+            <div class="sugerencias" id="sug-caballo"></div>
           </div>
-          <div id="resultados-caballo"></div>
+          <div class="ayuda">Desde 3 letras empieza a buscar solo.</div>
         </div>
       </div>
     </div>
@@ -1044,7 +1068,12 @@ function renderPronostico(ranking){
   });
 }
 
-// ---------- Buscador de caballo ----------
+// ---------- Buscador de caballo con autocompletado ----------
+let tempBusqueda = null;
+let sugActivo = -1;
+let sugUltimos = [];
+let sugPeticion = 0;
+
 function abrirBuscadorCaballo(){
   document.getElementById('card-buscador').style.display = 'block';
   document.getElementById('paso-buscador').classList.add('open');
@@ -1052,36 +1081,123 @@ function abrirBuscadorCaballo(){
   setTimeout(()=> document.getElementById('q-caballo').focus(), 400);
 }
 
-async function buscarCaballo(){
-  const q = document.getElementById('q-caballo').value.trim();
-  const cont = document.getElementById('resultados-caballo');
-  if (q.length < 3){
-    cont.innerHTML = estadoMsg('Escribí al menos 3 letras.', true);
-    return;
-  }
-  cont.innerHTML = estadoMsg('Buscando en el Stud Book…');
-  mostrarBarra('Buscando caballos…');
+function normalizarTexto(s){
+  return (s||'').toLowerCase()
+    .replace(/á/g,'a').replace(/é/g,'e').replace(/í/g,'i')
+    .replace(/ó/g,'o').replace(/ú/g,'u').replace(/ü/g,'u');
+}
+
+function iniciarBuscador(){
+  const inp = document.getElementById('q-caballo');
+  const sug = document.getElementById('sug-caballo');
+  const btnLimpiar = document.getElementById('limpiar-caballo');
+  if (!inp) return;
+
+  inp.addEventListener('input', ()=>{
+    btnLimpiar.classList.toggle('visible', inp.value.length > 0);
+    clearTimeout(tempBusqueda);
+    const q = inp.value.trim();
+    if (q.length < 3){
+      sug.classList.remove('visible');
+      sug.innerHTML = '';
+      return;
+    }
+    sug.classList.add('visible');
+    sug.innerHTML = '<div class="sug-estado"><div class="spin"></div>Buscando…</div>';
+    // Esperar a que termine de escribir, para no consultar en cada letra.
+    tempBusqueda = setTimeout(()=> consultarSugerencias(q), 420);
+  });
+
+  inp.addEventListener('keydown', e=>{
+    const items = sug.querySelectorAll('.sug-item');
+    if (!items.length) return;
+    if (e.key === 'ArrowDown'){
+      e.preventDefault();
+      sugActivo = Math.min(sugActivo + 1, items.length - 1);
+      marcarSugerencia(items);
+    } else if (e.key === 'ArrowUp'){
+      e.preventDefault();
+      sugActivo = Math.max(sugActivo - 1, 0);
+      marcarSugerencia(items);
+    } else if (e.key === 'Enter'){
+      e.preventDefault();
+      const elegido = sugUltimos[sugActivo >= 0 ? sugActivo : 0];
+      if (elegido) elegirSugerencia(elegido);
+    } else if (e.key === 'Escape'){
+      sug.classList.remove('visible');
+    }
+  });
+
+  document.addEventListener('click', e=>{
+    if (!e.target.closest('.buscador-envoltura')) sug.classList.remove('visible');
+  });
+}
+
+async function consultarSugerencias(q){
+  const sug = document.getElementById('sug-caballo');
+  const miNumero = ++sugPeticion;   // para descartar respuestas viejas
   try{
     const d = await apiGet('/api/buscar-caballo?q=' + encodeURIComponent(q));
-    const lista = d.resultados || [];
-    cont.innerHTML = '';
-    lista.forEach(r=>{
-      const item = document.createElement('div');
-      item.className = 'resultado-item';
-      item.innerHTML = `
-        <div style="flex:1; min-width:0;">
-          <div class="resultado-nombre">${r.nombre}</div>
-          ${r.detalle ? '<div class="resultado-detalle">'+r.detalle+'</div>' : ''}
-        </div>
-        <span class="chev">→</span>`;
-      item.onclick = ()=> abrirFichaPorNombre(r.perfil);
-      cont.appendChild(item);
-    });
+    if (miNumero !== sugPeticion) return;   // llegó tarde, ya escribió otra cosa
+    sugUltimos = d.resultados || [];
+    sugActivo = -1;
+    pintarSugerencias(sugUltimos, q);
   }catch(e){
-    cont.innerHTML = estadoMsg(e.message, true);
-  }finally{
-    ocultarBarra();
+    if (miNumero !== sugPeticion) return;
+    sugUltimos = [];
+    sug.innerHTML = '<div class="sug-estado">' + e.message + '</div>';
   }
+}
+
+function resaltarCoincidencia(nombre, q){
+  const piezas = normalizarTexto(q).split(/\s+/).filter(Boolean);
+  let salida = nombre;
+  piezas.forEach(p=>{
+    const re = new RegExp('(' + p.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + ')', 'ig');
+    salida = salida.replace(re, '<b>$1</b>');
+  });
+  return salida;
+}
+
+function pintarSugerencias(lista, q){
+  const sug = document.getElementById('sug-caballo');
+  if (!lista.length){
+    sug.innerHTML = '<div class="sug-estado">No se encontró ningún caballo con ese nombre.</div>';
+    return;
+  }
+  const pegado = normalizarTexto(q).replace(/\s+/g,'');
+  sug.innerHTML = '';
+  lista.forEach(x=>{
+    const exacto = normalizarTexto(x.nombre).replace(/\s+/g,'') === pegado;
+    const d = document.createElement('div');
+    d.className = 'sug-item' + (exacto ? ' sug-exacto' : '');
+    d.innerHTML = `
+      <div class="sug-nombre">${resaltarCoincidencia(x.nombre, q)}${
+        exacto ? '<span class="sug-etiqueta">exacto</span>' : ''}</div>
+      ${x.detalle ? '<div class="sug-detalle">'+x.detalle+'</div>' : ''}`;
+    d.onclick = ()=> elegirSugerencia(x);
+    sug.appendChild(d);
+  });
+}
+
+function marcarSugerencia(items){
+  items.forEach((it,i)=> it.classList.toggle('activo', i === sugActivo));
+  if (items[sugActivo]) items[sugActivo].scrollIntoView({block:'nearest'});
+}
+
+function elegirSugerencia(x){
+  if (!x) return;
+  document.getElementById('q-caballo').value = x.nombre;
+  document.getElementById('sug-caballo').classList.remove('visible');
+  abrirFichaPorNombre(x.perfil);
+}
+
+function limpiarBuscador(){
+  const inp = document.getElementById('q-caballo');
+  inp.value = '';
+  document.getElementById('limpiar-caballo').classList.remove('visible');
+  document.getElementById('sug-caballo').classList.remove('visible');
+  inp.focus();
 }
 
 async function abrirFichaPorNombre(perfil){
@@ -1353,6 +1469,7 @@ function quitarSeguido(nombre){
 
 // ---------- Arranque ----------
 cargarCalendario();
+iniciarBuscador();
 </script>
 </body>
 </html>
