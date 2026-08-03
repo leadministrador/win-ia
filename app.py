@@ -380,7 +380,7 @@ def _tabla_carreras_del_perfil(soup):
             # El video es un enlace a youtube dentro de la fila.
             video = ""
             for a in tr.find_all("a", href=True):
-                m_yt = re.search(r"youtube\.com/embed/([A-Za-z0-9_-]{6,})", a["href"])
+                m_yt = re.search(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", a["href"])
                 if m_yt:
                     video = m_yt.group(1)
                     break
@@ -839,6 +839,205 @@ def carrera():
         return jsonify(**resp)
     except Exception as e:
         return jsonify(ok=False,error="No se pudo cargar la carrera.",detalle=str(e)),502
+
+TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
+
+# Direcciones candidatas para buscar ejemplares por nombre. Se prueban en orden
+# hasta que alguna devuelva resultados: no todas existen en el sitio.
+RUTAS_BUSQUEDA = [
+    "/ejemplares/buscar?q={q}",
+    "/ejemplares/buscar/{q}",
+    "/ejemplares?nombre={q}",
+    "/ejemplares/listado?nombre={q}",
+    "/buscar?q={q}",
+    "/consultas/ejemplares?nombre={q}",
+]
+
+
+def _ejemplares_de_html(soup, termino):
+    """Saca los ejemplares que aparezcan en una pagina de resultados."""
+    encontrados, vistos = [], set()
+    t = normalize_text(termino)
+    for a in soup.select('a[href*="/ejemplares/perfil/"]'):
+        nombre = clean(a.get_text(" "))
+        href = a.get("href", "")
+        if not nombre or nombre in vistos:
+            continue
+        if t and t not in normalize_text(nombre):
+            continue
+        vistos.add(nombre)
+        # El texto alrededor suele traer año, sexo y padres.
+        contexto = ""
+        if a.parent:
+            contexto = clean(a.parent.get_text(" "))[:200]
+        encontrados.append({
+            "nombre": nombre,
+            "perfil": urljoin(BASE, href),
+            "detalle": contexto,
+        })
+    return encontrados
+
+
+def _ejemplares_de_json(datos, termino):
+    """Algunos buscadores devuelven JSON en vez de HTML."""
+    encontrados = []
+    t = normalize_text(termino)
+
+    def recorrer(obj):
+        if isinstance(obj, dict):
+            nombre = obj.get("nombre") or obj.get("name") or obj.get("text") or obj.get("label")
+            idd = obj.get("id") or obj.get("value") or obj.get("slug")
+            if nombre and isinstance(nombre, str):
+                nombre_limpio = clean(re.sub(r"<[^>]+>", " ", nombre))
+                if not t or t in normalize_text(nombre_limpio):
+                    perfil = ""
+                    if obj.get("url"):
+                        perfil = urljoin(BASE, str(obj["url"]))
+                    elif idd:
+                        perfil = f"{BASE}/ejemplares/perfil/{idd}/"
+                    encontrados.append({
+                        "nombre": nombre_limpio,
+                        "perfil": perfil,
+                        "detalle": "",
+                    })
+            for v in obj.values():
+                recorrer(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                recorrer(v)
+
+    recorrer(datos)
+    return encontrados
+
+
+def buscar_ejemplares(termino):
+    """
+    Busca caballos por nombre en el Stud Book. Prueba varias direcciones
+    porque el buscador del sitio no es publico; la que funcione se recuerda.
+    """
+    termino = clean(termino)
+    if len(termino) < 3:
+        return []
+
+    clave = f"busqueda:{normalize_text(termino)}"
+    cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
+    if cacheado is not None and fresco:
+        return cacheado
+
+    # Si ya sabemos cual ruta funciona, se prueba esa primero.
+    preferida, _ = cache_get("ruta_busqueda_ok", 30 * 24 * 60 * 60)
+    rutas = list(RUTAS_BUSQUEDA)
+    if preferida in rutas:
+        rutas.remove(preferida)
+        rutas.insert(0, preferida)
+
+    for ruta in rutas:
+        url = BASE + ruta.format(q=quote_plus(termino))
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=(4, 10))
+            if r.status_code != 200:
+                continue
+            tipo = r.headers.get("Content-Type", "")
+            if "json" in tipo:
+                resultados = _ejemplares_de_json(r.json(), termino)
+            else:
+                resultados = _ejemplares_de_html(
+                    BeautifulSoup(r.text, "html.parser"), termino
+                )
+            if resultados:
+                cache_set("ruta_busqueda_ok", ruta)
+                cache_set(clave, resultados[:25])
+                return resultados[:25]
+        except Exception:
+            continue
+
+    cache_set(clave, [])
+    return []
+
+
+@app.get("/api/buscar-caballo")
+def api_buscar_caballo():
+    termino = request.args.get("q", "").strip()
+    if len(termino) < 3:
+        return jsonify(ok=False, error="Escribí al menos 3 letras."), 400
+    try:
+        resultados = buscar_ejemplares(termino)
+    except Exception:
+        return jsonify(ok=False, error="No se pudo buscar en este momento."), 502
+    if not resultados:
+        return jsonify(
+            ok=False,
+            error=f"No se encontró ningún caballo con «{termino}».",
+            resultados=[],
+        ), 404
+    return jsonify(ok=True, resultados=resultados)
+
+
+@app.get("/api/caballo")
+def api_caballo():
+    """Ficha completa de un caballo: datos, próximas carreras y campaña."""
+    perfil = request.args.get("perfil", "")
+    if not (perfil.startswith(BASE) or perfil.startswith("https://studbook.org.ar")):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+
+    clave = f"caballo:{perfil}"
+    cacheado, fresco = cache_get(clave, TTL_CARRERA)
+    if cacheado is not None and fresco:
+        return jsonify(ok=True, **cacheado)
+
+    try:
+        soup = fetch(perfil)
+        texto = clean(soup.get_text(" "))
+
+        nombre = ""
+        for etiqueta in ["h1", "h2"]:
+            h = soup.find(etiqueta)
+            if h and clean(h.get_text(" ")):
+                nombre = clean(h.get_text(" "))
+                break
+
+        caballo = {"nombre": nombre, "perfil": perfil}
+        caballo.update(_resumen_del_perfil(soup, texto))
+
+        carreras = _tabla_carreras_del_perfil(soup)
+        caballo["carreras"] = carreras[:30]
+        puestos = [c["puesto"] for c in carreras if c["puesto"]]
+        caballo["corridas"] = len(carreras)
+        caballo["victorias"] = sum(1 for p in puestos if p == 1)
+        caballo["podios"] = sum(1 for p in puestos if p <= 3)
+
+        # Proximas carreras: buscarlas solo dentro de esa seccion del documento,
+        # no en toda la pagina (sino se cuelan las carreras ya corridas).
+        proximas = []
+        titulo_prox = None
+        for etiqueta in soup.find_all(["h1", "h2", "h3", "h4", "div", "span", "p"]):
+            if re.fullmatch(r"PR[ÓO]XIMAS CARRERAS", clean(etiqueta.get_text(" ")), re.I):
+                titulo_prox = etiqueta
+                break
+
+        if titulo_prox:
+            for nodo in titulo_prox.find_all_next():
+                texto_nodo = clean(nodo.get_text(" ")) if hasattr(nodo, "get_text") else ""
+                # Cortar al llegar a la seccion siguiente.
+                if re.fullmatch(r"(CAMPA[ÑN]A|EXPORTACI[ÓO]N.*|SERVICIOS|PEDIGREE)",
+                                texto_nodo, re.I):
+                    break
+                if getattr(nodo, "name", None) == "a" and nodo.get("href"):
+                    t = clean(nodo.get_text(" "))
+                    if re.search(r"\d{2}/\d{2}/\d{4}", t):
+                        proximas.append({
+                            "texto": t,
+                            "enlace": urljoin(BASE, nodo["href"]),
+                        })
+
+        caballo["proximas"] = proximas[:5]
+        caballo["sin_proximas"] = len(proximas) == 0
+
+        cache_set(clave, caballo)
+        return jsonify(ok=True, **caballo)
+    except Exception as e:
+        return jsonify(ok=False, error="No se pudo cargar el caballo.", detalle=str(e)), 502
+
 
 @app.get("/api/detalle-carrera")
 def api_detalle_carrera():
