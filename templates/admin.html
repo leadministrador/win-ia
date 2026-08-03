@@ -3,934 +3,193 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LEA WIN IA — Prototipo</title>
+<title>LEA WIN IA — Panel de control</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Archivo:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --verde-turf:#153832;
-    --verde-turf-2:#1f4a42;
-    --pergamino:#f2ebda;
-    --pergamino-2:#e7dcc2;
-    --bronce:#b6904f;
-    --bronce-claro:#d9b877;
-    --carmin:#8c2a2a;
-    --tinta:#241b14;
-    --hueso:#faf6ee;
-    --sombra: 0 10px 30px rgba(21,56,50,0.18);
+    --verde-turf:#153832; --verde-turf-2:#1f4a42;
+    --pergamino:#f2ebda; --pergamino-2:#e7dcc2;
+    --bronce:#b6904f; --bronce-claro:#d9b877;
+    --carmin:#8c2a2a; --tinta:#241b14; --hueso:#faf6ee;
   }
   *{box-sizing:border-box;}
   body{
-    margin:0;
-    background:var(--hueso);
-    color:var(--tinta);
-    font-family:'Archivo',sans-serif;
-    -webkit-font-smoothing:antialiased;
+    margin:0; background:var(--hueso); color:var(--tinta);
+    font-family:'Archivo',sans-serif; padding:0 0 60px;
   }
-  h1,h2,h3,.display{
-    font-family:'Fraunces',serif;
-    font-weight:600;
-    letter-spacing:-0.01em;
-  }
+  h1,h2,h3{ font-family:'Fraunces',serif; font-weight:600; letter-spacing:-0.01em; }
   .mono{ font-family:'Space Mono',monospace; }
+  .top{
+    background:var(--verde-turf); color:var(--hueso);
+    padding:26px 24px 30px;
+  }
+  .top .marca{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    letter-spacing:.06em; margin-bottom:14px;
+  }
+  .top .marca span{
+    font-family:'Space Mono',monospace; font-size:10px; color:var(--tinta);
+    background:var(--bronce-claro); padding:2px 6px; border-radius:3px;
+  }
+  .top h1{ font-size:clamp(26px,5vw,38px); margin:0; }
+  .top p{ color:#c7d4d0; font-size:14px; margin:8px 0 0; }
+  .wrap{ max-width:900px; margin:0 auto; padding:0 20px; }
 
-  /* ---------- HERO ---------- */
-  .hero{
-    position:relative;
-    background:radial-gradient(120% 140% at 15% 0%, var(--verde-turf-2) 0%, var(--verde-turf) 55%, #0f2621 100%);
-    color:var(--hueso);
-    padding:64px 24px 120px;
-    overflow:hidden;
+  .tarjetas{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+    gap:14px; margin:-22px auto 30px; max-width:900px; padding:0 20px;
   }
-  .hero-inner{
-    max-width:880px;
-    margin:0 auto;
-    position:relative;
-    z-index:2;
+  .tarjeta{
+    background:var(--pergamino); border:1px solid var(--pergamino-2);
+    border-radius:6px; padding:18px;
   }
-  .brand{
-    font-family:'Fraunces',serif;
-    font-size:15px;
-    font-weight:700;
-    letter-spacing:0.06em;
-    color:var(--hueso);
-    margin-bottom:26px;
-    display:flex;
-    align-items:center;
-    gap:8px;
+  .tarjeta .rotulo{
+    font-family:'Space Mono',monospace; font-size:10px; text-transform:uppercase;
+    letter-spacing:.1em; opacity:.6;
   }
-  .brand span{
-    font-family:'Space Mono',monospace;
-    font-size:11px;
-    font-weight:700;
-    color:var(--tinta);
-    background:var(--bronce-claro);
-    padding:2px 6px;
-    border-radius:3px;
-    letter-spacing:0.04em;
+  .tarjeta .valor{
+    font-family:'Fraunces',serif; font-size:32px; font-weight:700;
+    color:var(--verde-turf); margin-top:6px; line-height:1;
   }
-  .eyebrow{
-    font-family:'Space Mono',monospace;
-    font-size:12px;
-    letter-spacing:0.18em;
-    text-transform:uppercase;
-    color:var(--bronce-claro);
-    margin-bottom:18px;
-    display:flex;
-    align-items:center;
-    gap:10px;
-  }
-  .eyebrow::before{
-    content:"";
-    width:22px; height:1px;
-    background:var(--bronce-claro);
-    display:inline-block;
-  }
-  .hero h1{
-    font-size:clamp(40px,8vw,72px);
-    line-height:0.98;
-    margin:0 0 14px;
-  }
-  .hero h1 em{
-    font-style:italic;
-    color:var(--bronce-claro);
-  }
-  .hero p{
-    max-width:460px;
-    font-size:16px;
-    line-height:1.6;
-    color:#d9e3df;
-    margin:0 0 34px;
-  }
-  .btn{
-    font-family:'Archivo',sans-serif;
-    font-weight:600;
-    font-size:15px;
-    border:none;
-    cursor:pointer;
-    padding:15px 26px;
-    border-radius:3px;
-    transition:transform .15s ease, box-shadow .15s ease;
-  }
-  .btn:focus-visible{ outline:2px solid var(--bronce-claro); outline-offset:3px; }
-  .btn-primary{
-    background:var(--bronce);
-    color:var(--tinta);
-    box-shadow:var(--sombra);
-  }
-  .btn-primary:hover{ transform:translateY(-1px); background:var(--bronce-claro); }
-  .btn-ghost{
-    background:transparent;
-    color:var(--hueso);
-    border:1px solid rgba(250,246,238,0.35);
-  }
-  .btn-ghost:hover{ border-color:var(--bronce-claro); color:var(--bronce-claro); }
-  .hero-actions{ display:flex; gap:14px; flex-wrap:wrap; }
+  .tarjeta .valor.destaca{ color:var(--carmin); }
+  .tarjeta .nota{ font-size:12px; opacity:.6; margin-top:6px; }
 
-  .horse-svg{
-    position:absolute;
-    right:-40px; bottom:-30px;
-    width:min(46vw,460px);
-    opacity:0.95;
-    z-index:1;
+  h2{ font-size:20px; margin:34px 0 14px; }
+  table{ width:100%; border-collapse:collapse; font-size:13px; }
+  th{
+    font-family:'Space Mono',monospace; font-size:10px; text-transform:uppercase;
+    letter-spacing:.08em; text-align:left; padding:8px 10px;
+    border-bottom:2px solid var(--pergamino-2); opacity:.65;
   }
-  @media (max-width:720px){
-    .horse-svg{ opacity:0.25; right:-60px; bottom:-10px; width:80vw; }
-  }
-
-  /* ---------- CASCADA ---------- */
-  .panel-wrap{
-    max-width:880px;
-    margin:-70px auto 60px;
-    padding:0 24px;
-    position:relative;
-    z-index:3;
-  }
-  .card{
-    background:var(--pergamino);
-    border:1px solid var(--pergamino-2);
-    border-radius:6px;
-    box-shadow:var(--sombra);
-    overflow:hidden;
-  }
-  .card + .card{ margin-top:16px; }
-  .step{
-    padding:22px 26px;
-  }
-  .step-head{
-    display:flex;
-    align-items:baseline;
-    justify-content:space-between;
-    gap:12px;
-    cursor:pointer;
-  }
-  .step-label{
-    font-family:'Space Mono',monospace;
-    font-size:11px;
-    letter-spacing:0.14em;
-    text-transform:uppercase;
-    color:var(--verde-turf);
-    opacity:0.65;
-  }
-  .step-title{
-    font-family:'Fraunces',serif;
-    font-size:22px;
-    font-weight:600;
-    margin:4px 0 0;
-  }
-  .step-value{
-    font-family:'Space Mono',monospace;
-    font-size:13px;
-    color:var(--carmin);
-  }
-  .chev{
-    font-size:18px;
-    color:var(--verde-turf);
-    transition:transform .2s ease;
-  }
-  .step.open .chev{ transform:rotate(180deg); }
-  .step-body{
-    max-height:0;
-    overflow:hidden;
-    transition:max-height .28s ease;
-  }
-  .step.open .step-body{ max-height:2000px; margin-top:18px; }
-
-  /* fecha */
-  .fecha-grid{
-    display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(84px,1fr));
-    gap:8px;
-  }
-  .fecha-chip{
-    border:1px solid var(--pergamino-2);
-    background:var(--hueso);
-    border-radius:4px;
-    padding:10px 6px;
-    text-align:center;
-    cursor:pointer;
-    font-family:'Space Mono',monospace;
-  }
-  .fecha-chip .dia{ font-size:18px; font-weight:700; display:block; }
-  .fecha-chip .mes{ font-size:10px; text-transform:uppercase; letter-spacing:.08em; opacity:.6; }
-  .fecha-chip:hover{ border-color:var(--bronce); }
-  .fecha-chip.sel{ background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf); }
-
-  /* hipodromo */
-  .hip-list{ display:flex; flex-direction:column; gap:10px; }
-  .hip-item{
-    display:flex; align-items:center; justify-content:space-between;
-    border:1px solid var(--pergamino-2);
-    background:var(--hueso);
-    padding:14px 16px;
-    border-radius:4px;
-    cursor:pointer;
-  }
-  .hip-item:hover{ border-color:var(--bronce); }
-  .hip-item.sel{ border-color:var(--verde-turf); background:#fff; }
-  .hip-nombre{ font-family:'Fraunces',serif; font-size:17px; font-weight:600; }
-  .hip-meta{ font-family:'Space Mono',monospace; font-size:11px; opacity:.6; }
-
-  /* carreras */
-  .carrera-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; }
-  .carrera-item{
-    border:1px solid var(--pergamino-2);
-    background:var(--hueso);
-    border-radius:4px;
-    padding:12px 14px;
-    cursor:pointer;
-  }
-  .carrera-item:hover{ border-color:var(--bronce); }
-  .carrera-item.sel{ border-color:var(--verde-turf); background:#fff; }
-  .carrera-item .num{ font-family:'Space Mono',monospace; font-size:11px; color:var(--carmin); }
-  .carrera-item .tit{ font-family:'Fraunces',serif; font-weight:600; font-size:15px; margin-top:2px; }
-  .carrera-item .dist{ font-family:'Space Mono',monospace; font-size:11px; opacity:.6; margin-top:4px; }
-
-  /* competidores */
-  .comp-list{ display:flex; flex-direction:column; gap:8px; }
-  .comp-item{
-    display:flex; align-items:center; gap:14px;
-    border:1px solid var(--pergamino-2);
-    background:var(--hueso);
-    padding:12px 14px;
-    border-radius:4px;
-    cursor:pointer;
-  }
-  .comp-item:hover{ border-color:var(--bronce); }
-  .silk{
-    width:34px; height:34px;
-    border-radius:50%;
-    display:flex; align-items:center; justify-content:center;
-    font-family:'Space Mono',monospace;
-    font-weight:700; font-size:14px;
-    color:#fff;
-    flex-shrink:0;
-    border:2px solid rgba(255,255,255,0.6);
-    box-shadow:0 0 0 1px rgba(0,0,0,0.15);
-  }
-  .comp-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:16px; }
-  .comp-jinete{ font-family:'Space Mono',monospace; font-size:11px; opacity:.6; }
-  .comp-peso{ margin-left:auto; font-family:'Space Mono',monospace; font-size:12px; opacity:.7; }
-
-  /* ficha caballo (modal) */
-  .overlay{
-    position:fixed; inset:0;
-    background:rgba(21,56,50,0.55);
-    display:none;
-    align-items:flex-end;
-    justify-content:center;
-    z-index:50;
-    backdrop-filter:blur(2px);
-  }
-  .overlay.show{ display:flex; }
-  @media (min-width:720px){
-    .overlay{ align-items:center; }
-  }
-  .ficha{
-    background:var(--hueso);
-    width:100%;
-    max-width:520px;
-    max-height:88vh;
-    overflow-y:auto;
-    border-radius:10px 10px 0 0;
-    padding:28px 26px 34px;
-    position:relative;
-    animation:subir .25s ease;
-  }
-  @media (min-width:720px){ .ficha{ border-radius:10px; } }
-  @keyframes subir{ from{ transform:translateY(24px); opacity:0;} to{transform:translateY(0); opacity:1;} }
-  .ficha-close{
-    position:absolute; top:16px; right:16px;
-    background:none; border:none; font-size:20px; cursor:pointer; color:var(--tinta); opacity:.5;
-  }
-  .ficha-close:hover{ opacity:1; }
-  .ficha-head{ display:flex; align-items:center; gap:16px; margin-bottom:20px; }
-  .ficha-nombre{ font-size:26px; margin:0; }
-  .ficha-sub{ font-family:'Space Mono',monospace; font-size:12px; opacity:.6; margin-top:4px; }
-  .tag{
+  td{ padding:10px; border-bottom:1px solid var(--pergamino-2); vertical-align:top; }
+  tr:hover td{ background:var(--pergamino); }
+  .pill{
     display:inline-block; font-family:'Space Mono',monospace; font-size:10px;
-    text-transform:uppercase; letter-spacing:.08em;
-    background:var(--verde-turf); color:var(--hueso);
-    padding:4px 8px; border-radius:3px; margin-right:6px;
+    padding:2px 7px; border-radius:10px;
   }
-  .ficha-section{ margin-top:22px; }
-  .ficha-section h4{
-    font-family:'Space Mono',monospace; font-size:11px; text-transform:uppercase;
-    letter-spacing:.1em; opacity:.55; margin:0 0 10px;
+  .pill.si{ background:var(--verde-turf); color:var(--hueso); }
+  .pill.no{ background:var(--pergamino-2); color:var(--tinta); }
+  .lista-caballos{ font-size:12px; line-height:1.6; }
+  .lista-caballos b{ font-family:'Fraunces',serif; }
+  .barra-peso{
+    background:var(--pergamino-2); height:5px; border-radius:3px;
+    overflow:hidden; margin-top:5px; width:120px;
   }
-  .campana-row{
-    display:flex; align-items:center; gap:12px;
-    padding:10px 0; border-bottom:1px solid var(--pergamino-2);
+  .barra-peso div{ height:100%; background:var(--bronce); }
+  .estado{
+    font-family:'Space Mono',monospace; font-size:13px; padding:20px 0; opacity:.7;
   }
-  .campana-row:last-child{ border-bottom:none; }
-  .campana-thumb{
-    width:56px; height:38px; border-radius:4px;
-    background:linear-gradient(135deg,var(--verde-turf),var(--verde-turf-2));
-    display:flex; align-items:center; justify-content:center;
-    color:var(--bronce-claro); font-size:14px; flex-shrink:0;
-  }
-  .campana-info{ font-size:13px; line-height:1.4; }
-  .campana-info b{ font-family:'Fraunces',serif; }
-
-  /* pronostico */
-  .pronostico{
-    margin-top:20px;
-    display:flex; flex-direction:column; gap:10px;
-  }
-  .pron-row{
-    display:flex; align-items:center; gap:14px;
-    background:#fff;
-    border:1px solid var(--pergamino-2);
-    border-radius:4px;
-    padding:12px 14px;
-  }
-  .pron-pos{
-    font-family:'Fraunces',serif; font-weight:700; font-size:20px;
-    color:var(--verde-turf); width:26px;
-  }
-  .pron-bar-wrap{ flex:1; }
-  .pron-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:15px; }
-  .pron-bar-bg{ background:var(--pergamino); height:6px; border-radius:3px; margin-top:6px; overflow:hidden; }
-  .pron-bar{ height:100%; background:linear-gradient(90deg,var(--bronce),var(--carmin)); border-radius:3px; }
-  .pron-pct{ font-family:'Space Mono',monospace; font-size:13px; color:var(--carmin); width:48px; text-align:right; }
-
-  .contador-seg{
-    background:var(--carmin);
-    color:var(--hueso);
-    font-family:'Space Mono',monospace;
-    font-size:11px;
-    padding:1px 6px;
-    border-radius:10px;
-    margin-left:6px;
-  }
-  .seguir-btn{
-    display:flex; align-items:center; gap:8px;
-    background:var(--hueso);
-    border:1px solid var(--pergamino-2);
-    padding:9px 14px;
-    border-radius:5px;
-    cursor:pointer;
-    font-family:'Archivo',sans-serif;
-    font-weight:600;
-    font-size:13px;
-    color:var(--verde-turf);
-    margin-top:16px;
-    width:100%;
-    justify-content:center;
-    transition:all .15s ease;
-  }
-  .seguir-btn:hover{ border-color:var(--bronce); }
-  .seguir-btn.activo{
-    background:var(--verde-turf);
-    color:var(--hueso);
-    border-color:var(--verde-turf);
-  }
-  .toast{
-    position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(140%);
-    background:var(--verde-turf); color:var(--hueso);
-    padding:13px 20px; border-radius:6px;
-    font-size:14px; box-shadow:var(--sombra);
-    z-index:80; transition:transform .3s ease;
-    max-width:90vw; text-align:center;
-  }
-  .toast.show{ transform:translateX(-50%) translateY(0); }
-
-  .seg-overlay{
-    position:fixed; inset:0; background:rgba(21,56,50,0.55);
-    display:none; align-items:center; justify-content:center; z-index:60; padding:20px;
-  }
-  .seg-overlay.show{ display:flex; }
-  .seg-panel{
-    background:var(--hueso); border-radius:10px; padding:26px;
-    max-width:440px; width:100%; max-height:80vh; overflow-y:auto; position:relative;
-  }
-  .seg-empty{ font-size:14px; opacity:.6; padding:20px 0; text-align:center; }
-  .seg-item{
-    display:flex; align-items:center; gap:12px;
-    padding:12px 0; border-bottom:1px solid var(--pergamino-2);
-  }
-  .seg-item:last-child{ border-bottom:none; }
-  .seg-info{ flex:1; }
-  .seg-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:15px; }
-  .seg-aviso{ font-family:'Space Mono',monospace; font-size:11px; color:var(--carmin); margin-top:2px; }
-  .seg-quitar{
-    background:none; border:none; cursor:pointer; opacity:.5; font-size:16px;
-  }
-  .seg-quitar:hover{ opacity:1; }
-
-  .estado-msg{
-    font-family:'Space Mono',monospace;
-    font-size:13px;
-    padding:14px 4px;
-    color:var(--verde-turf);
-    opacity:.75;
-  }
-  .estado-msg.error{ color:var(--carmin); opacity:1; }
-  .spinner{
-    display:inline-block; width:12px; height:12px;
-    border:2px solid var(--pergamino-2); border-top-color:var(--bronce);
-    border-radius:50%; margin-right:8px; vertical-align:-1px;
-    animation:girar .7s linear infinite;
-  }
-  @keyframes girar{ to{ transform:rotate(360deg); } }
-
-  .aviso-demo{
-    max-width:880px; margin:0 auto 30px; padding:0 24px;
-  }
-  .aviso-demo p{
-    font-family:'Space Mono',monospace; font-size:12px; color:var(--tinta); opacity:.55;
-    text-align:center;
+  .estado.error{ color:var(--carmin); }
+  @media (max-width:600px){
+    table{ font-size:12px; }
+    th,td{ padding:7px 6px; }
   }
 </style>
 </head>
 <body>
 
-<div class="hero">
-  <svg class="horse-svg" viewBox="0 0 500 400" xmlns="http://www.w3.org/2000/svg">
-    <g stroke="#2a5a50" stroke-width="1" opacity="0.5">
-      <line x1="0" y1="60" x2="500" y2="60"/>
-      <line x1="0" y1="340" x2="500" y2="340"/>
-      <line x1="60" y1="0" x2="60" y2="400"/>
-      <circle cx="60" cy="60" r="3" fill="#2a5a50"/>
-      <circle cx="60" cy="340" r="3" fill="#2a5a50"/>
-    </g>
-    <g fill="none" stroke="#d9b877" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
-      <polygon points="330,90 365,105 372,140 350,160 320,150 310,115" fill="#1f4a42"/>
-      <circle cx="345" cy="120" r="5" fill="#8c2a2a" stroke="none"/>
-      <circle cx="345" cy="120" r="9" fill="none" stroke="#d9b877" stroke-width="1.4"/>
-      <polygon points="320,150 350,160 340,210 300,205" fill="#1f4a42"/>
-      <polygon points="300,205 340,210 355,260 300,290 230,280 220,220" fill="#1f4a42"/>
-      <line x1="250" y1="230" x2="300" y2="240" stroke="#8c2a2a" stroke-width="1.4"/>
-      <line x1="260" y1="255" x2="310" y2="258" stroke="#8c2a2a" stroke-width="1.4"/>
-      <circle cx="290" cy="245" r="3" fill="#d9b877" stroke="none"/>
-      <polyline points="240,270 235,310 245,345 240,375"/>
-      <polyline points="290,285 300,320 295,350 305,378"/>
-      <polyline points="330,255 350,290 345,325 358,365"/>
-      <polyline points="300,290 320,320 312,350 325,382"/>
-      <polyline points="310,100 300,120 312,135 302,155 314,168"/>
-      <polyline points="228,225 205,235 215,255 195,268 208,290"/>
-    </g>
-    <g fill="#d9b877" opacity="0.7">
-      <circle cx="120" cy="90" r="2"/>
-      <circle cx="150" cy="70" r="1.5"/>
-      <circle cx="90" cy="130" r="1.5"/>
-      <circle cx="400" cy="200" r="2"/>
-      <circle cx="430" cy="170" r="1.5"/>
-    </g>
-  </svg>
-  <div class="hero-inner">
-    <div class="brand">LEA WIN <span>IA</span></div>
-    <div class="eyebrow">San Isidro · Palermo · La Plata</div>
-    <h1>Lea la carrera<br><em>antes</em> de la carrera</h1>
-    <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
-    <div class="hero-actions">
-      <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
-      <button class="btn btn-ghost" onclick="abrirSeguidos()">🔔 Caballos seguidos <span id="contador-seguidos" class="contador-seg" style="display:none;">0</span></button>
-    </div>
+<div class="top">
+  <div class="wrap">
+    <div class="marca">LEA WIN <span>IA</span></div>
+    <h1>Panel de control</h1>
+    <p>Comparación automática entre lo que pronosticó la app y lo que pasó en la pista.</p>
   </div>
 </div>
 
-<div class="panel-wrap" id="buscar">
+<div class="tarjetas" id="tarjetas"></div>
 
-  <!-- PASO 1: FECHA -->
-  <div class="card">
-    <div class="step open" id="paso-fecha">
-      <div class="step-head" onclick="toggle('paso-fecha')">
-        <div>
-          <div class="step-label">Paso 1</div>
-          <h3 class="step-title">Elegí la fecha</h3>
-        </div>
-        <span class="chev">⌄</span>
-      </div>
-      <div class="step-body">
-        <div class="fecha-grid" id="fecha-grid"></div>
-      </div>
-    </div>
-  </div>
+<div class="wrap">
+  <h2>Últimas carreras comparadas</h2>
+  <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
 
-  <!-- PASO 2: HIPODROMO -->
-  <div class="card" id="card-hip" style="display:none;">
-    <div class="step" id="paso-hip">
-      <div class="step-head" onclick="toggle('paso-hip')">
-        <div>
-          <div class="step-label">Paso 2</div>
-          <h3 class="step-title">Elegí el hipódromo</h3>
-          <div class="step-value" id="fecha-elegida-txt"></div>
-        </div>
-        <span class="chev">⌄</span>
-      </div>
-      <div class="step-body">
-        <div class="hip-list" id="hip-list"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- PASO 3: CARRERAS -->
-  <div class="card" id="card-carreras" style="display:none;">
-    <div class="step" id="paso-carreras">
-      <div class="step-head" onclick="toggle('paso-carreras')">
-        <div>
-          <div class="step-label">Paso 3</div>
-          <h3 class="step-title">Elegí la carrera</h3>
-          <div class="step-value" id="hip-elegido-txt"></div>
-        </div>
-        <span class="chev">⌄</span>
-      </div>
-      <div class="step-body">
-        <div class="carrera-grid" id="carrera-grid"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- PASO 4: COMPETIDORES + PRONOSTICO -->
-  <div class="card" id="card-comp" style="display:none;">
-    <div class="step" id="paso-comp">
-      <div class="step-head" onclick="toggle('paso-comp')">
-        <div>
-          <div class="step-label">Paso 4</div>
-          <h3 class="step-title">Competidores</h3>
-          <div class="step-value" id="carrera-elegida-txt"></div>
-        </div>
-        <span class="chev">⌄</span>
-      </div>
-      <div class="step-body">
-        <div class="comp-list" id="comp-list"></div>
-
-        <div class="ficha-section">
-          <h4>Pronóstico — primeros 4 puestos</h4>
-          <div class="pronostico" id="pronostico"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
+  <h2>Estado del algoritmo</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Estos valores se ajustan solos a medida que se acumulan resultados.
+  </p>
+  <div id="tabla-pesos"></div>
 </div>
-
-<div class="aviso-demo">
-  <p>Datos oficiales del Stud Book Argentino · actualizados con cache de hasta 15-20 minutos.</p>
-</div>
-
-<!-- FICHA CABALLO -->
-<div class="overlay" id="overlay" onclick="if(event.target===this) cerrarFicha()">
-  <div class="ficha">
-    <button class="ficha-close" onclick="cerrarFicha()">✕</button>
-    <div class="ficha-head">
-      <div class="silk" id="ficha-silk">1</div>
-      <div>
-        <h3 class="ficha-nombre" id="ficha-nombre">—</h3>
-        <div class="ficha-sub" id="ficha-sub">—</div>
-      </div>
-    </div>
-    <div id="ficha-tags"></div>
-
-    <div class="ficha-section">
-      <h4>Datos</h4>
-      <div id="ficha-datos" style="font-size:14px; line-height:1.7;"></div>
-    </div>
-
-    <div class="ficha-section">
-      <h4>Campaña — carreras corridas</h4>
-      <div id="ficha-campana"></div>
-    </div>
-
-    <button class="seguir-btn" id="btn-seguir" onclick="toggleSeguir()">🔔 Seguir a este caballo</button>
-  </div>
-</div>
-
-<div class="seg-overlay" id="seg-overlay" onclick="if(event.target===this) cerrarSeguidos()">
-  <div class="seg-panel">
-    <button class="ficha-close" onclick="cerrarSeguidos()">✕</button>
-    <h3 style="margin-top:0;">Caballos seguidos</h3>
-    <div id="seg-lista"></div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
 
 <script>
-// ============================================================
-// LEA WIN IA — conectado a datos reales del backend (/api/*)
-// ============================================================
+const clave = new URLSearchParams(location.search).get('clave') || '';
 
-const silks = ['#8c2a2a','#153832','#b6904f','#2b4a8c','#5c2b8c','#2b8c6b'];
-const mesesLargo = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
-const diasCorto = ['DOM','LUN','MAR','MIE','JUE','VIE','SAB'];
-
-let calendarioCache = [];      // reuniones tal como las devuelve /api/calendario
-let fechaElegida = null;
-let hipodromoElegido = null;   // {hipodromo, url}
-let carreraElegida = null;     // {numero, titulo}
-let meetingUrlElegida = null;  // url de la reunion (para pedir /api/carrera)
-let participantesActuales = [];
-let caballoActual = null;
-let seguidos = [];
-
-function estadoMsg(texto, esError=false){
-  return `<div class="estado-msg${esError?' error':''}">${esError?'':'<span class="spinner"></span>'}${texto}</div>`;
-}
-
-async function apiGet(url){
-  const r = await fetch(url);
-  const data = await r.json();
-  if (!r.ok || data.ok === false) throw new Error(data.error || 'Error de conexión con el servidor.');
-  return data;
-}
-async function apiPost(url, body){
-  const r = await fetch(url, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(body)
-  });
-  const data = await r.json();
-  if (!r.ok || data.ok === false) throw new Error(data.error || 'Error de conexión con el servidor.');
-  return data;
-}
-
-function toggle(id){ document.getElementById(id).classList.toggle('open'); }
-function abrirPaso(id){ document.getElementById(id).classList.add('open'); }
-
-// ---------- PASO 1: calendario ----------
-async function cargarCalendario(){
-  const grid = document.getElementById('fecha-grid');
-  grid.innerHTML = estadoMsg('Consultando el calendario oficial…');
+async function cargar(){
   try{
-    const data = await apiGet('/api/calendario');
-    calendarioCache = data.reuniones || [];
-    if (calendarioCache.length === 0){
-      grid.innerHTML = estadoMsg('No hay reuniones publicadas por ahora.', true);
-      return;
-    }
-    const fechasUnicas = [...new Set(calendarioCache.map(r => r.fecha))].sort();
-    grid.innerHTML = '';
-    fechasUnicas.forEach(f=>{
-      const d = new Date(f + 'T00:00:00');
-      const chip = document.createElement('div');
-      chip.className = 'fecha-chip';
-      chip.innerHTML = `<span class="dia">${d.getDate()}</span><span class="mes">${diasCorto[d.getDay()]} ${mesesLargo[d.getMonth()].slice(0,3).toUpperCase()}</span>`;
-      chip.onclick = ()=> elegirFecha(f, d, chip);
-      grid.appendChild(chip);
-    });
-    if (data.aviso){
-      grid.innerHTML += estadoMsg(data.aviso, true);
-    }
+    const r = await fetch('/api/admin/rendimiento?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (!r.ok || d.ok === false) throw new Error(d.error || 'Sin acceso');
+    pintarTarjetas(d);
+    pintarUltimas(d.ultimas || []);
+    pintarPesos(d.pesos || []);
   }catch(e){
-    grid.innerHTML = estadoMsg('No se pudo cargar el calendario oficial. ' + e.message, true);
+    document.getElementById('tabla-ultimas').innerHTML =
+      '<div class="estado error">' + e.message + '</div>';
   }
 }
 
-function elegirFecha(fecha, d, chipEl){
-  fechaElegida = fecha;
-  document.querySelectorAll('.fecha-chip').forEach(c=>c.classList.remove('sel'));
-  chipEl.classList.add('sel');
-  document.getElementById('fecha-elegida-txt').textContent = `${d.getDate()} de ${mesesLargo[d.getMonth()]}`;
-
-  const hips = calendarioCache.filter(r => r.fecha === fecha);
-  const list = document.getElementById('hip-list');
-  list.innerHTML = '';
-  if (hips.length === 0){
-    list.innerHTML = estadoMsg('No hay hipódromos con reunión esa fecha.', true);
-  } else {
-    hips.forEach(h=>{
-      const item = document.createElement('div');
-      item.className = 'hip-item';
-      item.innerHTML = `<div><div class="hip-nombre">${h.hipodromo}</div><div class="hip-meta">Reunión oficial</div></div><span class="chev">→</span>`;
-      item.onclick = ()=> elegirHip(h, item);
-      list.appendChild(item);
-    });
-  }
-
-  document.getElementById('card-hip').style.display = 'block';
-  document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
-  document.getElementById('paso-hip').classList.add('open');
-  document.getElementById('card-carreras').style.display = 'none';
-  document.getElementById('card-comp').style.display = 'none';
+function pintarTarjetas(d){
+  const t = document.getElementById('tarjetas');
+  const card = (rotulo, valor, nota, destaca) => `
+    <div class="tarjeta">
+      <div class="rotulo">${rotulo}</div>
+      <div class="valor ${destaca?'destaca':''}">${valor}</div>
+      <div class="nota">${nota}</div>
+    </div>`;
+  t.innerHTML =
+    card('Pronósticos hechos', d.total_pronosticos ?? 0, 'total acumulado') +
+    card('Ya comparados', d.carreras_comparadas ?? 0, 'carreras que se corrieron') +
+    card('Acierto del ganador',
+         d.acierto_ganador_pct != null ? d.acierto_ganador_pct + '%' : '—',
+         'veces que acertó el 1º puesto', true) +
+    card('Acierto entre los 4',
+         d.acierto_top4_pct != null ? d.acierto_top4_pct + '%' : '—',
+         'caballos predichos que entraron');
 }
 
-// ---------- PASO 2 -> 3: reuniones/carreras de ese hipódromo ----------
-async function elegirHip(h, itemEl){
-  hipodromoElegido = h;
-  document.querySelectorAll('.hip-item').forEach(c=>c.classList.remove('sel'));
-  itemEl.classList.add('sel');
-  document.getElementById('hip-elegido-txt').textContent = h.hipodromo;
-
-  document.getElementById('card-carreras').style.display = 'block';
-  document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
-  document.getElementById('paso-carreras').classList.add('open');
-  document.getElementById('card-comp').style.display = 'none';
-
-  const gridC = document.getElementById('carrera-grid');
-  gridC.innerHTML = estadoMsg('Buscando las carreras de la reunión…');
-
-  try{
-    const url = `/api/reuniones?fecha=${encodeURIComponent(fechaElegida)}&hipodromo=${encodeURIComponent(h.hipodromo)}`;
-    const data = await apiGet(url);
-    const reunion = (data.reuniones || [])[0];
-    if (!reunion || !reunion.carreras || reunion.carreras.length === 0){
-      gridC.innerHTML = estadoMsg('Todavía no hay carreras confirmadas para esa reunión.', true);
-      return;
-    }
-    meetingUrlElegida = reunion.url;
-    gridC.innerHTML = '';
-    reunion.carreras.forEach(c=>{
-      const item = document.createElement('div');
-      item.className = 'carrera-item';
-      item.innerHTML = `<div class="num">Nº ${c.numero}</div><div class="tit">${c.titulo}</div>`;
-      item.onclick = ()=> elegirCarrera(c, item);
-      gridC.appendChild(item);
-    });
-    if (data.aviso){ gridC.innerHTML += estadoMsg(data.aviso, true); }
-  }catch(e){
-    gridC.innerHTML = estadoMsg('No se pudo cargar la reunión. ' + e.message, true);
-  }
-}
-
-// ---------- PASO 4: competidores + enriquecimiento + análisis ----------
-async function elegirCarrera(c, itemEl){
-  carreraElegida = c;
-  document.querySelectorAll('.carrera-item').forEach(x=>x.classList.remove('sel'));
-  itemEl.classList.add('sel');
-  document.getElementById('carrera-elegida-txt').textContent = c.titulo;
-
-  document.getElementById('card-comp').style.display = 'block';
-  document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
-  document.getElementById('paso-comp').classList.add('open');
-
-  const list = document.getElementById('comp-list');
-  const pron = document.getElementById('pronostico');
-  list.innerHTML = estadoMsg('Cargando participantes…');
-  pron.innerHTML = '';
-
-  let carreraData;
-  try{
-    const url = `/api/carrera?url=${encodeURIComponent(meetingUrlElegida)}&numero=${c.numero}`;
-    carreraData = await apiGet(url);
-  }catch(e){
-    list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
+function pintarUltimas(lista){
+  const cont = document.getElementById('tabla-ultimas');
+  if (lista.length === 0){
+    cont.innerHTML = '<div class="estado">Todavía no hay carreras comparadas. ' +
+      'A medida que se corran, aparecen acá solas.</div>';
     return;
   }
-
-  participantesActuales = carreraData.participantes || [];
-  if (participantesActuales.length === 0){
-    list.innerHTML = estadoMsg('Todavía no hay participantes confirmados para esta carrera.', true);
-    return;
-  }
-
-  renderCompetidores(participantesActuales);
-
-  // Enriquecer (campaña/actuaciones) y luego pedir el análisis.
-  pron.innerHTML = estadoMsg('Analizando campaña de cada participante…');
-  try{
-    const enriquecidos = await apiPost('/api/enriquecer', {participantes: participantesActuales});
-    participantesActuales = enriquecidos.participantes;
-    renderCompetidores(participantesActuales); // re-render con datos enriquecidos (tags de campaña)
-
-    const contexto = {
-      pista_dia: carreraData.estado || '',
-      url: meetingUrlElegida,
-      numero: c.numero,
-      fecha: fechaElegida,
-      hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
-    };
-    const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
-    renderPronostico(analisis.ranking || []);
-  }catch(e){
-    pron.innerHTML = estadoMsg('No se pudo calcular el pronóstico. ' + e.message, true);
-  }
-}
-
-function renderCompetidores(participantes){
-  const list = document.getElementById('comp-list');
-  list.innerHTML = '';
-  participantes.forEach((cp,idx)=>{
-    const row = document.createElement('div');
-    row.className = 'comp-item';
-    const numDisplay = cp.numero != null ? cp.numero : (idx+1);
-    const subtitulo = cp.retirado
-      ? 'RETIRADO — no corre'
-      : [cp.jockey, cp.entrenador].filter(Boolean).join(' · ') || 'Sin datos de jockey';
-    row.style.opacity = cp.retirado ? '0.45' : '1';
-    row.innerHTML = `
-      <div class="silk" style="background:${cp.retirado ? '#999' : silks[idx % silks.length]}">${numDisplay}</div>
-      <div>
-        <div class="comp-nombre">${cp.nombre}</div>
-        <div class="comp-jinete">${subtitulo}</div>
-      </div>
-      <div class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</div>`;
-    row.onclick = ()=> abrirFicha(cp, idx);
-    list.appendChild(row);
+  let html = '<table><tr><th>Carrera</th><th>Pronosticado</th><th>Resultado real</th>' +
+             '<th>Ganador</th><th>Aciertos</th></tr>';
+  lista.forEach(u=>{
+    const pred = u.predicho.map((n,i)=>`${i+1}º <b>${n}</b>`).join('<br>');
+    const real = u.real.length
+      ? u.real.map((n,i)=>`${i+1}º <b>${n}</b>`).join('<br>')
+      : '—';
+    html += `<tr>
+      <td class="mono">${u.fecha || ''}<br>${u.hipodromo || ''}<br>Nº ${u.numero}</td>
+      <td class="lista-caballos">${pred}</td>
+      <td class="lista-caballos">${real}</td>
+      <td><span class="pill ${u.acerto_ganador?'si':'no'}">${u.acerto_ganador?'ACERTÓ':'no'}</span></td>
+      <td class="mono">${u.aciertos_top4 ?? 0} de 4</td>
+    </tr>`;
   });
+  cont.innerHTML = html + '</table>';
 }
 
-function renderPronostico(ranking){
-  const pron = document.getElementById('pronostico');
-  pron.innerHTML = '';
-  if (ranking.length === 0){
-    pron.innerHTML = estadoMsg('No hay suficientes participantes confirmados para pronosticar.', true);
-    return;
-  }
-  ranking.forEach((p,i)=>{
-    const row = document.createElement('div');
-    row.className = 'pron-row';
-    row.innerHTML = `
-      <div class="pron-pos">${i+1}º</div>
-      <div class="pron-bar-wrap">
-        <div class="pron-nombre">${p.nombre}</div>
-        <div class="pron-bar-bg"><div class="pron-bar" style="width:${Math.min(100,p.probabilidad_relativa*2.2)}%"></div></div>
-      </div>
-      <div class="pron-pct">${p.probabilidad_relativa}%</div>`;
-    pron.appendChild(row);
+function pintarPesos(pesos){
+  const cont = document.getElementById('tabla-pesos');
+  if (!pesos.length){ cont.innerHTML = '<div class="estado">Sin datos.</div>'; return; }
+  const max = Math.max(...pesos.map(p=>Math.abs(p.valor))) || 1;
+  let html = '<table><tr><th>Factor</th><th>Peso actual</th><th></th><th>Actualizado</th></tr>';
+  pesos.forEach(p=>{
+    const nombre = p.clave.replace(/_/g,' ');
+    const ancho = Math.abs(p.valor)/max*100;
+    html += `<tr>
+      <td>${nombre}</td>
+      <td class="mono">${Number(p.valor).toFixed(2)}</td>
+      <td><div class="barra-peso"><div style="width:${ancho}%"></div></div></td>
+      <td class="mono" style="font-size:11px; opacity:.6;">${p.actualizado_en || ''}</td>
+    </tr>`;
   });
+  cont.innerHTML = html + '</table>';
 }
 
-// ---------- Ficha del caballo ----------
-function abrirFicha(cp, idx){
-  caballoActual = {...cp, idx};
-  document.getElementById('ficha-silk').textContent = cp.numero != null ? cp.numero : (idx+1);
-  document.getElementById('ficha-silk').style.background = silks[idx % silks.length];
-  document.getElementById('ficha-nombre').textContent = cp.nombre;
-  document.getElementById('ficha-sub').textContent = `${cp.sexo ? cp.sexo + ' · ' : ''}Peso: ${cp.peso || '—'} kg`;
-  document.getElementById('ficha-tags').innerHTML = `
-    <span class="tag">Nº ${cp.numero != null ? cp.numero : (idx+1)}</span>
-    <span class="tag">${(cp.actuaciones||[]).length} carreras registradas</span>`;
-  document.getElementById('ficha-datos').innerHTML = `
-    <div>Peso: <b>${cp.peso || '—'} kg</b></div>
-    <div>${cp.campana ? cp.campana : 'Sin datos de campaña disponibles.'}</div>
-    <div><a href="${cp.perfil}" target="_blank" rel="noopener" style="color:var(--verde-turf);">Ver ficha completa en Stud Book →</a></div>`;
-
-  const camp = document.getElementById('ficha-campana');
-  camp.innerHTML = '';
-  if (!cp.actuaciones || cp.actuaciones.length === 0){
-    camp.innerHTML = '<div style="font-size:13px; opacity:.6;">Sin actuaciones cargadas todavía.</div>';
-  } else {
-    cp.actuaciones.forEach(a=>{
-      const row = document.createElement('div');
-      row.className = 'campana-row';
-      row.innerHTML = `<div class="campana-thumb">▶</div><div class="campana-info">${a}</div>`;
-      camp.appendChild(row);
-    });
-  }
-
-  actualizarBotonSeguir();
-  document.getElementById('overlay').classList.add('show');
-}
-function cerrarFicha(){ document.getElementById('overlay').classList.remove('show'); }
-
-// ---------- Seguir caballo (solo visual por ahora, sin backend/login todavía) ----------
-function actualizarBotonSeguir(){
-  const btn = document.getElementById('btn-seguir');
-  const yaSigue = seguidos.some(s => s.nombre === caballoActual.nombre);
-  btn.textContent = yaSigue ? '✓ Siguiendo — te avisamos cuando vuelva a correr' : '🔔 Seguir a este caballo';
-  btn.classList.toggle('activo', yaSigue);
-}
-function toggleSeguir(){
-  const yaSigue = seguidos.some(s => s.nombre === caballoActual.nombre);
-  if (yaSigue){
-    seguidos = seguidos.filter(s => s.nombre !== caballoActual.nombre);
-    mostrarToast(`Dejaste de seguir a ${caballoActual.nombre}.`);
-  } else {
-    seguidos.push({nombre: caballoActual.nombre, num: caballoActual.numero});
-    mostrarToast(`Vas a recibir una notificación apenas se confirme cuándo vuelve a correr ${caballoActual.nombre}. (Función completa disponible cuando agreguemos login)`);
-  }
-  actualizarBotonSeguir();
-  actualizarContadorSeguidos();
-}
-function actualizarContadorSeguidos(){
-  const c = document.getElementById('contador-seguidos');
-  if (seguidos.length > 0){ c.style.display = 'inline'; c.textContent = seguidos.length; }
-  else { c.style.display = 'none'; }
-}
-function mostrarToast(msg){
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(()=> t.classList.remove('show'), 3600);
-}
-function abrirSeguidos(){
-  const lista = document.getElementById('seg-lista');
-  lista.innerHTML = '';
-  if (seguidos.length === 0){
-    lista.innerHTML = '<div class="seg-empty">Todavía no seguís ningún caballo.<br>Abrí la ficha de un competidor y tocá "Seguir a este caballo".</div>';
-  } else {
-    seguidos.forEach(s=>{
-      const row = document.createElement('div');
-      row.className = 'seg-item';
-      row.innerHTML = `
-        <div class="silk" style="background:${silks[(s.num||1) % silks.length]}; width:30px; height:30px; font-size:12px;">${s.num||'—'}</div>
-        <div class="seg-info">
-          <div class="seg-nombre">${s.nombre}</div>
-          <div class="seg-aviso">Notificaciones activas cuando haya login</div>
-        </div>
-        <button class="seg-quitar" onclick="quitarSeguido('${s.nombre.replace(/'/g,"\\'")}')">✕</button>`;
-      lista.appendChild(row);
-    });
-  }
-  document.getElementById('seg-overlay').classList.add('show');
-}
-function cerrarSeguidos(){ document.getElementById('seg-overlay').classList.remove('show'); }
-function quitarSeguido(nombre){
-  seguidos = seguidos.filter(s => s.nombre !== nombre);
-  actualizarContadorSeguidos();
-  abrirSeguidos();
-}
-
+cargar();
+</script>
+</body>
+</html>
