@@ -1,9 +1,9 @@
 
 from flask import Flask, render_template, request, jsonify
-import requests, re, sqlite3, json, os
+import requests, re, sqlite3, json, os, time, threading
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 BASE = "https://www.studbook.org.ar"
@@ -909,7 +909,182 @@ def historial():
     con.close()
     return jsonify(ok=True,carreras=[dict(x) for x in rows])
 
+# ============================================================
+# RECOLECTOR AUTOMATICO
+# Recorre las reuniones del Stud Book, analiza cada carrera y compara
+# contra el resultado real. Corre solo en el servidor, sin que nadie
+# tenga que abrir la app.
+# ============================================================
+
+RECOLECTOR = {
+    "corriendo": False,
+    "desde": "",
+    "hasta": "",
+    "reuniones_totales": 0,
+    "reuniones_hechas": 0,
+    "carreras_guardadas": 0,
+    "carreras_comparadas": 0,
+    "errores": 0,
+    "ultimo_mensaje": "",
+    "inicio": "",
+    "fin": "",
+}
+
+PAUSA_ENTRE_PEDIDOS = float(os.getenv("PAUSA_SCRAPING", "1.5"))  # segundos
+
+
+def _log_recolector(msg):
+    RECOLECTOR["ultimo_mensaje"] = f"{datetime.now().strftime('%H:%M:%S')} — {msg}"
+
+
+def procesar_carrera(url_reunion, numero, fecha, hipodromo):
+    """
+    Analiza una carrera y la registra. Devuelve 'comparada' si la carrera
+    ya se corrio (habia puestos), 'guardada' si todavia no, o None si fallo.
+    """
+    try:
+        soup = fetch(url_reunion)
+        data = parse_race(soup, numero)
+        if not data:
+            return None
+        participantes = [p for p in data.get("participantes", []) if not p.get("retirado")]
+        if len(participantes) < 2:
+            return None
+
+        # Enriquecer solo si la carrera todavia no corrio: si ya corrio,
+        # el puesto real ya alcanza y evitamos miles de pedidos extra.
+        ya_corrida = any(p.get("puesto") for p in participantes)
+        if not ya_corrida:
+            participantes = [enrich_horse(dict(p)) for p in participantes]
+
+        pesos = cargar_pesos()
+        ranked = []
+        for p in participantes:
+            score, motivos = score_horse(p, {"participantes": participantes,
+                                             "pista_dia": data.get("estado", "")}, pesos)
+            ranked.append({**p, "score": score, "motivos": motivos})
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+        top = ranked[:4]
+        total = sum(x["score"] for x in top) or 1
+        for x in top:
+            x["probabilidad_relativa"] = round(x["score"] / total * 100, 1)
+
+        registrar_pronostico(
+            url=url_reunion, numero=numero, fecha=fecha, hipodromo=hipodromo,
+            top=top, participantes=participantes, pesos=pesos, ya_corrida=ya_corrida,
+        )
+        return "comparada" if ya_corrida else "guardada"
+    except Exception:
+        return None
+
+
+def recolectar(desde, hasta):
+    """Recorre todas las reuniones entre dos fechas y procesa sus carreras."""
+    RECOLECTOR.update({
+        "corriendo": True, "desde": desde, "hasta": hasta,
+        "reuniones_totales": 0, "reuniones_hechas": 0,
+        "carreras_guardadas": 0, "carreras_comparadas": 0, "errores": 0,
+        "inicio": datetime.now().isoformat(timespec="seconds"), "fin": "",
+    })
+    try:
+        _log_recolector("Pidiendo el calendario oficial…")
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+
+        reuniones = [r for r in calendario if desde <= r["fecha"] <= hasta]
+        RECOLECTOR["reuniones_totales"] = len(reuniones)
+        _log_recolector(f"{len(reuniones)} reuniones encontradas entre {desde} y {hasta}")
+
+        for reunion in reuniones:
+            if not RECOLECTOR["corriendo"]:
+                _log_recolector("Detenido a pedido.")
+                break
+            try:
+                soup = fetch(reunion["url"])
+                carreras = extract_races_from_meeting(soup)
+                _log_recolector(
+                    f"{reunion['fecha']} {reunion['hipodromo']}: {len(carreras)} carreras"
+                )
+                for c in carreras:
+                    if not RECOLECTOR["corriendo"]:
+                        break
+                    r = procesar_carrera(
+                        reunion["url"], c["numero"], reunion["fecha"], reunion["hipodromo"]
+                    )
+                    if r == "comparada":
+                        RECOLECTOR["carreras_comparadas"] += 1
+                    elif r == "guardada":
+                        RECOLECTOR["carreras_guardadas"] += 1
+                    else:
+                        RECOLECTOR["errores"] += 1
+                    time.sleep(PAUSA_ENTRE_PEDIDOS)
+            except Exception:
+                RECOLECTOR["errores"] += 1
+            RECOLECTOR["reuniones_hechas"] += 1
+            time.sleep(PAUSA_ENTRE_PEDIDOS)
+
+        _log_recolector("Terminado.")
+    except Exception as e:
+        _log_recolector(f"Error general: {e}")
+    finally:
+        RECOLECTOR["corriendo"] = False
+        RECOLECTOR["fin"] = datetime.now().isoformat(timespec="seconds")
+
+
+@app.post("/api/admin/recolectar")
+def admin_recolectar():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if RECOLECTOR["corriendo"]:
+        return jsonify(ok=False, error="Ya hay una recolección en curso."), 409
+
+    body = request.get_json(silent=True) or {}
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    desde = body.get("desde") or request.args.get("desde") or "2026-01-01"
+    hasta = body.get("hasta") or request.args.get("hasta") or hoy
+
+    hilo = threading.Thread(target=recolectar, args=(desde, hasta), daemon=True)
+    hilo.start()
+    return jsonify(ok=True, mensaje=f"Recolección iniciada de {desde} a {hasta}.")
+
+
+@app.post("/api/admin/detener")
+def admin_detener():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    RECOLECTOR["corriendo"] = False
+    return jsonify(ok=True, mensaje="Se pidió detener la recolección.")
+
+
+@app.get("/api/admin/estado")
+def admin_estado():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    return jsonify(ok=True, **RECOLECTOR)
+
+
+def revision_diaria():
+    """
+    Tarea de fondo permanente: cada 6 horas revisa los ultimos 7 dias.
+    Asi las carreras que se van corriendo se comparan solas, sin que
+    nadie abra la app.
+    """
+    time.sleep(60)  # dejar que el servidor termine de arrancar
+    while True:
+        try:
+            if not RECOLECTOR["corriendo"]:
+                hoy = datetime.now()
+                desde = (hoy - timedelta(days=7)).strftime("%Y-%m-%d")
+                hasta = hoy.strftime("%Y-%m-%d")
+                recolectar(desde, hasta)
+        except Exception:
+            pass
+        time.sleep(6 * 60 * 60)
+
+
 init_db()
+
+if os.getenv("REVISION_AUTOMATICA", "1") == "1":
+    threading.Thread(target=revision_diaria, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
