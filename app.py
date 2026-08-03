@@ -915,7 +915,7 @@ def buscar_ejemplares(termino):
     if len(termino) < 3:
         return []
 
-    clave = f"busqueda3:{normalize_text(termino)}"
+    clave = f"busqueda4:{normalize_text(termino)}"
     cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
     if cacheado is not None and fresco:
         return cacheado
@@ -926,7 +926,7 @@ def buscar_ejemplares(termino):
 
     vistos, encontrados = set(), []
     consultas = 0
-    MAX_CONSULTAS = 14   # tope para no demorar ni castigar al sitio
+    MAX_CONSULTAS = 10
 
     def agregar(lista):
         for item in lista:
@@ -946,60 +946,52 @@ def buscar_ejemplares(termino):
 
     def consultar(q, tipo="1", muerto="1"):
         nonlocal consultas
-        if consultas >= MAX_CONSULTAS:
+        if consultas >= MAX_CONSULTAS or not q:
             return
         consultas += 1
         agregar(_consultar_autocomplete(q, tipo, muerto))
 
-    pegado = termino.replace(" ", "")
+    # 1) El termino TAL COMO SE ESCRIBIO, con espacios y todo.
+    #    Comprobado con el diagnostico: el sitio si acepta espacios.
+    consultar(termino)
 
-    # 1) Nombre completo sin espacios, probando cada categoria de ejemplar.
-    #    Con tipo=1 solo no alcanza: hay caballos con ficha propia que no
-    #    aparecen (comprobado con CANDY GIRL).
-    for tipo in VARIANTES_TIPO:
-        if ya_esta():
-            break
-        consultar(pegado, tipo)
-
-    # 2) Probar tambien sin el filtro de fallecidos.
+    # 2) Si no aparecio, probar las otras categorias de ejemplar.
     if not ya_esta():
-        consultar(pegado, "1", "0")
-
-    # 3) Primera palabra sola: trae el listado general para elegir.
-    if not ya_esta():
-        consultar(palabras[0], "1")
-        if not encontrados:
-            for tipo in VARIANTES_TIPO[1:]:
-                if encontrados:
-                    break
-                consultar(palabras[0], tipo)
-
-    # 4) Si sigue sin aparecer, agregar letras para avanzar en el alfabeto
-    #    y sortear el tope de 15 resultados.
-    if len(palabras) > 1 and not ya_esta():
-        prefijo = palabras[0]
-        for palabra in palabras[1:]:
-            for i in range(1, len(palabra) + 1):
-                if ya_esta() or consultas >= MAX_CONSULTAS:
-                    break
-                consultar(prefijo + palabra[:i], "1")
-            prefijo += palabra
-            if ya_esta() or consultas >= MAX_CONSULTAS:
+        for tipo in VARIANTES_TIPO[1:]:
+            if ya_esta():
                 break
+            consultar(termino, tipo)
 
-    # 5) Quedarse con los que contengan TODAS las palabras buscadas.
+    # 3) Todavia no: probar sin el filtro de fallecidos.
+    if not ya_esta():
+        consultar(termino, "1", "0")
+
+    # 4) Ultimo recurso: el nombre pegado, por si el sitio lo indexa asi.
+    if not ya_esta() and len(palabras) > 1:
+        consultar(termino.replace(" ", ""))
+
+    # 5) Si aun asi no hay NADA, mostrar al menos los parecidos de la
+    #    primera palabra, para que el usuario elija.
+    if not encontrados:
+        consultar(palabras[0])
+
+    # 6) Quedarse con los que contengan TODAS las palabras buscadas.
     piezas = [normalize_text(p) for p in palabras if p]
     filtrados = [
         e for e in encontrados
         if all(p in normalize_text(e["nombre"]) for p in piezas)
     ]
-    # El nombre exacto va primero.
-    filtrados.sort(key=lambda e: (
-        normalize_text(e["nombre"]).replace(" ", "") != objetivo_pegado,
-        e["nombre"],
-    ))
+    # El nombre exacto va primero, despues los que empiezan igual.
+    def orden(e):
+        n = normalize_text(e["nombre"]).replace(" ", "")
+        if n == objetivo_pegado:
+            return (0, e["nombre"])
+        if n.startswith(objetivo_pegado):
+            return (1, e["nombre"])
+        return (2, e["nombre"])
 
-    resultado = filtrados[:25] if filtrados else encontrados[:25]
+    filtrados.sort(key=orden)
+    resultado = filtrados[:25] if filtrados else sorted(encontrados, key=orden)[:25]
     cache_set(clave, resultado)
     return resultado
 
