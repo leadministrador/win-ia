@@ -849,16 +849,19 @@ TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
 RUTA_AUTOCOMPLETE = "/ejemplares/autocomplete?tipo=1&muerto=1&term={q}"
 
 
-def _consultar_autocomplete(termino):
+def _consultar_autocomplete(termino, tipo="1", muerto="1"):
     """
     Consulta cruda al autocompletado del Stud Book.
-    Verificado en el sitio: solo responde bien con UNA palabra y devuelve
-    como maximo 15 resultados, ordenados alfabeticamente.
+    Comprobado en el sitio: solo responde con UNA palabra (sin espacios) y
+    devuelve como maximo 15 resultados, en orden alfabetico.
+    El parametro 'tipo' filtra por categoria de ejemplar: con tipo=1 no
+    aparecen todos, por eso se prueban varias variantes.
     """
     cabeceras = dict(HEADERS)
     cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
     cabeceras["X-Requested-With"] = "XMLHttpRequest"
-    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote(termino))
+    url = (f"{BASE}/ejemplares/autocomplete"
+           f"?tipo={tipo}&muerto={muerto}&term={quote(termino)}")
     try:
         r = requests.get(url, headers=cabeceras, timeout=(4, 10))
         r.raise_for_status()
@@ -868,6 +871,12 @@ def _consultar_autocomplete(termino):
     if isinstance(datos, dict):
         datos = datos.get("results") or datos.get("data") or []
     return datos if isinstance(datos, list) else []
+
+
+# Variantes de categoria a probar. La primera es la que usa el sitio; las
+# demas existen porque se comprobo que con tipo=1 faltan ejemplares
+# (por ejemplo CANDY GIRL, que tiene ficha propia pero no aparecia).
+VARIANTES_TIPO = ["1", "2", "0", "", "3"]
 
 
 def _armar_resultado(item):
@@ -906,7 +915,7 @@ def buscar_ejemplares(termino):
     if len(termino) < 3:
         return []
 
-    clave = f"busqueda2:{normalize_text(termino)}"
+    clave = f"busqueda3:{normalize_text(termino)}"
     cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
     if cacheado is not None and fresco:
         return cacheado
@@ -917,7 +926,7 @@ def buscar_ejemplares(termino):
 
     vistos, encontrados = set(), []
     consultas = 0
-    MAX_CONSULTAS = 8   # tope, para no castigar al sitio ni demorar al usuario
+    MAX_CONSULTAS = 14   # tope para no demorar ni castigar al sitio
 
     def agregar(lista):
         for item in lista:
@@ -935,36 +944,50 @@ def buscar_ejemplares(termino):
             for e in encontrados
         )
 
-    def consultar(q):
+    def consultar(q, tipo="1", muerto="1"):
         nonlocal consultas
         if consultas >= MAX_CONSULTAS:
             return
         consultas += 1
-        agregar(_consultar_autocomplete(q))
+        agregar(_consultar_autocomplete(q, tipo, muerto))
 
-    # 1) El nombre completo SIN espacios: el buscador compara asi, y con esto
-    #    la mayoria de los nombres de varias palabras se resuelven de una.
-    if len(palabras) > 1:
-        consultar(termino.replace(" ", ""))
+    pegado = termino.replace(" ", "")
 
-    # 2) La primera palabra sola: trae el listado general.
+    # 1) Nombre completo sin espacios, probando cada categoria de ejemplar.
+    #    Con tipo=1 solo no alcanza: hay caballos con ficha propia que no
+    #    aparecen (comprobado con CANDY GIRL).
+    for tipo in VARIANTES_TIPO:
+        if ya_esta():
+            break
+        consultar(pegado, tipo)
+
+    # 2) Probar tambien sin el filtro de fallecidos.
     if not ya_esta():
-        consultar(palabras[0])
+        consultar(pegado, "1", "0")
 
-    # 3) Si todavia no aparecio, se agregan letras de a poco para avanzar en el
-    #    orden alfabetico y sortear el tope de 15 resultados del sitio.
+    # 3) Primera palabra sola: trae el listado general para elegir.
+    if not ya_esta():
+        consultar(palabras[0], "1")
+        if not encontrados:
+            for tipo in VARIANTES_TIPO[1:]:
+                if encontrados:
+                    break
+                consultar(palabras[0], tipo)
+
+    # 4) Si sigue sin aparecer, agregar letras para avanzar en el alfabeto
+    #    y sortear el tope de 15 resultados.
     if len(palabras) > 1 and not ya_esta():
-        pegado = palabras[0]
+        prefijo = palabras[0]
         for palabra in palabras[1:]:
             for i in range(1, len(palabra) + 1):
                 if ya_esta() or consultas >= MAX_CONSULTAS:
                     break
-                consultar(pegado + palabra[:i])
-            pegado += palabra
+                consultar(prefijo + palabra[:i], "1")
+            prefijo += palabra
             if ya_esta() or consultas >= MAX_CONSULTAS:
                 break
 
-    # 4) Quedarse con los que contengan TODAS las palabras buscadas.
+    # 5) Quedarse con los que contengan TODAS las palabras buscadas.
     piezas = [normalize_text(p) for p in palabras if p]
     filtrados = [
         e for e in encontrados
@@ -1309,41 +1332,52 @@ def admin_diagnostico():
     ]
     # Y distintos valores de 'tipo', por si filtra por categoria de ejemplar.
     for etiqueta, q in variantes:
-        for tipo in ("1", "2", "0", ""):
-            url = f"{BASE}/ejemplares/autocomplete?tipo={tipo}&muerto=1&term={q}"
-            intento = {"variante": etiqueta, "tipo": tipo, "url": url}
-            try:
-                r = requests.get(url, headers=cabeceras, timeout=(4, 10))
-                intento["status"] = r.status_code
-                intento["content_type"] = r.headers.get("Content-Type", "")
+        for tipo in ("1", "2", "0", "", "3"):
+            for muerto in ("1", "0"):
+                url = (f"{BASE}/ejemplares/autocomplete"
+                       f"?tipo={tipo}&muerto={muerto}&term={q}")
+                intento = {"variante": etiqueta, "tipo": tipo,
+                           "muerto": muerto, "url": url}
                 try:
-                    datos = r.json()
-                    lista = datos if isinstance(datos, list) else (
-                        datos.get("results") or datos.get("data") or []
-                    )
-                    intento["cantidad"] = len(lista)
-                    intento["nombres"] = [
-                        clean(str(x.get("text", "")))
-                        for x in lista[:12] if isinstance(x, dict)
-                    ]
-                    if lista and isinstance(lista[0], dict):
-                        intento["campos_del_primero"] = list(lista[0].keys())
-                        intento["primero"] = lista[0]
-                except Exception:
-                    intento["cantidad"] = 0
-                    intento["respuesta_cruda"] = r.text[:400]
-            except Exception as e:
-                intento["error"] = str(e)
-            informe["intentos"].append(intento)
+                    r = requests.get(url, headers=cabeceras, timeout=(4, 10))
+                    intento["status"] = r.status_code
+                    try:
+                        datos = r.json()
+                        lista = datos if isinstance(datos, list) else (
+                            datos.get("results") or datos.get("data") or []
+                        )
+                        intento["cantidad"] = len(lista)
+                        intento["nombres"] = [
+                            clean(str(x.get("text", "")))
+                            for x in lista[:15] if isinstance(x, dict)
+                        ]
+                        # Marcar si el buscado aparece en esta variante.
+                        buscado = normalize_text(termino).replace(" ", "")
+                        intento["ENCONTRADO"] = any(
+                            normalize_text(n).replace(" ", "") == buscado
+                            for n in intento["nombres"]
+                        )
+                    except Exception:
+                        intento["cantidad"] = 0
+                        intento["respuesta_cruda"] = r.text[:300]
+                except Exception as e:
+                    intento["error"] = str(e)
+                informe["intentos"].append(intento)
 
-    # Resumen: cuales funcionaron.
+    # Resumen: cuales encontraron exactamente el caballo buscado.
+    aciertos = [i for i in informe["intentos"] if i.get("ENCONTRADO")]
     exitosos = [i for i in informe["intentos"] if i.get("cantidad")]
     informe["resumen"] = {
-        "variantes_con_resultados": len(exitosos),
+        "LO_ENCONTRARON": [
+            {"variante": i["variante"], "tipo": i["tipo"], "muerto": i["muerto"]}
+            for i in aciertos
+        ],
+        "variantes_con_algun_resultado": len(exitosos),
         "variantes_probadas": len(informe["intentos"]),
-        "mejor": max(exitosos, key=lambda i: i["cantidad"]) if exitosos else None,
     }
-    informe["lo_que_usa_la_app"] = buscar_ejemplares(termino)
+    informe["lo_que_usa_la_app"] = [
+        e["nombre"] for e in buscar_ejemplares(termino)
+    ]
 
     return jsonify(ok=True, **informe)
 
