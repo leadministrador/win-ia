@@ -460,6 +460,43 @@ def _resumen_del_perfil(soup, texto):
     return resumen
 
 
+TTL_DETALLE_CARRERA = 30 * 24 * 60 * 60   # 30 dias: una carrera corrida ya no cambia
+
+
+def detalle_de_carrera(url_carrera):
+    """
+    Entra a la pagina de una carrera y saca, en palabras, la condicion
+    y el estado de la pista. Se guarda en cache porque una carrera ya
+    corrida no cambia nunca.
+    """
+    if not url_carrera:
+        return {}
+
+    clave = f"detalle_carrera:{url_carrera}"
+    cacheado, fresco = cache_get(clave, TTL_DETALLE_CARRERA)
+    if cacheado is not None and fresco:
+        return cacheado
+
+    try:
+        soup = fetch(url_carrera)
+        texto = clean(soup.get_text(" "))
+
+        def sacar(patron):
+            m = re.search(patron, texto, re.I)
+            return clean(m.group(1)) if m else ""
+
+        detalle = {
+            "condicion_txt": sacar(r"Condición:\s*(.+?)\s*Pista:"),
+            "pista_txt": sacar(r"Pista:\s*(.+?)\s*\|\s*Estado:"),
+            "estado_txt": sacar(r"Estado:\s*(.+?)\s*\|\s*Categoria"),
+            "categoria_txt": sacar(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ ]+)"),
+        }
+        cache_set(clave, detalle)
+        return detalle
+    except Exception:
+        return cacheado or {}
+
+
 def enrich_horse(horse):
     profile = horse.get("perfil", "")
     if not profile:
@@ -474,6 +511,12 @@ def enrich_horse(horse):
 
         carreras = _tabla_carreras_del_perfil(soup)
         horse["carreras"] = carreras[:20]
+
+        # Para las 6 mas recientes, entrar a la pagina de la carrera y traer
+        # la condicion y el estado de pista en palabras (no en codigos).
+        for c in horse["carreras"][:6]:
+            if c.get("enlace"):
+                c.update(detalle_de_carrera(c["enlace"]))
 
         # Contadores para el pronostico y para mostrar.
         puestos = [c["puesto"] for c in carreras if c["puesto"]]
