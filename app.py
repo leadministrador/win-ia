@@ -2,7 +2,7 @@
 from flask import Flask, render_template, request, jsonify
 import requests, re, sqlite3, json, os, time, threading
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin, quote_plus, quote
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -860,7 +860,9 @@ def buscar_ejemplares(termino):
     if cacheado is not None and fresco:
         return cacheado
 
-    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote_plus(termino))
+    # El sitio manda los espacios como %20 (no como '+'), por eso se usa quote
+    # y no quote_plus: con '+' no encuentra los nombres de dos palabras.
+    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote(termino))
     cabeceras = dict(HEADERS)
     cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
     cabeceras["X-Requested-With"] = "XMLHttpRequest"
@@ -1206,6 +1208,74 @@ def admin_rendimiento():
             "aciertos_top4": u["aciertos_top4"],
         } for u in ultimos],
     )
+
+
+@app.get("/api/admin/diagnostico")
+def admin_diagnostico():
+    """
+    Herramienta de control: muestra exactamente que responde el Stud Book
+    ante una busqueda. Sirve para cualquier caso futuro en que un caballo
+    no aparezca, sin tener que adivinar el motivo.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    termino = request.args.get("q", "").strip()
+    if not termino:
+        return jsonify(ok=False, error="Falta el nombre a probar."), 400
+
+    cabeceras = dict(HEADERS)
+    cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
+    cabeceras["X-Requested-With"] = "XMLHttpRequest"
+
+    informe = {"termino": termino, "intentos": []}
+
+    # Se prueban distintas variantes para ver cual devuelve resultados.
+    variantes = [
+        ("como lo manda el sitio (%20)", quote(termino)),
+        ("con signo mas (+)", quote_plus(termino)),
+        ("sin espacios", termino.replace(" ", "")),
+        ("solo la primera palabra", quote(termino.split()[0])),
+    ]
+    # Y distintos valores de 'tipo', por si filtra por categoria de ejemplar.
+    for etiqueta, q in variantes:
+        for tipo in ("1", "2", "0", ""):
+            url = f"{BASE}/ejemplares/autocomplete?tipo={tipo}&muerto=1&term={q}"
+            intento = {"variante": etiqueta, "tipo": tipo, "url": url}
+            try:
+                r = requests.get(url, headers=cabeceras, timeout=(4, 10))
+                intento["status"] = r.status_code
+                intento["content_type"] = r.headers.get("Content-Type", "")
+                try:
+                    datos = r.json()
+                    lista = datos if isinstance(datos, list) else (
+                        datos.get("results") or datos.get("data") or []
+                    )
+                    intento["cantidad"] = len(lista)
+                    intento["nombres"] = [
+                        clean(str(x.get("text", "")))
+                        for x in lista[:12] if isinstance(x, dict)
+                    ]
+                    if lista and isinstance(lista[0], dict):
+                        intento["campos_del_primero"] = list(lista[0].keys())
+                        intento["primero"] = lista[0]
+                except Exception:
+                    intento["cantidad"] = 0
+                    intento["respuesta_cruda"] = r.text[:400]
+            except Exception as e:
+                intento["error"] = str(e)
+            informe["intentos"].append(intento)
+
+    # Resumen: cuales funcionaron.
+    exitosos = [i for i in informe["intentos"] if i.get("cantidad")]
+    informe["resumen"] = {
+        "variantes_con_resultados": len(exitosos),
+        "variantes_probadas": len(informe["intentos"]),
+        "mejor": max(exitosos, key=lambda i: i["cantidad"]) if exitosos else None,
+    }
+    informe["lo_que_usa_la_app"] = buscar_ejemplares(termino)
+
+    return jsonify(ok=True, **informe)
 
 
 @app.get("/api/videos")
