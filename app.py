@@ -849,66 +849,136 @@ TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
 RUTA_AUTOCOMPLETE = "/ejemplares/autocomplete?tipo=1&muerto=1&term={q}"
 
 
-def buscar_ejemplares(termino):
-    """Busca caballos por nombre usando el autocompletado del Stud Book."""
-    termino = clean(termino)
-    if len(termino) < 3:
-        return []
-
-    clave = f"busqueda:{normalize_text(termino)}"
-    cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
-    if cacheado is not None and fresco:
-        return cacheado
-
-    # El sitio manda los espacios como %20 (no como '+'), por eso se usa quote
-    # y no quote_plus: con '+' no encuentra los nombres de dos palabras.
-    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote(termino))
+def _consultar_autocomplete(termino):
+    """
+    Consulta cruda al autocompletado del Stud Book.
+    Verificado en el sitio: solo responde bien con UNA palabra y devuelve
+    como maximo 15 resultados, ordenados alfabeticamente.
+    """
     cabeceras = dict(HEADERS)
     cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
     cabeceras["X-Requested-With"] = "XMLHttpRequest"
-
+    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote(termino))
     try:
         r = requests.get(url, headers=cabeceras, timeout=(4, 10))
         r.raise_for_status()
         datos = r.json()
     except Exception:
-        return cacheado or []
-
+        return []
     if isinstance(datos, dict):
         datos = datos.get("results") or datos.get("data") or []
+    return datos if isinstance(datos, list) else []
 
-    resultados = []
-    for item in datos if isinstance(datos, list) else []:
-        if not isinstance(item, dict):
-            continue
-        nombre = clean(item.get("text", ""))
-        idd = item.get("id")
-        if not nombre or not idd:
-            continue
 
-        slug = item.get("url_friendly") or normalize_text(nombre).replace(" ", "-")
-        perfil = f"{BASE}/ejemplares/perfil/{idd}/{slug}"
+def _armar_resultado(item):
+    nombre = clean(item.get("text", ""))
+    idd = item.get("id")
+    if not nombre or idd is None or idd == "":
+        return None
+    slug = item.get("url_friendly") or normalize_text(nombre).replace(" ", "-")
+    partes = []
+    if item.get("leyenda"):
+        partes.append(clean(str(item["leyenda"])))
+    padres = " y ".join(
+        clean(str(item[k])) for k in ("padre", "madre") if item.get(k)
+    )
+    if padres:
+        partes.append("por " + padres)
+    return {
+        "nombre": nombre,
+        "perfil": f"{BASE}/ejemplares/perfil/{idd}/{slug}",
+        "detalle": " ".join(partes),
+        "sexo": clean(str(item.get("sexo", ""))),
+        "nacimiento": clean(str(item.get("nacimiento", ""))),
+        "pelo": clean(str(item.get("pelo", ""))),
+    }
 
-        partes = []
-        if item.get("leyenda"):
-            partes.append(clean(str(item["leyenda"])))
-        padres = " y ".join(
-            clean(str(item[k])) for k in ("padre", "madre") if item.get(k)
+
+def buscar_ejemplares(termino):
+    """
+    Busca caballos por nombre. Sortea las dos limitaciones del buscador del
+    Stud Book, comprobadas en el sitio:
+      1) con espacios devuelve vacio -> se consulta solo la primera palabra
+      2) devuelve como maximo 15, en orden alfabetico -> si el buscado no
+         entra en esa tanda, se agregan letras hasta alcanzarlo
+    """
+    termino = clean(termino)
+    if len(termino) < 3:
+        return []
+
+    clave = f"busqueda2:{normalize_text(termino)}"
+    cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
+    if cacheado is not None and fresco:
+        return cacheado
+
+    objetivo = normalize_text(termino)
+    objetivo_pegado = objetivo.replace(" ", "")
+    palabras = termino.split()
+
+    vistos, encontrados = set(), []
+    consultas = 0
+    MAX_CONSULTAS = 8   # tope, para no castigar al sitio ni demorar al usuario
+
+    def agregar(lista):
+        for item in lista:
+            if not isinstance(item, dict):
+                continue
+            r = _armar_resultado(item)
+            if not r or r["perfil"] in vistos:
+                continue
+            vistos.add(r["perfil"])
+            encontrados.append(r)
+
+    def ya_esta():
+        return any(
+            normalize_text(e["nombre"]).replace(" ", "") == objetivo_pegado
+            for e in encontrados
         )
-        if padres:
-            partes.append("por " + padres)
 
-        resultados.append({
-            "nombre": nombre,
-            "perfil": perfil,
-            "detalle": " ".join(partes),
-            "sexo": clean(str(item.get("sexo", ""))),
-            "nacimiento": clean(str(item.get("nacimiento", ""))),
-            "pelo": clean(str(item.get("pelo", ""))),
-        })
+    def consultar(q):
+        nonlocal consultas
+        if consultas >= MAX_CONSULTAS:
+            return
+        consultas += 1
+        agregar(_consultar_autocomplete(q))
 
-    cache_set(clave, resultados[:25])
-    return resultados[:25]
+    # 1) El nombre completo SIN espacios: el buscador compara asi, y con esto
+    #    la mayoria de los nombres de varias palabras se resuelven de una.
+    if len(palabras) > 1:
+        consultar(termino.replace(" ", ""))
+
+    # 2) La primera palabra sola: trae el listado general.
+    if not ya_esta():
+        consultar(palabras[0])
+
+    # 3) Si todavia no aparecio, se agregan letras de a poco para avanzar en el
+    #    orden alfabetico y sortear el tope de 15 resultados del sitio.
+    if len(palabras) > 1 and not ya_esta():
+        pegado = palabras[0]
+        for palabra in palabras[1:]:
+            for i in range(1, len(palabra) + 1):
+                if ya_esta() or consultas >= MAX_CONSULTAS:
+                    break
+                consultar(pegado + palabra[:i])
+            pegado += palabra
+            if ya_esta() or consultas >= MAX_CONSULTAS:
+                break
+
+    # 4) Quedarse con los que contengan TODAS las palabras buscadas.
+    piezas = [normalize_text(p) for p in palabras if p]
+    filtrados = [
+        e for e in encontrados
+        if all(p in normalize_text(e["nombre"]) for p in piezas)
+    ]
+    # El nombre exacto va primero.
+    filtrados.sort(key=lambda e: (
+        normalize_text(e["nombre"]).replace(" ", "") != objetivo_pegado,
+        e["nombre"],
+    ))
+
+    resultado = filtrados[:25] if filtrados else encontrados[:25]
+    cache_set(clave, resultado)
+    return resultado
 
 
 @app.get("/api/buscar-caballo")
