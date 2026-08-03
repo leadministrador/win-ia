@@ -842,79 +842,15 @@ def carrera():
 
 TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
 
-# Direcciones candidatas para buscar ejemplares por nombre. Se prueban en orden
-# hasta que alguna devuelva resultados: no todas existen en el sitio.
-RUTAS_BUSQUEDA = [
-    "/ejemplares/buscar?q={q}",
-    "/ejemplares/buscar/{q}",
-    "/ejemplares?nombre={q}",
-    "/ejemplares/listado?nombre={q}",
-    "/buscar?q={q}",
-    "/consultas/ejemplares?nombre={q}",
-]
-
-
-def _ejemplares_de_html(soup, termino):
-    """Saca los ejemplares que aparezcan en una pagina de resultados."""
-    encontrados, vistos = [], set()
-    t = normalize_text(termino)
-    for a in soup.select('a[href*="/ejemplares/perfil/"]'):
-        nombre = clean(a.get_text(" "))
-        href = a.get("href", "")
-        if not nombre or nombre in vistos:
-            continue
-        if t and t not in normalize_text(nombre):
-            continue
-        vistos.add(nombre)
-        # El texto alrededor suele traer año, sexo y padres.
-        contexto = ""
-        if a.parent:
-            contexto = clean(a.parent.get_text(" "))[:200]
-        encontrados.append({
-            "nombre": nombre,
-            "perfil": urljoin(BASE, href),
-            "detalle": contexto,
-        })
-    return encontrados
-
-
-def _ejemplares_de_json(datos, termino):
-    """Algunos buscadores devuelven JSON en vez de HTML."""
-    encontrados = []
-    t = normalize_text(termino)
-
-    def recorrer(obj):
-        if isinstance(obj, dict):
-            nombre = obj.get("nombre") or obj.get("name") or obj.get("text") or obj.get("label")
-            idd = obj.get("id") or obj.get("value") or obj.get("slug")
-            if nombre and isinstance(nombre, str):
-                nombre_limpio = clean(re.sub(r"<[^>]+>", " ", nombre))
-                if not t or t in normalize_text(nombre_limpio):
-                    perfil = ""
-                    if obj.get("url"):
-                        perfil = urljoin(BASE, str(obj["url"]))
-                    elif idd:
-                        perfil = f"{BASE}/ejemplares/perfil/{idd}/"
-                    encontrados.append({
-                        "nombre": nombre_limpio,
-                        "perfil": perfil,
-                        "detalle": "",
-                    })
-            for v in obj.values():
-                recorrer(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                recorrer(v)
-
-    recorrer(datos)
-    return encontrados
+# Buscador real del Stud Book, verificado en el sitio:
+# /ejemplares/autocomplete?tipo=1&muerto=1&term=NOMBRE
+# Devuelve JSON con: id, text, leyenda, padre, madre, sexo, nacimiento,
+# pelo, url_friendly.
+RUTA_AUTOCOMPLETE = "/ejemplares/autocomplete?tipo=1&muerto=1&term={q}"
 
 
 def buscar_ejemplares(termino):
-    """
-    Busca caballos por nombre en el Stud Book. Prueba varias direcciones
-    porque el buscador del sitio no es publico; la que funcione se recuerda.
-    """
+    """Busca caballos por nombre usando el autocompletado del Stud Book."""
     termino = clean(termino)
     if len(termino) < 3:
         return []
@@ -924,35 +860,53 @@ def buscar_ejemplares(termino):
     if cacheado is not None and fresco:
         return cacheado
 
-    # Si ya sabemos cual ruta funciona, se prueba esa primero.
-    preferida, _ = cache_get("ruta_busqueda_ok", 30 * 24 * 60 * 60)
-    rutas = list(RUTAS_BUSQUEDA)
-    if preferida in rutas:
-        rutas.remove(preferida)
-        rutas.insert(0, preferida)
+    url = BASE + RUTA_AUTOCOMPLETE.format(q=quote_plus(termino))
+    cabeceras = dict(HEADERS)
+    cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
+    cabeceras["X-Requested-With"] = "XMLHttpRequest"
 
-    for ruta in rutas:
-        url = BASE + ruta.format(q=quote_plus(termino))
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=(4, 10))
-            if r.status_code != 200:
-                continue
-            tipo = r.headers.get("Content-Type", "")
-            if "json" in tipo:
-                resultados = _ejemplares_de_json(r.json(), termino)
-            else:
-                resultados = _ejemplares_de_html(
-                    BeautifulSoup(r.text, "html.parser"), termino
-                )
-            if resultados:
-                cache_set("ruta_busqueda_ok", ruta)
-                cache_set(clave, resultados[:25])
-                return resultados[:25]
-        except Exception:
+    try:
+        r = requests.get(url, headers=cabeceras, timeout=(4, 10))
+        r.raise_for_status()
+        datos = r.json()
+    except Exception:
+        return cacheado or []
+
+    if isinstance(datos, dict):
+        datos = datos.get("results") or datos.get("data") or []
+
+    resultados = []
+    for item in datos if isinstance(datos, list) else []:
+        if not isinstance(item, dict):
+            continue
+        nombre = clean(item.get("text", ""))
+        idd = item.get("id")
+        if not nombre or not idd:
             continue
 
-    cache_set(clave, [])
-    return []
+        slug = item.get("url_friendly") or normalize_text(nombre).replace(" ", "-")
+        perfil = f"{BASE}/ejemplares/perfil/{idd}/{slug}"
+
+        partes = []
+        if item.get("leyenda"):
+            partes.append(clean(str(item["leyenda"])))
+        padres = " y ".join(
+            clean(str(item[k])) for k in ("padre", "madre") if item.get(k)
+        )
+        if padres:
+            partes.append("por " + padres)
+
+        resultados.append({
+            "nombre": nombre,
+            "perfil": perfil,
+            "detalle": " ".join(partes),
+            "sexo": clean(str(item.get("sexo", ""))),
+            "nacimiento": clean(str(item.get("nacimiento", ""))),
+            "pelo": clean(str(item.get("pelo", ""))),
+        })
+
+    cache_set(clave, resultados[:25])
+    return resultados[:25]
 
 
 @app.get("/api/buscar-caballo")
