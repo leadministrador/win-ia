@@ -522,6 +522,52 @@
     border-top-color:var(--bronce); border-radius:50%;
     animation:girar .7s linear infinite; flex-shrink:0;
   }
+  /* --- Buscador de caballo --- */
+  .buscador-caja{ padding:4px 0; }
+  .buscador-fila{ display:flex; gap:9px; }
+  .buscador-fila input{
+    flex:1; font-family:'Archivo',sans-serif; font-size:16px;
+    padding:13px 15px; border:1px solid var(--pergamino-2);
+    border-radius:5px; background:var(--hueso); color:var(--tinta);
+    min-width:0;
+  }
+  .buscador-fila input:focus{ outline:2px solid var(--bronce); outline-offset:-1px; }
+  .buscador-fila button{
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+    background:var(--verde-turf); color:var(--hueso); border:none;
+    padding:13px 22px; border-radius:5px; cursor:pointer; flex-shrink:0;
+  }
+  .buscador-fila button:hover{ background:var(--verde-turf-2); }
+  .resultado-item{
+    display:flex; align-items:center; gap:12px;
+    border:1px solid var(--pergamino-2); background:var(--hueso);
+    padding:13px 15px; border-radius:5px; margin-top:9px; cursor:pointer;
+  }
+  .resultado-item:hover{ border-color:var(--bronce); }
+  .resultado-nombre{ font-family:'Fraunces',serif; font-weight:600; font-size:16px; }
+  .resultado-detalle{
+    font-family:'Space Mono',monospace; font-size:11px; opacity:.62;
+    margin-top:3px; line-height:1.4;
+  }
+  .proxima-caja{
+    background:var(--verde-turf); color:var(--hueso);
+    border-radius:6px; padding:14px 16px; margin:14px 0;
+  }
+  .proxima-caja .p-rot{
+    font-family:'Space Mono',monospace; font-size:10px; text-transform:uppercase;
+    letter-spacing:.1em; color:var(--bronce-claro); margin-bottom:7px;
+  }
+  .proxima-item{
+    font-family:'Fraunces',serif; font-size:15px; font-weight:600;
+    padding:5px 0; border-bottom:1px solid rgba(255,255,255,.14);
+  }
+  .proxima-item:last-child{ border-bottom:none; }
+  .sin-proxima{
+    background:var(--pergamino); border-left:3px solid var(--pergamino-2);
+    padding:11px 13px; border-radius:0 4px 4px 0; font-size:13px;
+    opacity:.75; margin:14px 0;
+  }
+
   .cond-txt{
     margin-top:7px; padding:7px 9px; background:var(--pergamino);
     border-radius:4px; font-family:'Archivo',sans-serif; font-size:11.5px;
@@ -594,6 +640,7 @@
     <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
     <div class="hero-actions">
       <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
+      <button class="btn btn-ghost" onclick="abrirBuscadorCaballo()">🔍 Buscar caballo</button>
       <button class="btn btn-ghost" onclick="abrirSeguidos()">🔔 Caballos seguidos <span id="contador-seguidos" class="contador-seg" style="display:none;">0</span></button>
     </div>
   </div>
@@ -605,6 +652,29 @@
     <div class="spin"></div>
     <span id="barra-top-txt">Trabajando…</span>
     <div class="barra-top-prog"><div></div></div>
+  </div>
+
+  <!-- BUSCADOR DE CABALLO -->
+  <div class="card" id="card-buscador" style="display:none;">
+    <div class="step open" id="paso-buscador">
+      <div class="step-head" onclick="toggle('paso-buscador')">
+        <div>
+          <div class="step-label">Buscar caballo</div>
+          <h3 class="step-title">Escribí el nombre</h3>
+        </div>
+        <span class="chev">⌄</span>
+      </div>
+      <div class="step-body">
+        <div class="buscador-caja">
+          <div class="buscador-fila">
+            <input type="text" id="q-caballo" placeholder="Por ejemplo: Amiguita"
+                   onkeydown="if(event.key==='Enter') buscarCaballo()">
+            <button onclick="buscarCaballo()">Buscar</button>
+          </div>
+          <div id="resultados-caballo"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- PASO 1: FECHA -->
@@ -974,6 +1044,70 @@ function renderPronostico(ranking){
   });
 }
 
+// ---------- Buscador de caballo ----------
+function abrirBuscadorCaballo(){
+  document.getElementById('card-buscador').style.display = 'block';
+  document.getElementById('paso-buscador').classList.add('open');
+  document.getElementById('buscar').scrollIntoView({behavior:'smooth'});
+  setTimeout(()=> document.getElementById('q-caballo').focus(), 400);
+}
+
+async function buscarCaballo(){
+  const q = document.getElementById('q-caballo').value.trim();
+  const cont = document.getElementById('resultados-caballo');
+  if (q.length < 3){
+    cont.innerHTML = estadoMsg('Escribí al menos 3 letras.', true);
+    return;
+  }
+  cont.innerHTML = estadoMsg('Buscando en el Stud Book…');
+  mostrarBarra('Buscando caballos…');
+  try{
+    const d = await apiGet('/api/buscar-caballo?q=' + encodeURIComponent(q));
+    const lista = d.resultados || [];
+    cont.innerHTML = '';
+    lista.forEach(r=>{
+      const item = document.createElement('div');
+      item.className = 'resultado-item';
+      item.innerHTML = `
+        <div style="flex:1; min-width:0;">
+          <div class="resultado-nombre">${r.nombre}</div>
+          ${r.detalle ? '<div class="resultado-detalle">'+r.detalle+'</div>' : ''}
+        </div>
+        <span class="chev">→</span>`;
+      item.onclick = ()=> abrirFichaPorNombre(r.perfil);
+      cont.appendChild(item);
+    });
+  }catch(e){
+    cont.innerHTML = estadoMsg(e.message, true);
+  }finally{
+    ocultarBarra();
+  }
+}
+
+async function abrirFichaPorNombre(perfil){
+  mostrarBarra('Cargando la ficha del caballo…');
+  try{
+    const d = await apiGet('/api/caballo?perfil=' + encodeURIComponent(perfil));
+    // Reusar la misma ficha, agregandole las proximas carreras.
+    abrirFicha({
+      nombre: d.nombre,
+      numero: null,
+      perfil: d.perfil,
+      peso: '',
+      sexo: d.sexo, edad: d.edad,
+      padre: d.padre, madre: d.madre, logro: d.logro,
+      carreras: d.carreras || [],
+      corridas: d.corridas, victorias: d.victorias, podios: d.podios,
+      proximas: d.proximas || [],
+      sin_proximas: d.sin_proximas,
+    }, 0);
+  }catch(e){
+    alert('No se pudo cargar el caballo. ' + e.message);
+  }finally{
+    ocultarBarra();
+  }
+}
+
 // ---------- Ficha del caballo ----------
 function abrirFicha(cp, idx){
   caballoActual = {...cp, idx};
@@ -995,8 +1129,19 @@ function abrirFicha(cp, idx){
       ? `<span class="tag">${carreras.length} carreras</span>`
       : `<span class="tag">Debutante</span>`);
 
-  // --- Resumen limpio ---
+  // --- Próximas carreras (solo cuando se llega desde el buscador) ---
   let datos = '';
+  if (cp.proximas && cp.proximas.length){
+    datos += '<div class="proxima-caja"><div class="p-rot">Próximas carreras</div>';
+    cp.proximas.forEach(p=>{
+      datos += `<div class="proxima-item">${p.texto}</div>`;
+    });
+    datos += '</div>';
+  } else if (cp.sin_proximas){
+    datos += '<div class="sin-proxima">No tiene carreras previstas por ahora.</div>';
+  }
+
+  // --- Resumen limpio ---
   if (carreras.length){
     datos += `<div class="resumen-grid">
       <div class="resumen-item"><div class="r-rot">Corridas</div><div class="r-val">${cp.corridas ?? carreras.length}</div></div>
