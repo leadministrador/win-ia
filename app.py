@@ -44,6 +44,24 @@ def init_db():
       valor TEXT NOT NULL,
       actualizado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS pronosticos(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL, numero INTEGER NOT NULL,
+      fecha TEXT, hipodromo TEXT,
+      ranking TEXT NOT NULL,        -- lo que predijo la app
+      resultado TEXT,               -- puestos reales, cuando la carrera se corre
+      acierto_ganador INTEGER,      -- 1 si acerto el 1o, 0 si no, NULL si no corrio
+      aciertos_top4 INTEGER,        -- cuantos de los 4 predichos entraron entre los 4
+      pesos_usados TEXT,            -- version del algoritmo con la que se predijo
+      creado_en TEXT NOT NULL,
+      comparado_en TEXT,
+      UNIQUE(url,numero)
+    );
+    CREATE TABLE IF NOT EXISTS algoritmo(
+      clave TEXT PRIMARY KEY,
+      valor REAL NOT NULL,
+      actualizado_en TEXT NOT NULL
+    );
     """)
     con.commit()
     con.close()
@@ -329,23 +347,67 @@ def enrich_horse(horse):
         horse.setdefault("actuaciones", [])
     return horse
 
-def score_horse(h, context):
+# ============================================================
+# APRENDIZAJE: los valores del algoritmo dejan de ser fijos.
+# Se guardan en la base y se ajustan comparando pronostico vs resultado.
+# ============================================================
+
+PESOS_INICIALES = {
+    "campana_disponible": 1.2,
+    "registra_victorias": 8.0,
+    "hipodromos_principales": 4.0,
+    "peso_liviano": 5.0,
+    "peso_pesado": -3.0,
+    "victoria_reciente": 4.0,
+    "podio_reciente": 2.0,
+    "pista_compatible": 7.0,
+}
+
+def cargar_pesos():
+    """Lee los pesos del algoritmo. Si no existen todavia, usa los iniciales."""
+    try:
+        con = db()
+        filas = con.execute("SELECT clave, valor FROM algoritmo").fetchall()
+        con.close()
+        guardados = {f["clave"]: f["valor"] for f in filas}
+    except Exception:
+        guardados = {}
+    pesos = dict(PESOS_INICIALES)
+    pesos.update({k: v for k, v in guardados.items() if k in PESOS_INICIALES})
+    return pesos
+
+def guardar_pesos(pesos):
+    con = db()
+    ahora = datetime.now().isoformat(timespec="seconds")
+    for clave, valor in pesos.items():
+        con.execute("""
+            INSERT INTO algoritmo(clave, valor, actualizado_en) VALUES(?,?,?)
+            ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                            actualizado_en=excluded.actualizado_en
+        """, (clave, float(valor), ahora))
+    con.commit()
+    con.close()
+
+
+def score_horse(h, context, pesos=None):
     # Puntaje transparente. Solo usa datos detectados o cargados.
+    P = pesos if pesos is not None else cargar_pesos()
     score, reasons = 50.0, []
     acts = h.get("actuaciones", [])
     campaign = h.get("campana", "").lower()
     detail = h.get("detalle", "").lower()
 
     if acts:
-        score += min(14, len(acts) * 1.2)
+        score += min(14, len(acts) * P["campana_disponible"])
         reasons.append("tiene campaña reciente disponible")
     if "ganador" in campaign or "ganadora" in campaign:
-        score += 8; reasons.append("registra victorias")
+        score += P["registra_victorias"]; reasons.append("registra victorias")
     if "debut" in campaign or not acts:
         score += 1
         reasons.append("debutante o historial limitado: se mantiene sin penalización fuerte")
     if any(x in campaign for x in ["palermo","san isidro","la plata"]):
-        score += 4; reasons.append("experiencia en hipódromos principales")
+        score += P["hipodromos_principales"]
+        reasons.append("experiencia en hipódromos principales")
     # Peso relativo al resto de la carrera (no un umbral fijo).
     peso_propio = _to_float(h.get("peso"))
     pesos_carrera = [
@@ -357,26 +419,27 @@ def score_horse(h, context):
         promedio = sum(pesos_carrera) / len(pesos_carrera)
         diferencia = promedio - peso_propio
         if diferencia >= 1.5:
-            score += 5
+            score += P["peso_liviano"]
             reasons.append(f"lleva {diferencia:.1f} kg menos que el promedio de la carrera")
         elif diferencia <= -1.5:
-            score -= 3
+            score += P["peso_pesado"]
             reasons.append(f"lleva {abs(diferencia):.1f} kg más que el promedio de la carrera")
 
     # Puestos recientes leidos de la campaña (1º, 2º, 3º en las ultimas salidas).
     victorias = len(re.findall(r"\b1\s*[º°]", " ".join(acts)))
     podios = len(re.findall(r"\b[123]\s*[º°]", " ".join(acts)))
     if victorias:
-        score += min(10, victorias * 4)
+        score += min(10, victorias * P["victoria_reciente"])
         reasons.append(f"{victorias} victoria(s) en su campaña reciente")
     if podios > victorias:
-        score += min(6, (podios - victorias) * 2)
+        score += min(6, (podios - victorias) * P["podio_reciente"])
         reasons.append(f"{podios} llegada(s) entre los tres primeros")
 
     if context.get("pista_dia") in ["Pesada","Barrosa","Húmeda"] and any(
         x in (campaign+" "+detail) for x in ["pesada","barrosa","húmeda","humeda"]
     ):
-        score += 7; reasons.append("antecedente compatible con la pista del día")
+        score += P["pista_compatible"]
+        reasons.append("antecedente compatible con la pista del día")
     return round(max(1, min(99, score)), 1), reasons
 
 
@@ -600,73 +663,10 @@ def analizar():
     horses = [h for h in data.get("participantes",[]) if not h.get("retirado")]
     if len(horses) < 2:
         return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
+    pesos = cargar_pesos()
     ranked = []
     for h in horses:
-        score, reasons = score_horse(h, data)
+        score, reasons = score_horse(h, data, pesos)
         ranked.append({**h,"score":score,"motivos":reasons})
     ranked.sort(key=lambda x:x["score"], reverse=True)
     top = ranked[:4]
-    total = sum(x["score"] for x in top) or 1
-    for x in top:
-        x["probabilidad_relativa"] = round(x["score"]/total*100,1)
-    return jsonify(ok=True,ranking=top,confianza=round(top[0]["score"],1))
-
-@app.get("/api/videos")
-def videos():
-    horse = request.args.get("caballo","").strip()
-    if not horse:
-        return jsonify(ok=False,error="Falta el caballo."),400
-    query = f'{horse} carrera caballo Argentina'
-    if not YOUTUBE_API_KEY:
-        return jsonify(ok=True,modo="busqueda",url="https://www.youtube.com/results?search_query="+quote_plus(query),videos=[])
-    url = "https://www.googleapis.com/youtube/v3/search"
-    params = {"part":"snippet","q":query,"type":"video","maxResults":5,"key":YOUTUBE_API_KEY}
-    r = requests.get(url,params=params,timeout=20)
-    r.raise_for_status()
-    items = [{
-        "id":x["id"]["videoId"],
-        "titulo":x["snippet"]["title"],
-        "miniatura":x["snippet"]["thumbnails"]["medium"]["url"]
-    } for x in r.json().get("items",[])]
-    return jsonify(ok=True,modo="api",videos=items)
-
-@app.post("/api/guardar")
-def guardar():
-    data = request.get_json(silent=True) or {}
-    if not all(data.get(k) for k in ["fecha","hipodromo","numero","participantes"]):
-        return jsonify(ok=False,error="Faltan datos."),400
-    con = db()
-    con.execute("""
-    INSERT INTO carreras(fecha,hipodromo,numero,premio,distancia,superficie,
-    estado_publicado,condicion,pista_dia,clima,viento,retiros,observaciones,
-    participantes,analisis,resultado_real,creado_en)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(fecha,hipodromo,numero) DO UPDATE SET
-    pista_dia=excluded.pista_dia,clima=excluded.clima,viento=excluded.viento,
-    retiros=excluded.retiros,observaciones=excluded.observaciones,
-    participantes=excluded.participantes,analisis=excluded.analisis,
-    creado_en=excluded.creado_en
-    """,(
-      data["fecha"],data["hipodromo"],int(data["numero"]),data.get("premio",""),
-      data.get("distancia"),data.get("superficie",""),data.get("estado_publicado",""),
-      data.get("condicion",""),data.get("pista_dia",""),data.get("clima",""),
-      data.get("viento",""),json.dumps(data.get("retiros",[]),ensure_ascii=False),
-      data.get("observaciones",""),json.dumps(data["participantes"],ensure_ascii=False),
-      json.dumps(data.get("analisis",{}),ensure_ascii=False),"",
-      datetime.now().isoformat(timespec="seconds")
-    ))
-    con.commit(); con.close()
-    return jsonify(ok=True,mensaje="Carrera y análisis guardados.")
-
-@app.get("/api/historial")
-def historial():
-    con=db()
-    rows=con.execute("""SELECT id,fecha,hipodromo,numero,premio,pista_dia,clima,
-    analisis,resultado_real FROM carreras ORDER BY fecha DESC,numero""").fetchall()
-    con.close()
-    return jsonify(ok=True,carreras=[dict(x) for x in rows])
-
-init_db()
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
