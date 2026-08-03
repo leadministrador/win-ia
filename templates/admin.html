@@ -77,6 +77,49 @@
     overflow:hidden; margin-top:5px; width:120px;
   }
   .barra-peso div{ height:100%; background:var(--bronce); }
+  .caja-recolector{
+    background:var(--pergamino); border:1px solid var(--pergamino-2);
+    border-radius:6px; padding:20px; margin-top:14px;
+  }
+  .fila-form{ display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .campo label{
+    display:block; font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.08em; opacity:.6; margin-bottom:5px;
+  }
+  .campo input{
+    font-family:'Space Mono',monospace; font-size:13px; padding:9px 11px;
+    border:1px solid var(--pergamino-2); border-radius:4px;
+    background:var(--hueso); color:var(--tinta);
+  }
+  .btn{
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:14px;
+    border:none; cursor:pointer; padding:11px 20px; border-radius:4px;
+  }
+  .btn-run{ background:var(--verde-turf); color:var(--hueso); }
+  .btn-run:hover{ background:var(--verde-turf-2); }
+  .btn-stop{ background:var(--carmin); color:var(--hueso); }
+  .btn:disabled{ opacity:.4; cursor:not-allowed; }
+  .progreso{ margin-top:16px; }
+  .progreso-bg{
+    background:var(--pergamino-2); height:8px; border-radius:4px; overflow:hidden;
+  }
+  .progreso-bar{
+    height:100%; background:linear-gradient(90deg,var(--bronce),var(--carmin));
+    width:0%; transition:width .4s ease;
+  }
+  .progreso-txt{
+    font-family:'Space Mono',monospace; font-size:12px; margin-top:8px; opacity:.75;
+  }
+  .chips{ display:flex; gap:18px; flex-wrap:wrap; margin-top:12px; }
+  .chip-dato{ font-family:'Space Mono',monospace; font-size:12px; }
+  .chip-dato b{ font-family:'Fraunces',serif; font-size:17px; display:block; color:var(--verde-turf); }
+  .punto{
+    display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:#bbb; margin-right:7px; vertical-align:1px;
+  }
+  .punto.activo{ background:var(--carmin); animation:latir 1s infinite; }
+  @keyframes latir{ 50%{ opacity:.3; } }
+
   .estado{
     font-family:'Space Mono',monospace; font-size:13px; padding:20px 0; opacity:.7;
   }
@@ -100,6 +143,35 @@
 <div class="tarjetas" id="tarjetas"></div>
 
 <div class="wrap">
+  <h2>Recolección automática</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Recorre las carreras del Stud Book sola y las compara contra el resultado.
+    Podés cerrar esta página: el servidor sigue trabajando.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="fila-form">
+      <div class="campo">
+        <label>Desde</label>
+        <input type="date" id="desde" value="2026-01-01">
+      </div>
+      <div class="campo">
+        <label>Hasta</label>
+        <input type="date" id="hasta">
+      </div>
+      <button class="btn btn-run" id="btn-run" onclick="arrancar()">Iniciar recolección</button>
+      <button class="btn btn-stop" id="btn-stop" onclick="detener()" disabled>Detener</button>
+    </div>
+
+    <div class="progreso">
+      <div class="progreso-bg"><div class="progreso-bar" id="barra"></div></div>
+      <div class="progreso-txt" id="progreso-txt">
+        <span class="punto" id="punto"></span>Sin actividad.
+      </div>
+      <div class="chips" id="chips"></div>
+    </div>
+  </div>
+
   <h2>Últimas carreras comparadas</h2>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
 
@@ -188,6 +260,69 @@ function pintarPesos(pesos){
   });
   cont.innerHTML = html + '</table>';
 }
+
+// ---------- Recolector automatico ----------
+document.getElementById('hasta').value = new Date().toISOString().slice(0,10);
+
+async function arrancar(){
+  const desde = document.getElementById('desde').value;
+  const hasta = document.getElementById('hasta').value;
+  if (!desde || !hasta){ alert('Elegí las dos fechas.'); return; }
+  document.getElementById('btn-run').disabled = true;
+  try{
+    const r = await fetch('/api/admin/recolectar?clave=' + encodeURIComponent(clave), {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({desde, hasta})
+    });
+    const d = await r.json();
+    if (d.ok === false) alert(d.error);
+  }catch(e){ alert('No se pudo iniciar: ' + e.message); }
+  setTimeout(verEstado, 800);
+}
+
+async function detener(){
+  await fetch('/api/admin/detener?clave=' + encodeURIComponent(clave), {method:'POST'});
+  setTimeout(verEstado, 500);
+}
+
+async function verEstado(){
+  try{
+    const r = await fetch('/api/admin/estado?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    const corriendo = d.corriendo;
+    document.getElementById('btn-run').disabled = corriendo;
+    document.getElementById('btn-stop').disabled = !corriendo;
+    document.getElementById('punto').className = 'punto' + (corriendo ? ' activo' : '');
+
+    const pct = d.reuniones_totales
+      ? Math.round(d.reuniones_hechas / d.reuniones_totales * 100) : 0;
+    document.getElementById('barra').style.width = pct + '%';
+
+    let txt = '<span class="punto ' + (corriendo?'activo':'') + '"></span>';
+    if (corriendo){
+      txt += `Trabajando… ${d.reuniones_hechas} de ${d.reuniones_totales} reuniones (${pct}%)`;
+    } else if (d.fin){
+      txt += 'Terminado. ' + (d.ultimo_mensaje || '');
+    } else {
+      txt += 'Sin actividad.';
+    }
+    if (d.ultimo_mensaje && corriendo) txt += '<br>' + d.ultimo_mensaje;
+    document.getElementById('progreso-txt').innerHTML = txt;
+
+    document.getElementById('chips').innerHTML = `
+      <div class="chip-dato"><b>${d.carreras_comparadas}</b>comparadas</div>
+      <div class="chip-dato"><b>${d.carreras_guardadas}</b>por correr</div>
+      <div class="chip-dato"><b>${d.errores}</b>sin datos</div>`;
+
+    if (corriendo) cargar();   // refrescar tambien las estadisticas
+  }catch(e){}
+}
+
+setInterval(verEstado, 4000);
+verEstado();
 
 cargar();
 </script>
