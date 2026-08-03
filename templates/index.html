@@ -784,7 +784,13 @@ async function elegirCarrera(c, itemEl){
     participantesActuales = enriquecidos.participantes;
     renderCompetidores(participantesActuales); // re-render con datos enriquecidos (tags de campaña)
 
-    const contexto = {pista_dia: carreraData.estado || ''};
+    const contexto = {
+      pista_dia: carreraData.estado || '',
+      url: meetingUrlElegida,
+      numero: c.numero,
+      fecha: fechaElegida,
+      hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
+    };
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
     renderPronostico(analisis.ranking || []);
   }catch(e){
@@ -928,9 +934,3 @@ function quitarSeguido(nombre){
   abrirSeguidos();
 }
 
-// ---------- Arranque ----------
-cargarCalendario();
-</script>
-</script>
-</body>
-</html>
