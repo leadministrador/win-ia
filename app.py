@@ -512,12 +512,6 @@ def enrich_horse(horse):
         carreras = _tabla_carreras_del_perfil(soup)
         horse["carreras"] = carreras[:20]
 
-        # Para las 6 mas recientes, entrar a la pagina de la carrera y traer
-        # la condicion y el estado de pista en palabras (no en codigos).
-        for c in horse["carreras"][:6]:
-            if c.get("enlace"):
-                c.update(detalle_de_carrera(c["enlace"]))
-
         # Contadores para el pronostico y para mostrar.
         puestos = [c["puesto"] for c in carreras if c["puesto"]]
         horse["victorias"] = sum(1 for p in puestos if p == 1)
@@ -845,6 +839,18 @@ def carrera():
         return jsonify(**resp)
     except Exception as e:
         return jsonify(ok=False,error="No se pudo cargar la carrera.",detalle=str(e)),502
+
+@app.get("/api/detalle-carrera")
+def api_detalle_carrera():
+    """Devuelve pista, estado y condicion en palabras de una carrera puntual."""
+    url = request.args.get("url", "")
+    if not url.startswith(BASE) and not url.startswith("https://studbook.org.ar"):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+    detalle = detalle_de_carrera(url)
+    if not detalle:
+        return jsonify(ok=False, error="No se pudo leer el detalle."), 502
+    return jsonify(ok=True, **detalle)
+
 
 @app.post("/api/enriquecer")
 def enriquecer():
