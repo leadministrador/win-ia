@@ -326,25 +326,172 @@ def parse_race(soup, numero):
     }
 
 
+def _tabla_carreras_del_perfil(soup):
+    """
+    Busca la tabla CARRERAS de la ficha del ejemplar y la lee por columnas:
+    Fecha | video | Hip. | Nº | O | Dist. | Tiempo | Premio | Cat. | Cond. |
+    P | E | Kg | Jockey | Caballeriza
+    Devuelve una lista de carreras corridas, cada una con su video si lo tiene.
+    """
+    mejor = []
+    for table in soup.find_all("table"):
+        encabezados = [
+            clean(th.get_text(" ")).lower().rstrip(".")
+            for th in (table.find_all("th") or [])
+        ]
+        # La tabla de campaña se reconoce por tener Dist. y Jockey.
+        if not any("dist" in h for h in encabezados):
+            continue
+        if not any("jockey" in h for h in encabezados):
+            continue
+
+        idx = {}
+        for i, h in enumerate(encabezados):
+            if "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
+            elif h in ("n°", "n", "nº") and "puesto" not in idx: idx["puesto"] = i
+            elif h == "o" and "numero" not in idx: idx["numero"] = i
+            elif "dist" in h and "distancia" not in idx: idx["distancia"] = i
+            elif "tiempo" in h and "tiempo" not in idx: idx["tiempo"] = i
+            elif "premio" in h and "premio" not in idx: idx["premio"] = i
+            elif h == "cat" and "categoria" not in idx: idx["categoria"] = i
+            elif h == "cond" and "condicion" not in idx: idx["condicion"] = i
+            elif h == "p" and "pista" not in idx: idx["pista"] = i
+            elif h == "e" and "estado" not in idx: idx["estado"] = i
+            elif h == "kg" and "kilos" not in idx: idx["kilos"] = i
+            elif "jockey" in h and "jockey" not in idx: idx["jockey"] = i
+            elif "caballeriza" in h and "caballeriza" not in idx: idx["caballeriza"] = i
+
+        filas = []
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all("td")
+            if not celdas:
+                continue
+            texto_fila = clean(tr.get_text(" "))
+            m_fecha = re.search(r"(\d{2}/\d{2}/\d{4})", texto_fila)
+            if not m_fecha:
+                continue
+
+            def col(clave):
+                i = idx.get(clave)
+                if i is None or i >= len(celdas):
+                    return ""
+                return clean(celdas[i].get_text(" "))
+
+            # El video es un enlace a youtube dentro de la fila.
+            video = ""
+            for a in tr.find_all("a", href=True):
+                m_yt = re.search(r"youtube\.com/embed/([A-Za-z0-9_-]{6,})", a["href"])
+                if m_yt:
+                    video = m_yt.group(1)
+                    break
+
+            enlace_carrera = ""
+            for a in tr.find_all("a", href=True):
+                if "/reuniones/carrera/" in a["href"]:
+                    enlace_carrera = urljoin(BASE, a["href"])
+                    break
+
+            puesto_txt = col("puesto")
+            filas.append({
+                "fecha": m_fecha.group(1),
+                "hipodromo": col("hipodromo"),
+                "puesto": int(puesto_txt) if puesto_txt.isdigit() else None,
+                "numero": col("numero"),
+                "distancia": col("distancia"),
+                "tiempo": col("tiempo"),
+                "premio": col("premio"),
+                "categoria": col("categoria"),
+                "condicion": col("condicion"),
+                "pista": col("pista"),
+                "estado": col("estado"),
+                "kilos": col("kilos"),
+                "jockey": col("jockey"),
+                "caballeriza": col("caballeriza"),
+                "video": video,
+                "enlace": enlace_carrera,
+            })
+
+        if len(filas) > len(mejor):
+            mejor = filas
+    return mejor
+
+
+def _resumen_del_perfil(soup, texto):
+    """Saca un resumen corto y legible, sin el bloque gigante de porcentajes."""
+    resumen = {}
+
+    m = re.search(r"\b(Macho|Hembra)\b", texto, re.I)
+    resumen["sexo"] = m.group(1) if m else ""
+
+    m = re.search(r"(\d{2}/\d{2}/\d{4})\s*\((\d+)\s*años?\)", texto)
+    if m:
+        resumen["nacimiento"] = m.group(1)
+        resumen["edad"] = m.group(2)
+
+    # Padre y madre: aparecen como "por PADRE y MADRE"
+    m = re.search(r"\bpor\s+(.+?)\s+y\s+(.+?)\s+por\b", texto)
+    if m:
+        resumen["padre"] = clean(m.group(1))[:60]
+        resumen["madre"] = clean(m.group(2))[:60]
+
+    # Frase resumen que el propio sitio arma, ej:
+    # "Ganadora de 4 carreras en Palermo - $31.320.000, a los 4 y 5 años."
+    # Se corta en el punto final real, no en los puntos de miles.
+    m = re.search(
+        r"(Ganador[a]?\s+de\s+\d+\s+carreras?.{0,160}?\.)(?:\s|$)",
+        texto, re.I
+    )
+    if m:
+        frase = clean(m.group(1))
+        # Si se cortó dentro de un número (ej "$31."), estirar hasta el punto siguiente.
+        if re.search(r"\$[\d.]*\.$", frase):
+            m2 = re.search(
+                r"(Ganador[a]?\s+de\s+\d+\s+carreras?.{0,200}?años?\.)",
+                texto, re.I
+            )
+            if m2:
+                frase = clean(m2.group(1))
+        resumen["logro"] = frase
+
+    m = re.search(r"CARRERAS\s*\((\d+)\)", texto, re.I)
+    if m:
+        resumen["total_carreras"] = m.group(1)
+
+    return resumen
+
+
 def enrich_horse(horse):
     profile = horse.get("perfil", "")
     if not profile:
         return horse
     try:
         soup = fetch(profile)
-        text = clean(soup.get_text(" "))
-        horse["sexo"] = (re.search(r"\b(Macho|Hembra)\b", text, re.I) or [None, ""])[1]
-        horse["campana"] = clean((re.search(r"#?\s*CAMPAÑA\s*(.+?)(?:POR HIPODROMO|PEDIGREE|$)", text, re.I) or [None, ""])[1])[:1000]
-        horse["actuaciones"] = []
-        for tr in soup.find_all("tr"):
-            row = clean(tr.get_text(" "))
-            if re.search(r"\d{2}/\d{2}/\d{4}", row):
-                horse["actuaciones"].append(row[:500])
-        horse["actuaciones"] = horse["actuaciones"][:12]
+        texto = clean(soup.get_text(" "))
+
+        resumen = _resumen_del_perfil(soup, texto)
+        horse.update({k: v for k, v in resumen.items() if v})
+        horse.setdefault("sexo", "")
+
+        carreras = _tabla_carreras_del_perfil(soup)
+        horse["carreras"] = carreras[:20]
+
+        # Contadores para el pronostico y para mostrar.
+        puestos = [c["puesto"] for c in carreras if c["puesto"]]
+        horse["victorias"] = sum(1 for p in puestos if p == 1)
+        horse["podios"] = sum(1 for p in puestos if p <= 3)
+        horse["corridas"] = len(carreras)
+
+        # Compatibilidad con el resto del codigo que espera 'actuaciones'.
+        horse["actuaciones"] = [
+            f"{c['fecha']} {c['hipodromo']} {c['puesto']}º {c['distancia']}m"
+            for c in carreras if c["puesto"]
+        ][:20]
+        horse["campana"] = resumen.get("logro", "")
     except Exception:
         horse.setdefault("sexo", "")
         horse.setdefault("campana", "")
         horse.setdefault("actuaciones", [])
+        horse.setdefault("carreras", [])
     return horse
 
 # ============================================================
@@ -425,12 +572,17 @@ def score_horse(h, context, pesos=None):
             score += P["peso_pesado"]
             reasons.append(f"lleva {abs(diferencia):.1f} kg más que el promedio de la carrera")
 
-    # Puestos recientes leidos de la campaña (1º, 2º, 3º en las ultimas salidas).
-    victorias = len(re.findall(r"\b1\s*[º°]", " ".join(acts)))
-    podios = len(re.findall(r"\b[123]\s*[º°]", " ".join(acts)))
+    # Victorias y podios: si vienen contados de la ficha se usan directo;
+    # si no, se intentan leer del texto de las actuaciones.
+    if h.get("corridas") is not None:
+        victorias = h.get("victorias", 0)
+        podios = h.get("podios", 0)
+    else:
+        victorias = len(re.findall(r"\b1\s*[º°]", " ".join(acts)))
+        podios = len(re.findall(r"\b[123]\s*[º°]", " ".join(acts)))
     if victorias:
         score += min(10, victorias * P["victoria_reciente"])
-        reasons.append(f"{victorias} victoria(s) en su campaña reciente")
+        reasons.append(f"{victorias} victoria(s) en su campaña")
     if podios > victorias:
         score += min(6, (podios - victorias) * P["podio_reciente"])
         reasons.append(f"{podios} llegada(s) entre los tres primeros")
