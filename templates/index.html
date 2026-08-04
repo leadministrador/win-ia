@@ -489,29 +489,46 @@
   .carrera-extra.abierta{ display:block; }
 
   /* barra de carga visible arriba */
+  /* ====== CARTEL DE CARGA GRANDE ====== */
   .barra-top{
-    position:sticky; top:0; z-index:20;
+    position:sticky; top:8px; z-index:20;
     background:var(--verde-turf); color:var(--hueso);
-    padding:11px 16px; border-radius:6px; margin-bottom:14px;
-    display:none; align-items:center; gap:10px;
-    font-family:'Space Mono',monospace; font-size:12px;
-    box-shadow:0 4px 14px rgba(21,56,50,.25);
+    border-radius:10px; padding:20px 20px 18px; margin-bottom:16px;
+    display:none;
+    box-shadow:0 8px 26px rgba(21,56,50,.3);
   }
-  .barra-top.visible{ display:flex; }
-  .barra-top .spin{
-    width:12px; height:12px; border:2px solid rgba(255,255,255,.25);
-    border-top-color:var(--bronce-claro); border-radius:50%;
-    animation:girar .7s linear infinite; flex-shrink:0;
+  .barra-top.visible{ display:block; }
+  .carga-fila{ display:flex; align-items:center; gap:15px; }
+  .caballito{
+    width:44px; height:44px; flex-shrink:0;
+    animation:galope 1.1s ease-in-out infinite;
   }
-  .barra-top-prog{
-    flex:1; height:4px; background:rgba(255,255,255,.2);
-    border-radius:2px; overflow:hidden;
+  @keyframes galope{
+    0%,100%{ transform:translateY(0) rotate(-2deg); }
+    50%{ transform:translateY(-7px) rotate(2deg); }
   }
-  .barra-top-prog div{
-    height:100%; width:12%; background:var(--bronce-claro);
-    border-radius:2px; animation:avanzar 1.6s ease-in-out infinite;
+  .carga-texto{ flex:1; min-width:0; }
+  .carga-titulo{
+    font-family:'Fraunces',serif; font-size:19px; font-weight:600; line-height:1.25;
   }
-  @keyframes avanzar{ 0%{width:12%} 50%{width:78%} 100%{width:12%} }
+  .carga-paso{
+    font-family:'Space Mono',monospace; font-size:12.5px;
+    color:var(--bronce-claro); margin-top:5px;
+  }
+  .pista-carga{
+    margin-top:15px; height:10px; background:rgba(255,255,255,.16);
+    border-radius:5px; overflow:hidden;
+  }
+  .pista-carga div{
+    height:100%; width:30%; border-radius:5px;
+    background:linear-gradient(90deg,var(--bronce),var(--bronce-claro));
+    animation:correr 1.7s ease-in-out infinite;
+  }
+  @keyframes correr{ 0%{width:12%} 50%{width:82%} 100%{width:12%} }
+  .puntos::after{ content:''; animation:puntitos 1.4s steps(4,end) infinite; }
+  @keyframes puntitos{
+    0%{content:''} 25%{content:'.'} 50%{content:'..'} 75%{content:'...'}
+  }
   .cargando-linea{
     display:flex; align-items:center; gap:8px;
     font-family:'Space Mono',monospace; font-size:11px;
@@ -618,6 +635,112 @@
     font-family:'Space Mono',monospace; font-size:12px; color:var(--tinta); opacity:.55;
     text-align:center;
   }
+  /* ==========================================================
+     CELULAR — todo mas grande y comodo de tocar
+     ========================================================== */
+  @media (max-width:720px){
+    body{ font-size:16px; }
+
+    /* Botones: altura minima comoda para el dedo */
+    .btn{
+      font-size:17px; padding:16px 22px; min-height:56px;
+      border-radius:8px; justify-content:center;
+    }
+    .hero-actions{ gap:11px; }
+    .hero-actions .btn{ width:100%; }
+
+    /* Titulos y textos del inicio */
+    .hero{ padding:52px 20px 110px; }
+    .hero p{ font-size:16px; }
+    .eyebrow{ font-size:12px; }
+
+    /* Tarjetas y pasos */
+    .panel-wrap{ padding:0 16px; }
+    .step{ padding:20px 18px; }
+    .step-title{ font-size:23px; }
+    .step-label{ font-size:12px; }
+    .step-value{ font-size:14px; }
+
+    /* Fechas: cuadros mas grandes */
+    .fecha-grid{ grid-template-columns:repeat(auto-fill,minmax(92px,1fr)); gap:10px; }
+    .fecha-chip{ padding:14px 8px; min-height:78px; border-width:1.5px; }
+    .fecha-chip .dia{ font-size:24px; }
+    .fecha-chip .mes{ font-size:11px; margin-top:4px; display:block; }
+
+    /* Hipodromos */
+    .hip-item{ padding:17px 16px; min-height:66px; border-width:1.5px; }
+    .hip-nombre{ font-size:19px; }
+    .hip-meta{ font-size:12px; }
+
+    /* Carreras */
+    .carrera-grid{ grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:11px; }
+    .carrera-item{ padding:15px 15px; min-height:74px; border-width:1.5px; }
+    .carrera-item .tit{ font-size:17px; }
+    .carrera-item .num{ font-size:12px; }
+
+    /* Competidores */
+    .comp-item{ padding:15px 15px; min-height:68px; border-width:1.5px; }
+    .silk{ width:40px; height:40px; font-size:16px; }
+    .comp-nombre{ font-size:18px; }
+    .comp-jinete{ font-size:12px; }
+    .comp-peso{ font-size:14px; }
+
+    /* Pronostico */
+    .pron-row{ padding:15px 15px; }
+    .pron-pos{ font-size:23px; width:32px; }
+    .pron-nombre{ font-size:17px; }
+    .pron-pct{ font-size:15px; width:56px; }
+    .pron-bar-bg{ height:8px; }
+
+    /* Ficha del caballo */
+    .ficha{ padding:26px 20px 34px; }
+    .ficha-nombre{ font-size:27px; }
+    .ficha-sub{ font-size:13px; }
+    .ficha-section h4{ font-size:12px; }
+    .r-val{ font-size:21px; }
+    .r-rot{ font-size:10px; }
+    .logro{ font-size:14px; }
+    .pedigree{ font-size:13px; }
+    .carrera-cab{ padding:14px 14px; }
+    .puesto-bola{ width:36px; height:36px; font-size:15px; }
+    .carrera-l1{ font-size:16px; }
+    .carrera-l2{ font-size:11.5px; }
+    .btn-video{ width:40px; height:40px; font-size:15px; }
+    .carrera-extra{ font-size:12px; }
+    .cond-txt{ font-size:13px; }
+    .ficha-close{ font-size:26px; top:14px; right:14px; padding:6px; }
+
+    /* Buscador */
+    .buscador-fila input{ font-size:17px; padding:16px 15px; }
+    .sug-item{ padding:14px 15px; }
+    .sug-nombre{ font-size:17px; }
+    .sug-detalle{ font-size:11.5px; }
+    .ayuda{ font-size:12px; }
+    .limpiar{ font-size:20px; top:15px; }
+
+    /* Seguir caballo */
+    .seguir-btn{ font-size:15px; padding:15px 16px; min-height:54px; }
+    .seg-item{ padding:14px 0; }
+    .seg-nombre{ font-size:17px; }
+
+    /* Cartel de carga */
+    .barra-top{ padding:18px 17px 16px; }
+    .carga-titulo{ font-size:18px; }
+    .carga-paso{ font-size:12px; }
+    .caballito{ width:40px; height:40px; }
+
+    /* Mensajes */
+    .estado-msg{ font-size:14px; padding:16px 4px; }
+    .aviso-demo p{ font-size:12px; }
+  }
+
+  /* Pantallas muy angostas */
+  @media (max-width:400px){
+    .fecha-grid{ grid-template-columns:repeat(3,1fr); }
+    .carrera-grid{ grid-template-columns:1fr 1fr; }
+    .hero h1{ font-size:38px; }
+    .step-title{ font-size:21px; }
+  }
 </style>
 </head>
 <body>
@@ -671,9 +794,24 @@
 <div class="panel-wrap" id="buscar">
 
   <div class="barra-top" id="barra-top">
-    <div class="spin"></div>
-    <span id="barra-top-txt">Trabajando…</span>
-    <div class="barra-top-prog"><div></div></div>
+    <div class="carga-fila">
+      <svg class="caballito" viewBox="0 0 100 100" fill="none">
+        <path d="M62 22 L74 27 L77 38 L70 45 L60 42 L57 31 Z" fill="#1f4a42" stroke="#d9b877" stroke-width="2.5" stroke-linejoin="round"/>
+        <circle cx="67" cy="32" r="2.6" fill="#8c2a2a"/>
+        <path d="M60 42 L70 45 L67 60 L54 58 Z" fill="#1f4a42" stroke="#d9b877" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M54 58 L67 60 L71 76 L54 85 L34 82 L31 62 Z" fill="#1f4a42" stroke="#d9b877" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M38 78 L36 90" stroke="#d9b877" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M54 85 L58 95" stroke="#d9b877" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M67 74 L73 90" stroke="#d9b877" stroke-width="2.5" stroke-linecap="round"/>
+        <path d="M31 64 L20 68 L24 76" stroke="#d9b877" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M57 27 L52 34 L57 40" stroke="#d9b877" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="carga-texto">
+        <div class="carga-titulo" id="carga-titulo">Trabajando</div>
+        <div class="carga-paso" id="barra-top-txt">Un momento<span class="puntos"></span></div>
+      </div>
+    </div>
+    <div class="pista-carga"><div></div></div>
   </div>
 
   <!-- BUSCADOR DE CABALLO -->
@@ -968,7 +1106,7 @@ async function elegirCarrera(c, itemEl){
   const pron = document.getElementById('pronostico');
   list.innerHTML = estadoMsg('Cargando participantes…');
   pron.innerHTML = '';
-  mostrarBarra('Cargando participantes…');
+  mostrarBarra('Buscando los participantes', 'Abriendo la carrera');
 
   let carreraData;
   try{
@@ -991,14 +1129,14 @@ async function elegirCarrera(c, itemEl){
 
   // Enriquecer (campaña) y luego pedir el análisis.
   const n = participantesActuales.length;
-  mostrarBarra(`Analizando la campaña de ${n} participantes…`);
+  mostrarBarra(`Campaña de ${n} participantes`, 'Analizando la carrera');
   pron.innerHTML = estadoMsg('Calculando el pronóstico…');
   try{
     const enriquecidos = await apiPost('/api/enriquecer', {participantes: participantesActuales});
     participantesActuales = enriquecidos.participantes;
     renderCompetidores(participantesActuales);
 
-    mostrarBarra('Calculando el pronóstico…');
+    mostrarBarra('Cruzando los datos', 'Calculando el pronóstico');
     const contexto = {
       pista_dia: carreraData.estado || '',
       url: meetingUrlElegida,
@@ -1015,9 +1153,11 @@ async function elegirCarrera(c, itemEl){
   }
 }
 
-function mostrarBarra(texto){
+function mostrarBarra(texto, titulo){
   const b = document.getElementById('barra-top');
-  document.getElementById('barra-top-txt').textContent = texto;
+  if (titulo) document.getElementById('carga-titulo').textContent = titulo;
+  document.getElementById('barra-top-txt').innerHTML =
+    texto + '<span class="puntos"></span>';
   b.classList.add('visible');
 }
 function ocultarBarra(){
@@ -1201,7 +1341,7 @@ function limpiarBuscador(){
 }
 
 async function abrirFichaPorNombre(perfil){
-  mostrarBarra('Cargando la ficha del caballo…');
+  mostrarBarra('Trayendo la campaña completa', 'Abriendo la ficha');
   try{
     const d = await apiGet('/api/caballo?perfil=' + encodeURIComponent(perfil));
     // Reusar la misma ficha, agregandole las proximas carreras.
