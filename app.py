@@ -157,6 +157,8 @@ def _map_headers(header_cells):
             kg_positions.append(i)
         elif h in ("cpos", "cuerpos"):
             idx["cuerpos"] = i
+        elif h in ("acum", "acumulado"):
+            idx["acumulado"] = i
         elif h == "pago":
             idx["pago"] = i
 
@@ -248,6 +250,8 @@ def _parse_participants_table(table):
             "peso": peso,
             "peso_corporal": col("peso_corporal"),
             "puesto": puesto,
+            "cuerpos": col("cuerpos"),
+            "acumulado": col("acumulado"),
             "detalle": " · ".join(p for p in detalle_partes if p)[:700],
             "retirado": False,
         })
@@ -321,7 +325,7 @@ def parse_race(soup, numero):
         "condicion": get(r"Condición:\s*(.+?)\s+Pista:"),
         "superficie": get(r"Pista:\s*(.+?)\s*\|\s*Estado:"),
         "estado": get(r"Estado:\s*(.+?)\s*\|\s*Categoria:"),
-        "categoria": get(r"Categoria:\s*(.+?)(?:Premios|PROGRAMA|RESULTADOS|$)"),
+        "categoria": get(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)"),
         "participantes": participants
     }
 
@@ -489,7 +493,9 @@ def detalle_de_carrera(url_carrera):
             "condicion_txt": sacar(r"Condición:\s*(.+?)\s*Pista:"),
             "pista_txt": sacar(r"Pista:\s*(.+?)\s*\|\s*Estado:"),
             "estado_txt": sacar(r"Estado:\s*(.+?)\s*\|\s*Categoria"),
-            "categoria_txt": sacar(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ ]+)"),
+            "categoria_txt": sacar(
+                r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+de\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)\b"
+            ),
         }
         cache_set(clave, detalle)
         return detalle
@@ -1588,6 +1594,179 @@ def calendario_meses():
         desde=desde,
         hasta=hasta,
     )
+
+
+@app.get("/api/admin/diag-tabulada")
+def admin_diag_tabulada():
+    """
+    Comprueba si de la pagina de una carrera se pueden sacar TODOS los datos
+    que hacen falta para la tabulada: competidores, puestos y cuerpos.
+    Se corre ANTES de programar la pantalla, para no trabajar a ciegas.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    url = request.args.get("url", "").strip()
+    numero = request.args.get("numero", "1")
+
+    if not url:
+        return jsonify(ok=False,
+                       error="Falta la direccion de la carrera (parametro url)."), 400
+
+    informe = {"url": url, "numero": numero}
+
+    try:
+        soup = fetch(url)
+    except Exception as e:
+        return jsonify(ok=False, error=f"No se pudo abrir la pagina: {e}"), 502
+
+    # 1) Que encabezados tiene la tabla
+    encabezados_vistos = []
+    for table in soup.find_all("table"):
+        ths = [clean(th.get_text(" ")) for th in table.find_all("th")]
+        if ths:
+            encabezados_vistos.append(ths)
+    informe["encabezados_de_las_tablas"] = encabezados_vistos[:4]
+
+    # 2) Que saca el lector actual
+    try:
+        data = parse_race(soup, int(numero)) if str(numero).isdigit() else None
+    except Exception as e:
+        data = None
+        informe["error_parse"] = str(e)
+
+    if not data:
+        informe["parse_race"] = "No encontro la carrera numero " + str(numero)
+        informe["RESUMEN"] = {"SIRVE_PARA_TABULADA": False,
+                              "motivo": "no se pudo leer la carrera"}
+        return jsonify(ok=True, **informe)
+
+    participantes = data.get("participantes", [])
+    informe["cantidad_participantes"] = len(participantes)
+    informe["muestra"] = [
+        {
+            "nombre": p.get("nombre"),
+            "numero": p.get("numero"),
+            "puesto": p.get("puesto"),
+            "peso": p.get("peso"),
+            "jockey": p.get("jockey"),
+            "retirado": p.get("retirado"),
+        }
+        for p in participantes[:6]
+    ]
+
+    # 3) Los cuerpos: leerlos directo de la tabla para ver si estan
+    cuerpos_encontrados = []
+    for table in soup.find_all("table"):
+        cabeceras = _find_header_row(table)
+        if not cabeceras:
+            continue
+        idx = _map_headers(cabeceras)
+        if "cuerpos" not in idx or "nombre" not in idx:
+            continue
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all("td")
+            if len(celdas) <= max(idx["cuerpos"], idx["nombre"]):
+                continue
+            nombre = _cell_text(celdas[idx["nombre"]])
+            cpos = _cell_text(celdas[idx["cuerpos"]])
+            if nombre:
+                cuerpos_encontrados.append({"nombre": nombre, "cpos": cpos})
+    informe["cuerpos_leidos"] = cuerpos_encontrados[:8]
+
+    con_puesto = sum(1 for p in participantes if p.get("puesto"))
+    con_cuerpos = sum(1 for c in cuerpos_encontrados if c["cpos"])
+
+    informe["RESUMEN"] = {
+        "SIRVE_PARA_TABULADA": bool(participantes) and con_puesto > 0,
+        "participantes": len(participantes),
+        "con_puesto": con_puesto,
+        "con_cuerpos": con_cuerpos,
+        "falta": (
+            [] if (participantes and con_puesto and con_cuerpos)
+            else [x for x, ok in [
+                ("participantes", bool(participantes)),
+                ("puestos", con_puesto > 0),
+                ("cuerpos", con_cuerpos > 0),
+            ] if not ok]
+        ),
+    }
+    return jsonify(ok=True, **informe)
+
+
+@app.get("/api/tabulada")
+def api_tabulada():
+    """
+    Tabulada de una carrera: todos los que corrieron, en orden de llegada,
+    con los cuerpos al de adelante y al ganador.
+    """
+    url = request.args.get("url", "").strip()
+    numero = request.args.get("numero", "").strip()
+
+    if not (url.startswith(BASE) or url.startswith("https://studbook.org.ar")):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+
+    clave = f"tabulada:{url}:{numero}"
+    cacheado, fresco = cache_get(clave, TTL_DETALLE_CARRERA)
+    if cacheado is not None and fresco:
+        return jsonify(ok=True, **cacheado)
+
+    try:
+        soup = fetch(url)
+    except Exception as e:
+        return jsonify(ok=False, error=f"No se pudo abrir la carrera: {e}"), 502
+
+    # La pagina de una carrera suele traer una sola; la de reunion, varias.
+    data = None
+    if numero.isdigit():
+        data = parse_race(soup, int(numero))
+    if not data:
+        # Probar con el primer numero de carrera que aparezca en la pagina.
+        for n in range(1, 21):
+            data = parse_race(soup, n)
+            if data and data.get("participantes"):
+                break
+    if not data or not data.get("participantes"):
+        return jsonify(ok=False, error="No se encontraron los participantes."), 404
+
+    participantes = [p for p in data["participantes"] if not p.get("retirado")]
+    # Ordenar por puesto de llegada; los que no tienen puesto van al final.
+    con_puesto = sorted(
+        [p for p in participantes if p.get("puesto")],
+        key=lambda p: p["puesto"]
+    )
+    sin_puesto = [p for p in participantes if not p.get("puesto")]
+
+    filas = []
+    for p in con_puesto + sin_puesto:
+        filas.append({
+            "puesto": p.get("puesto"),
+            "numero": p.get("numero"),
+            "nombre": p.get("nombre"),
+            "cuerpos": p.get("cuerpos", ""),
+            "acumulado": p.get("acumulado", ""),
+            "peso": p.get("peso", ""),
+            "jockey": p.get("jockey", ""),
+            "entrenador": p.get("entrenador", ""),
+            "caballeriza": p.get("caballeriza", ""),
+            "perfil": p.get("perfil", ""),
+        })
+
+    detalle = detalle_de_carrera(url)
+
+    resultado = {
+        "carrera": data.get("carrera"),
+        "premio": data.get("premio", ""),
+        "distancia": data.get("distancia", ""),
+        "pista": detalle.get("pista_txt") or data.get("superficie", ""),
+        "estado": detalle.get("estado_txt") or data.get("estado", ""),
+        "categoria": detalle.get("categoria_txt") or data.get("categoria", ""),
+        "condicion": detalle.get("condicion_txt") or data.get("condicion", ""),
+        "competidores": len(filas),
+        "filas": filas,
+    }
+    cache_set(clave, resultado)
+    return jsonify(ok=True, **resultado)
 
 
 @app.get("/api/videos")
