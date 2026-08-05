@@ -612,6 +612,138 @@
     border-radius:4px; font-family:'Archivo',sans-serif; font-size:11.5px;
     line-height:1.5; opacity:.9;
   }
+  /* ===== CUADRÍCULA DE LAS ÚLTIMAS CUATRO ===== */
+  .cuadricula{ display:grid; grid-template-columns:1fr 1fr; gap:11px; }
+  .mini{
+    border:1.5px solid var(--pergamino-2); border-radius:8px;
+    background:var(--hueso); padding:11px 11px 12px; cursor:pointer;
+    transition:border-color .15s, transform .15s;
+  }
+  .mini:hover{ border-color:var(--bronce); transform:translateY(-2px); }
+  .mini-cab{
+    display:flex; align-items:center; gap:8px; margin-bottom:8px;
+    padding-bottom:8px; border-bottom:1px solid var(--pergamino-2);
+  }
+  .bola{
+    width:28px; height:28px; border-radius:50%; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    font-family:'Fraunces',serif; font-weight:700; font-size:13px;
+    background:var(--pergamino-2);
+  }
+  .bola.p1{ background:var(--bronce); color:#fff; }
+  .bola.p2{ background:#9aa8a4; color:#fff; }
+  .bola.p3{ background:#c08a5a; color:#fff; }
+  .mini-fecha{ font-family:'Space Mono',monospace; font-size:10px; opacity:.6; line-height:1.35; }
+  .dias{ color:var(--carmin); opacity:.85; }
+  .mini-hip{ font-family:'Fraunces',serif; font-weight:600; font-size:12.5px; }
+  .mini-filas{ font-size:11px; min-height:52px; }
+  .mini-fila{
+    display:flex; align-items:center; gap:6px; padding:3px 0;
+    white-space:nowrap; overflow:hidden;
+  }
+  .mini-fila.yo{ font-weight:700; color:var(--carmin); }
+  .mini-pos{
+    font-family:'Space Mono',monospace; font-size:10px; width:15px;
+    flex-shrink:0; opacity:.65;
+  }
+  .mini-nom{
+    overflow:hidden; text-overflow:ellipsis; flex:1;
+    font-family:'Fraunces',serif; font-size:11.5px;
+  }
+  .mini-acum{
+    font-family:'Space Mono',monospace; font-size:10.5px;
+    background:var(--pergamino); border-radius:4px;
+    padding:5px 7px; margin-top:7px; text-align:center;
+  }
+  .mini-acum b{ color:var(--carmin); font-family:'Fraunces',serif; font-size:12px; }
+  .mini-pie{
+    font-family:'Space Mono',monospace; font-size:9.5px; opacity:.5;
+    margin-top:7px; padding-top:7px; border-top:1px solid var(--pergamino-2);
+    display:flex; justify-content:space-between; gap:6px;
+  }
+  .lupa{ color:var(--bronce); flex-shrink:0; }
+  .mini-cargando{
+    grid-column:1/-1; font-family:'Space Mono',monospace; font-size:12px;
+    opacity:.6; padding:18px 4px; text-align:center;
+  }
+  .btn-mas{
+    width:100%; margin-top:12px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:15px; background:var(--pergamino);
+    border:1.5px solid var(--pergamino-2); color:var(--verde-turf);
+    padding:14px; border-radius:8px; cursor:pointer; min-height:52px;
+  }
+  .btn-mas:hover{ border-color:var(--bronce); background:#fff; }
+
+  /* ===== VENTANA DE LA TABULADA AMPLIADA ===== */
+  .tab-overlay{
+    position:fixed; inset:0; background:rgba(21,56,50,.62);
+    display:none; align-items:center; justify-content:center;
+    z-index:60; padding:16px; backdrop-filter:blur(2px);
+  }
+  .tab-overlay.visible{ display:flex; }
+  .tab-grande{
+    background:var(--hueso); border-radius:10px; width:100%;
+    max-width:560px; max-height:88vh; overflow-y:auto;
+    padding:22px 20px 26px; position:relative;
+  }
+  .tab-cerrar{
+    position:absolute; top:14px; right:14px; background:none; border:none;
+    font-size:24px; cursor:pointer; opacity:.45; padding:6px;
+  }
+  .tab-cerrar:hover{ opacity:1; }
+  .g-titulo{ font-family:'Fraunces',serif; font-size:21px; font-weight:600; padding-right:34px; }
+  .g-dias{ font-family:'Space Mono',monospace; font-size:11px; color:var(--carmin); margin-top:3px; }
+  .g-sub{
+    font-family:'Space Mono',monospace; font-size:11.5px; opacity:.65;
+    margin-top:8px; margin-bottom:16px; line-height:1.6;
+  }
+  .tab-env{ overflow-x:auto; }
+  .tab-env table{ width:100%; border-collapse:collapse; }
+  .tab-env th{
+    font-family:'Space Mono',monospace; font-size:9.5px; text-transform:uppercase;
+    text-align:left; padding:8px 5px; border-bottom:1.5px solid var(--pergamino-2);
+    opacity:.55; font-weight:400; white-space:nowrap;
+  }
+  .tab-env td{
+    padding:9px 5px; border-bottom:1px solid var(--pergamino-2); font-size:13px;
+  }
+  .tab-env tr:last-child td{ border-bottom:none; }
+  .fila-yo{ background:#f7f0e0; }
+  .fila-yo td{ font-weight:700; }
+  .p-num{
+    font-family:'Fraunces',serif; font-weight:700; font-size:15px;
+    width:28px; text-align:center;
+  }
+  .p-num.g1{ color:var(--bronce); }
+  .p-num.g2{ color:#7d8c88; }
+  .p-num.g3{ color:#b57a4a; }
+  .n-bola{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:22px; height:22px; border-radius:50%; color:#fff;
+    font-family:'Space Mono',monospace; font-size:10px; font-weight:700;
+  }
+  .nombre-cab{ font-family:'Fraunces',serif; font-weight:600; }
+  .cpos{ font-family:'Space Mono',monospace; font-size:11px; color:var(--carmin); white-space:nowrap; }
+  .acame{
+    font-family:'Space Mono',monospace; font-size:9px; background:var(--bronce);
+    color:#fff; padding:1px 5px; border-radius:3px; margin-left:5px;
+  }
+  .g-cond{
+    margin-top:13px; padding:10px 12px; background:var(--pergamino);
+    border-radius:5px; font-size:12px; line-height:1.5; opacity:.9;
+  }
+  .g-video{
+    width:100%; margin-top:14px; background:var(--carmin); color:#fff;
+    border:none; padding:14px; border-radius:7px; cursor:pointer;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+  }
+  .g-video-caja{ margin-top:12px; }
+  .g-video-caja iframe{
+    width:100%; aspect-ratio:16/9; border:none; border-radius:6px; background:#000;
+  }
+  @media (max-width:360px){
+    .cuadricula{ grid-template-columns:1fr; }
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -936,8 +1068,15 @@
     </div>
 
     <div class="ficha-section">
-      <h4>Campaña — carreras corridas</h4>
-      <div id="ficha-campana"></div>
+      <h4>Últimas cuatro carreras</h4>
+      <div class="cuadricula" id="ficha-cuadricula"></div>
+      <button class="btn-mas" id="btn-mas-carreras" onclick="alternarCampanaCompleta()"
+              style="display:none;">Ver todas las carreras</button>
+
+      <div id="campana-completa" style="display:none;">
+        <h4 style="margin-top:22px;">Campaña completa</h4>
+        <div id="ficha-campana"></div>
+      </div>
     </div>
 
     <button class="seguir-btn" id="btn-seguir" onclick="toggleSeguir()">🔔 Seguir a este caballo</button>
@@ -950,6 +1089,10 @@
     <h3 style="margin-top:0;">Caballos seguidos</h3>
     <div id="seg-lista"></div>
   </div>
+</div>
+
+<div class="tab-overlay" id="tab-overlay" onclick="if(event.target===this) cerrarTabulada()">
+  <div class="tab-grande" id="tab-grande"></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -1425,6 +1568,10 @@ function abrirFicha(cp, idx){
   document.getElementById('ficha-datos').innerHTML = datos;
 
   // --- Carreras corridas, con video ---
+  // Las últimas cuatro carreras, en cuadrícula, ya visibles.
+  pintarCuadricula(carreras);
+  document.getElementById('campana-completa').style.display = 'none';
+
   const camp = document.getElementById('ficha-campana');
   camp.innerHTML = '';
   if (carreras.length === 0){
@@ -1463,6 +1610,220 @@ function abrirFicha(cp, idx){
 
   actualizarBotonSeguir();
   document.getElementById('overlay').classList.add('show');
+}
+
+// ============================================================
+// ÚLTIMAS CUATRO CARRERAS EN CUADRÍCULA + TABULADA AMPLIADA
+// ============================================================
+
+const COLORES_TAB = ["#8c2a2a","#153832","#b6904f","#2b4a8c",
+                     "#5c2b8c","#2b8c6b","#8c6b2a","#2a6b8c"];
+
+// Días transcurridos desde una fecha DD/MM/AAAA
+function diasDesde(fechaTxt){
+  const p = (fechaTxt||'').split('/');
+  if (p.length !== 3) return '';
+  const f = new Date(+p[2], +p[1]-1, +p[0]);
+  const dias = Math.floor((new Date() - f) / 86400000);
+  if (isNaN(dias) || dias < 0) return '';
+  if (dias === 0) return 'hoy';
+  if (dias === 1) return 'ayer';
+  if (dias < 60) return dias + ' días';
+  const meses = Math.floor(dias / 30);
+  if (meses < 24) return meses + ' meses';
+  return Math.floor(dias / 365) + ' años';
+}
+
+function clasePuesto(p){
+  return p === 1 ? 'p1' : p === 2 ? 'p2' : p === 3 ? 'p3' : '';
+}
+
+// Guarda las tabuladas ya traídas, para no pedirlas dos veces.
+const tabuladasCache = {};
+
+async function pintarCuadricula(carreras){
+  const cont = document.getElementById('ficha-cuadricula');
+  const btnMas = document.getElementById('btn-mas-carreras');
+  if (!cont) return;
+
+  const ultimas = (carreras || []).slice(0, 4);
+  if (!ultimas.length){
+    cont.innerHTML = '<div class="mini-cargando">Todavía no corrió ninguna carrera oficial.</div>';
+    btnMas.style.display = 'none';
+    return;
+  }
+
+  btnMas.style.display = (carreras.length > 4) ? 'block' : 'none';
+  btnMas.textContent = 'Ver todas las carreras (' + carreras.length + ')';
+
+  // Primero se dibujan con lo que ya sabemos, para que se vea al instante.
+  cont.innerHTML = '';
+  ultimas.forEach((c, i)=>{
+    const d = document.createElement('div');
+    d.className = 'mini';
+    d.id = 'mini-' + i;
+    d.onclick = ()=> abrirTabulada(i, c);
+    d.innerHTML = miniHTML(c, null);
+    cont.appendChild(d);
+  });
+
+  // Después se completan con la tabulada de cada una.
+  ultimas.forEach(async (c, i)=>{
+    if (!c.enlace) return;
+    try{
+      const t = await apiGet('/api/tabulada?url=' + encodeURIComponent(c.enlace)
+                             + '&numero=' + encodeURIComponent(c.numero || ''));
+      tabuladasCache[c.enlace] = t;
+      const el = document.getElementById('mini-' + i);
+      if (el) el.innerHTML = miniHTML(c, t);
+    }catch(e){ /* si falla, queda la version simple */ }
+  });
+}
+
+function miniHTML(c, tab){
+  const nombreCaballo = (caballoActual && caballoActual.nombre) || '';
+  let filas = '', acum = '';
+
+  if (tab && tab.filas && tab.filas.length){
+    const yo = tab.filas.find(f =>
+      normalizarTexto(f.nombre) === normalizarTexto(nombreCaballo));
+    let muestra = tab.filas.slice(0, 2);
+    if (yo && yo.puesto > 2) muestra.push(yo);
+    else muestra = tab.filas.slice(0, 3);
+
+    filas = muestra.map(f=>{
+      const esYo = normalizarTexto(f.nombre) === normalizarTexto(nombreCaballo);
+      return `<div class="mini-fila ${esYo?'yo':''}">
+        <span class="mini-pos">${f.puesto||'-'}º</span>
+        <span class="mini-nom">${f.nombre}</span>
+      </div>`;
+    }).join('');
+
+    if (yo){
+      acum = (yo.puesto === 1)
+        ? '<b>Ganó</b>' + (tab.filas[1] && tab.filas[1].cuerpos
+                            ? ' por ' + tab.filas[1].cuerpos : '')
+        : (yo.acumulado
+            ? 'A <b>' + yo.acumulado + '</b> del ganador'
+            : 'Llegó <b>' + yo.puesto + 'º</b> de ' + tab.competidores);
+    }
+  } else {
+    filas = '<div class="mini-cargando" style="padding:8px 0;">Buscando la tabulada…</div>';
+  }
+
+  const dias = diasDesde(c.fecha);
+  return `
+    <div class="mini-cab">
+      <div class="bola ${clasePuesto(c.puesto)}">${c.puesto ? c.puesto+'º' : '—'}</div>
+      <div>
+        <div class="mini-hip">${c.hipodromo || ''}</div>
+        <div class="mini-fecha">${c.fecha}${dias ? '<br><span class="dias">(hace '+dias+')</span>' : ''}</div>
+      </div>
+    </div>
+    <div class="mini-filas">${filas}</div>
+    ${acum ? '<div class="mini-acum">'+acum+'</div>' : ''}
+    <div class="mini-pie">
+      <span>${c.distancia ? c.distancia+' m' : ''}${c.tiempo ? ' · '+c.tiempo : ''}</span>
+      <span class="lupa">ampliar ›</span>
+    </div>
+    <div class="mini-pie" style="border:none; padding-top:3px; margin-top:0;">
+      <span>${(tab && tab.pista) || c.pista_txt || ''}${
+        (tab && tab.estado) || c.estado_txt ? ' · ' + ((tab && tab.estado) || c.estado_txt) : ''}</span>
+    </div>`;
+}
+
+async function abrirTabulada(i, c){
+  const cont = document.getElementById('tab-grande');
+  const nombreCaballo = (caballoActual && caballoActual.nombre) || '';
+  const dias = diasDesde(c.fecha);
+
+  document.getElementById('tab-overlay').classList.add('visible');
+  cont.innerHTML = `
+    <button class="tab-cerrar" onclick="cerrarTabulada()">✕</button>
+    <div class="g-titulo">${c.fecha} · ${c.hipodromo||''}</div>
+    ${dias ? '<div class="g-dias">hace '+dias+'</div>' : ''}
+    <div class="mini-cargando">Trayendo la tabulada…</div>`;
+
+  let t = tabuladasCache[c.enlace];
+  if (!t && c.enlace){
+    try{
+      t = await apiGet('/api/tabulada?url=' + encodeURIComponent(c.enlace)
+                       + '&numero=' + encodeURIComponent(c.numero || ''));
+      tabuladasCache[c.enlace] = t;
+    }catch(e){
+      cont.innerHTML = `
+        <button class="tab-cerrar" onclick="cerrarTabulada()">✕</button>
+        <div class="g-titulo">${c.fecha} · ${c.hipodromo||''}</div>
+        <div class="mini-cargando">No se pudo traer la tabulada. ${e.message}</div>`;
+      return;
+    }
+  }
+  if (!t){
+    cont.innerHTML = `
+      <button class="tab-cerrar" onclick="cerrarTabulada()">✕</button>
+      <div class="g-titulo">${c.fecha} · ${c.hipodromo||''}</div>
+      <div class="mini-cargando">Esta carrera no tiene tabulada disponible.</div>`;
+    return;
+  }
+
+  const filas = t.filas.map((f, idx)=>{
+    const pos = f.puesto || (idx+1);
+    const cls = pos===1?'g1':pos===2?'g2':pos===3?'g3':'';
+    const esYo = normalizarTexto(f.nombre) === normalizarTexto(nombreCaballo);
+    return `<tr class="${esYo?'fila-yo':''}">
+      <td class="p-num ${cls}">${pos}º</td>
+      <td><span class="n-bola" style="background:${COLORES_TAB[idx%8]}">${f.numero||'-'}</span></td>
+      <td class="nombre-cab">${f.nombre}${esYo?'<span class="acame">acá</span>':''}</td>
+      <td class="cpos">${f.cuerpos||''}</td>
+      <td class="cpos">${f.acumulado||''}</td>
+      <td>${f.peso||''}</td>
+      <td style="font-family:'Space Mono',monospace;font-size:10.5px;opacity:.7">${f.jockey||''}</td>
+    </tr>`;
+  }).join('');
+
+  cont.innerHTML = `
+    <button class="tab-cerrar" onclick="cerrarTabulada()">✕</button>
+    <div class="g-titulo">${c.fecha} · ${c.hipodromo||''}</div>
+    ${dias ? '<div class="g-dias">hace '+dias+'</div>' : ''}
+    <div class="g-sub">
+      ${t.premio||''}${t.distancia ? ' · '+t.distancia+' m' : ''}${c.tiempo ? ' · '+c.tiempo : ''}<br>
+      ${t.pista||''}${t.estado ? ' · '+t.estado : ''} · ${t.competidores} competidores
+      ${t.categoria ? ' · '+t.categoria : ''}
+    </div>
+    <div class="tab-env">
+      <table>
+        <tr><th></th><th>Nº</th><th>Ejemplar</th><th>Cpos</th><th>Acum.</th><th>Kg</th><th>Jockey</th></tr>
+        ${filas}
+      </table>
+    </div>
+    ${t.condicion ? '<div class="g-cond">Condición: '+t.condicion+'</div>' : ''}
+    ${c.video
+      ? '<button class="g-video" onclick="verVideoTabulada(\''+c.video+'\')">▶ Ver el video</button>'
+        + '<div class="g-video-caja" id="g-video-caja"></div>'
+      : ''}`;
+}
+
+function verVideoTabulada(id){
+  const caja = document.getElementById('g-video-caja');
+  if (!caja) return;
+  caja.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0&modestbranding=1"
+    allow="accelerometer; autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+}
+
+function cerrarTabulada(){
+  document.getElementById('tab-overlay').classList.remove('visible');
+  const caja = document.getElementById('g-video-caja');
+  if (caja) caja.innerHTML = '';
+}
+
+function alternarCampanaCompleta(){
+  const c = document.getElementById('campana-completa');
+  const b = document.getElementById('btn-mas-carreras');
+  const abierta = c.style.display === 'block';
+  c.style.display = abierta ? 'none' : 'block';
+  b.textContent = abierta
+    ? 'Ver todas las carreras (' + ((caballoActual.carreras||[]).length) + ')'
+    : 'Ocultar la campaña completa';
 }
 
 function alternarCarrera(i){
