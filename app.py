@@ -694,6 +694,83 @@ def calendar_from_meetings(soup):
     return meetings
 
 
+def _codigo_recaptcha(soup):
+    """
+    El sitio exige un codigo 'recaptcha' en la direccion para cambiar de mes.
+    Ese codigo viene dentro de la propia pagina de reuniones.
+    """
+    # 1) En algun enlace de la propia pagina.
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"[?&]recaptcha=([^&\"']+)", a["href"])
+        if m:
+            return m.group(1)
+    # 2) En un campo oculto del formulario.
+    campo = soup.find("input", attrs={"name": "recaptcha"})
+    if campo and campo.get("value"):
+        return campo["value"]
+    # 3) En el codigo de la pagina.
+    m = re.search(r"recaptcha['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-]{40,})", str(soup))
+    if m:
+        return m.group(1)
+    return ""
+
+
+def calendario_del_mes(anio, mes):
+    """
+    Devuelve las reuniones de un mes concreto (anio=2024, mes=3).
+    Guarda en cache: un mes que ya paso no cambia mas.
+    """
+    clave = f"calendario_mes:{anio}-{mes:02d}"
+    hoy = datetime.now()
+    es_pasado = (anio, mes) < (hoy.year, hoy.month)
+    ttl = 90 * 24 * 60 * 60 if es_pasado else TTL_CALENDARIO
+
+    cacheado, fresco = cache_get(clave, ttl)
+    if cacheado is not None and fresco:
+        return cacheado
+
+    try:
+        # Primero la pagina normal, para sacar el codigo que exige el sitio.
+        base_soup = fetch(BASE + "/reuniones")
+        codigo = _codigo_recaptcha(base_soup)
+
+        url = f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"
+        if codigo:
+            url += f"&recaptcha={codigo}"
+
+        soup = fetch(url)
+        reuniones = calendar_from_meetings(soup)
+
+        # Quedarse solo con las del mes pedido: si el sitio ignoro el pedido,
+        # es preferible devolver vacio antes que datos de otro mes.
+        prefijo = f"{anio}-{mes:02d}-"
+        reuniones = [r for r in reuniones if r["fecha"].startswith(prefijo)]
+
+        cache_set(clave, reuniones)
+        return reuniones
+    except Exception:
+        return cacheado or []
+
+
+def calendario_entre(desde, hasta):
+    """Junta las reuniones de todos los meses entre dos fechas (AAAA-MM-DD)."""
+    try:
+        d = datetime.strptime(desde, "%Y-%m-%d")
+        h = datetime.strptime(hasta, "%Y-%m-%d")
+    except ValueError:
+        return []
+
+    todas = []
+    anio, mes = d.year, d.month
+    while (anio, mes) <= (h.year, h.month):
+        todas.extend(calendario_del_mes(anio, mes))
+        mes += 1
+        if mes > 12:
+            mes = 1
+            anio += 1
+    return todas
+
+
 def saved_calendar():
     con = db()
     rows = con.execute(
@@ -1372,6 +1449,145 @@ def admin_diagnostico():
     ]
 
     return jsonify(ok=True, **informe)
+
+
+@app.get("/api/admin/diag-calendario")
+def admin_diag_calendario():
+    """
+    Comprueba si se pueden traer meses anteriores del calendario.
+    Prueba varias formas y dice cual funciona de verdad.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    anio = int(request.args.get("anio", "2026"))
+    mes = int(request.args.get("mes", "7"))
+    prefijo = f"{anio}-{mes:02d}-"
+    informe = {"pedido": f"{anio}-{mes:02d}", "intentos": []}
+
+    # Sacar el codigo de la pagina normal.
+    codigo = ""
+    try:
+        base_soup = fetch(BASE + "/reuniones")
+        codigo = _codigo_recaptcha(base_soup)
+        informe["codigo_encontrado"] = bool(codigo)
+        informe["codigo_largo"] = len(codigo)
+    except Exception as e:
+        informe["codigo_encontrado"] = False
+        informe["error_pagina_base"] = str(e)
+
+    formas = [
+        ("sin codigo", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"),
+        ("mes sin cero", f"{BASE}/reuniones?mes={mes}&anio={anio}"),
+    ]
+    if codigo:
+        formas += [
+            ("con codigo", f"{BASE}/reuniones?recaptcha={codigo}&mes={mes:02d}&anio={anio}"),
+            ("codigo al final", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}&recaptcha={codigo}"),
+        ]
+
+    for etiqueta, url in formas:
+        intento = {"forma": etiqueta, "url": url[:110] + ("…" if len(url) > 110 else "")}
+        try:
+            soup = fetch(url)
+            reuniones = calendar_from_meetings(soup)
+            del_mes = [r for r in reuniones if r["fecha"].startswith(prefijo)]
+            intento["total_traido"] = len(reuniones)
+            intento["DEL_MES_PEDIDO"] = len(del_mes)
+            intento["FUNCIONA"] = len(del_mes) > 0
+            meses = sorted({r["fecha"][:7] for r in reuniones})
+            intento["meses_que_trajo"] = meses
+            intento["ejemplos"] = [
+                f"{r['fecha']} {r['hipodromo']}" for r in del_mes[:4]
+            ]
+        except Exception as e:
+            intento["error"] = str(e)
+        informe["intentos"].append(intento)
+
+    funcionan = [i["forma"] for i in informe["intentos"] if i.get("FUNCIONA")]
+    informe["RESUMEN"] = {
+        "FORMAS_QUE_FUNCIONAN": funcionan,
+        "se_puede_traer_meses_viejos": len(funcionan) > 0,
+    }
+    return jsonify(ok=True, **informe)
+
+
+SIGLAS = {
+    "palermo": "PAL", "san isidro": "SI", "la plata": "LP",
+    "la punta": "LPU", "rosario": "ROS", "tandil": "TAN",
+    "dolores": "DOL", "azul": "AZL", "tucuman": "TUC",
+    "cordoba": "CBA", "mendoza": "MZA", "santa fe": "SFE",
+}
+
+COLORES_HIP = {
+    "PAL": "#8c2a2a", "SI": "#153832", "LP": "#2b4a8c",
+    "LPU": "#5c2b8c", "ROS": "#2b8c6b", "TAN": "#8c6b2a",
+    "DOL": "#2a6b8c", "AZL": "#6b2a8c", "TUC": "#8c4a2a",
+}
+
+def sigla_de(hipodromo):
+    n = normalize_text(hipodromo)
+    for nombre, sigla in SIGLAS.items():
+        if nombre in n:
+            return sigla
+    # Si no esta en la lista, armar una sigla con las iniciales.
+    palabras = [p for p in n.split() if len(p) > 2]
+    return "".join(p[0] for p in palabras[:3]).upper() or "OTR"
+
+
+@app.get("/api/calendario-meses")
+def calendario_meses():
+    """
+    Calendario agrupado por mes, con los hipodromos de cada fecha.
+    Parametros: desde y hasta (AAAA-MM-DD). Por defecto, desde 2024.
+    """
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    desde = request.args.get("desde", "2024-01-01")
+    hasta = request.args.get("hasta", hoy)
+
+    reuniones = calendario_entre(desde, hasta)
+    if not reuniones:
+        # Respaldo: lo que haya guardado en la base.
+        guardadas = saved_calendar()
+        reuniones = [r for r in guardadas if desde <= r["fecha"] <= hasta]
+        if not reuniones:
+            return jsonify(
+                ok=False,
+                error="No se pudo traer el calendario en este momento.",
+                fechas=[],
+            ), 503
+
+    # Agrupar por fecha.
+    por_fecha = {}
+    for r in reuniones:
+        f = r["fecha"]
+        if f not in por_fecha:
+            por_fecha[f] = {"fecha": f, "hipodromos": []}
+        sigla = sigla_de(r["hipodromo"])
+        if not any(h["sigla"] == sigla for h in por_fecha[f]["hipodromos"]):
+            por_fecha[f]["hipodromos"].append({
+                "nombre": r["hipodromo"],
+                "sigla": sigla,
+                "color": COLORES_HIP.get(sigla, "#5a6b66"),
+                "url": r.get("url", ""),
+            })
+
+    fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"], reverse=True)
+
+    # Lista de hipodromos para el filtro.
+    hips = {}
+    for f in fechas:
+        for h in f["hipodromos"]:
+            hips[h["sigla"]] = {"nombre": h["nombre"], "sigla": h["sigla"],
+                                "color": h["color"]}
+
+    return jsonify(
+        ok=True,
+        fechas=fechas,
+        hipodromos=sorted(hips.values(), key=lambda h: h["nombre"]),
+        desde=desde,
+        hasta=hasta,
+    )
 
 
 @app.get("/api/videos")
