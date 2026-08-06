@@ -1,4 +1,3 @@
-
 from flask import Flask, render_template, request, jsonify
 import requests, re, sqlite3, json, os, time, threading
 from bs4 import BeautifulSoup
@@ -17,7 +16,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
 
-def fetch(u
+def fetch(url):
     r = requests.get(url, headers=HEADERS, timeout=(4, 8))
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
@@ -721,6 +720,108 @@ def _codigo_recaptcha(soup):
     return ""
 
 
+def _sesion_studbook():
+    """
+    Una sesion que conserva las cookies. Hace falta porque el sitio puede
+    recordar el mes elegido en la sesion, y no solo en la direccion.
+    """
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def _datos_del_formulario(soup):
+    """
+    Lee el formulario de la pagina de reuniones y devuelve como se llaman
+    sus campos y si se envia por GET o por POST. No se adivina: se lee.
+    """
+    for form in soup.find_all("form"):
+        campos = {}
+        nombres = []
+        for inp in form.find_all(["input", "select"]):
+            n = inp.get("name")
+            if not n:
+                continue
+            nombres.append(n)
+            if inp.name == "input":
+                campos[n] = inp.get("value", "")
+            else:
+                sel = inp.find("option", selected=True) or inp.find("option")
+                campos[n] = sel.get("value", "") if sel else ""
+        # El formulario del calendario tiene los campos de mes y año.
+        texto = " ".join(nombres).lower()
+        if any(x in texto for x in ["mes", "month", "anio", "año", "year"]):
+            return {
+                "accion": urljoin(BASE, form.get("action") or "/reuniones"),
+                "metodo": (form.get("method") or "get").lower(),
+                "campos": campos,
+                "nombres": nombres,
+            }
+    return None
+
+
+def _traer_mes(anio, mes):
+    """
+    Trae la pagina de un mes concreto. Prueba, en orden, las tres vias
+    posibles, cada una con la sesion abierta para conservar las cookies:
+      1) el formulario tal como lo declara la pagina
+      2) por direccion, con el codigo que traiga la pagina
+      3) por direccion pelada
+    Devuelve (reuniones, via_que_funciono).
+    """
+    prefijo = f"{anio}-{mes:02d}-"
+    s = _sesion_studbook()
+
+    # Primero se abre la pagina normal: asi se obtienen cookies y el formulario.
+    r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
+    r0.raise_for_status()
+    soup0 = BeautifulSoup(r0.text, "html.parser")
+
+    formulario = _datos_del_formulario(soup0)
+    codigo = _codigo_recaptcha(soup0)
+
+    intentos = []
+
+    # 1) El formulario, tal como lo declara la pagina.
+    if formulario:
+        campos = dict(formulario["campos"])
+        for n in formulario["nombres"]:
+            bajo = n.lower()
+            if "mes" in bajo or "month" in bajo:
+                campos[n] = f"{mes:02d}"
+            elif "anio" in bajo or "año" in bajo or "year" in bajo:
+                campos[n] = str(anio)
+        intentos.append(("formulario", formulario["metodo"],
+                         formulario["accion"], campos))
+
+    # 2) Por direccion, con el codigo si aparecio.
+    params = {"mes": f"{mes:02d}", "anio": str(anio)}
+    if codigo:
+        intentos.append(("direccion con codigo", "get", BASE + "/reuniones",
+                         {**params, "recaptcha": codigo}))
+    # 3) Por direccion pelada, ya con las cookies de la sesion.
+    intentos.append(("direccion con sesion", "get", BASE + "/reuniones", params))
+    # 4) Por direccion, como POST.
+    intentos.append(("direccion como POST", "post", BASE + "/reuniones", params))
+
+    for etiqueta, metodo, accion, datos in intentos:
+        try:
+            if metodo == "post":
+                r = s.post(accion, data=datos, timeout=(5, 15))
+            else:
+                r = s.get(accion, params=datos, timeout=(5, 15))
+            if r.status_code != 200:
+                continue
+            reuniones = calendar_from_meetings(BeautifulSoup(r.text, "html.parser"))
+            del_mes = [x for x in reuniones if x["fecha"].startswith(prefijo)]
+            if del_mes:
+                return del_mes, etiqueta
+        except Exception:
+            continue
+
+    return [], ""
+
+
 def calendario_del_mes(anio, mes):
     """
     Devuelve las reuniones de un mes concreto (anio=2024, mes=3).
@@ -736,23 +837,9 @@ def calendario_del_mes(anio, mes):
         return cacheado
 
     try:
-        # Primero la pagina normal, para sacar el codigo que exige el sitio.
-        base_soup = fetch(BASE + "/reuniones")
-        codigo = _codigo_recaptcha(base_soup)
-
-        url = f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"
-        if codigo:
-            url += f"&recaptcha={codigo}"
-
-        soup = fetch(url)
-        reuniones = calendar_from_meetings(soup)
-
-        # Quedarse solo con las del mes pedido: si el sitio ignoro el pedido,
-        # es preferible devolver vacio antes que datos de otro mes.
-        prefijo = f"{anio}-{mes:02d}-"
-        reuniones = [r for r in reuniones if r["fecha"].startswith(prefijo)]
-
-        cache_set(clave, reuniones)
+        reuniones, via = _traer_mes(anio, mes)
+        if reuniones:
+            cache_set(clave, reuniones)
         return reuniones
     except Exception:
         return cacheado or []
@@ -1500,8 +1587,8 @@ def admin_diagnostico():
 @app.get("/api/admin/diag-calendario")
 def admin_diag_calendario():
     """
-    Comprueba si se pueden traer meses anteriores del calendario.
-    Prueba varias formas y dice cual funciona de verdad.
+    Comprueba si se pueden traer meses anteriores. Ahora mira el formulario
+    real de la pagina y prueba cuatro vias distintas, con sesion abierta.
     """
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
@@ -1509,51 +1596,51 @@ def admin_diag_calendario():
     anio = int(request.args.get("anio", "2026"))
     mes = int(request.args.get("mes", "7"))
     prefijo = f"{anio}-{mes:02d}-"
-    informe = {"pedido": f"{anio}-{mes:02d}", "intentos": []}
+    informe = {"pedido": f"{anio}-{mes:02d}"}
 
-    # Sacar el codigo de la pagina normal.
-    codigo = ""
     try:
-        base_soup = fetch(BASE + "/reuniones")
-        codigo = _codigo_recaptcha(base_soup)
-        informe["codigo_encontrado"] = bool(codigo)
-        informe["codigo_largo"] = len(codigo)
+        s = _sesion_studbook()
+        r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
+        soup0 = BeautifulSoup(r0.text, "html.parser")
+        informe["cookies"] = list(s.cookies.keys())
     except Exception as e:
-        informe["codigo_encontrado"] = False
-        informe["error_pagina_base"] = str(e)
+        return jsonify(ok=False, error=f"No se pudo abrir la pagina: {e}"), 502
 
-    formas = [
-        ("sin codigo", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"),
-        ("mes sin cero", f"{BASE}/reuniones?mes={mes}&anio={anio}"),
-    ]
-    if codigo:
-        formas += [
-            ("con codigo", f"{BASE}/reuniones?recaptcha={codigo}&mes={mes:02d}&anio={anio}"),
-            ("codigo al final", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}&recaptcha={codigo}"),
-        ]
+    # 1) Como es el formulario, de verdad
+    formulario = _datos_del_formulario(soup0)
+    informe["FORMULARIO"] = formulario or "no se encontro un formulario con mes/año"
 
-    for etiqueta, url in formas:
-        intento = {"forma": etiqueta, "url": url[:110] + ("…" if len(url) > 110 else "")}
-        try:
-            soup = fetch(url)
-            reuniones = calendar_from_meetings(soup)
-            del_mes = [r for r in reuniones if r["fecha"].startswith(prefijo)]
-            intento["total_traido"] = len(reuniones)
-            intento["DEL_MES_PEDIDO"] = len(del_mes)
-            intento["FUNCIONA"] = len(del_mes) > 0
-            meses = sorted({r["fecha"][:7] for r in reuniones})
-            intento["meses_que_trajo"] = meses
-            intento["ejemplos"] = [
-                f"{r['fecha']} {r['hipodromo']}" for r in del_mes[:4]
-            ]
-        except Exception as e:
-            intento["error"] = str(e)
-        informe["intentos"].append(intento)
+    # Todos los formularios, por si el filtro fue muy estricto
+    todos = []
+    for f in soup0.find_all("form"):
+        todos.append({
+            "accion": f.get("action", ""),
+            "metodo": f.get("method", "get"),
+            "campos": [i.get("name") for i in f.find_all(["input","select"]) if i.get("name")],
+        })
+    informe["todos_los_formularios"] = todos[:6]
 
-    funcionan = [i["forma"] for i in informe["intentos"] if i.get("FUNCIONA")]
+    # Todos los <select> de la pagina, con sus opciones
+    selects = []
+    for sel in soup0.find_all("select"):
+        opciones = [o.get("value","") for o in sel.find_all("option")][:14]
+        selects.append({"nombre": sel.get("name",""), "id": sel.get("id",""),
+                        "opciones": opciones})
+    informe["selectores"] = selects[:6]
+
+    informe["codigo_recaptcha"] = bool(_codigo_recaptcha(soup0))
+
+    # 2) Probar las vias
+    try:
+        reuniones, via = _traer_mes(anio, mes)
+    except Exception as e:
+        reuniones, via = [], f"error: {e}"
+
     informe["RESUMEN"] = {
-        "FORMAS_QUE_FUNCIONAN": funcionan,
-        "se_puede_traer_meses_viejos": len(funcionan) > 0,
+        "se_puede_traer_meses_viejos": bool(reuniones),
+        "VIA_QUE_FUNCIONA": via,
+        "reuniones_del_mes": len(reuniones),
+        "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:5]],
     }
     return jsonify(ok=True, **informe)
 
