@@ -98,6 +98,11 @@
   .btn-run{ background:var(--verde-turf); color:var(--hueso); }
   .btn-run:hover{ background:var(--verde-turf-2); }
   .btn-stop{ background:var(--carmin); color:var(--hueso); }
+  .btn-borrar{
+    background:transparent; color:var(--carmin);
+    border:1.5px solid var(--carmin);
+  }
+  .btn-borrar:hover{ background:var(--carmin); color:#fff; }
   .btn:disabled{ opacity:.4; cursor:not-allowed; }
   .progreso{ margin-top:16px; }
   .progreso-bg{
@@ -161,6 +166,7 @@
       </div>
       <button class="btn btn-run" id="btn-run" onclick="arrancar()">Iniciar recolección</button>
       <button class="btn btn-stop" id="btn-stop" onclick="detener()" disabled>Detener</button>
+      <button class="btn btn-borrar" onclick="reiniciarTodo()">Borrar y empezar de cero</button>
     </div>
 
     <div class="progreso">
@@ -284,6 +290,21 @@ async function arrancar(){
 async function detener(){
   await fetch('/api/admin/detener?clave=' + encodeURIComponent(clave), {method:'POST'});
   setTimeout(verEstado, 500);
+}
+
+async function reiniciarTodo(){
+  if (!confirm('Esto borra TODOS los pronósticos guardados y vuelve el algoritmo ' +
+               'a sus valores iniciales.\n\n¿Seguro?')) return;
+  try{
+    const r = await fetch('/api/admin/reiniciar?clave=' + encodeURIComponent(clave),
+                          {method:'POST'});
+    const d = await r.json();
+    alert(d.mensaje || d.error || 'Listo.');
+    cargar();
+    verEstado();
+  }catch(e){
+    alert('No se pudo borrar: ' + e.message);
+  }
 }
 
 async function verEstado(){
