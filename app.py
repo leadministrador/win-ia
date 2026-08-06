@@ -722,11 +722,21 @@ def _codigo_recaptcha(soup):
 
 def _sesion_studbook():
     """
-    Una sesion que conserva las cookies. Hace falta porque el sitio puede
-    recordar el mes elegido en la sesion, y no solo en la direccion.
+    Una sesion que conserva las cookies y se presenta como un navegador
+    real. Hace falta porque el sitio puede recordar el mes elegido en la
+    sesion, y porque puede rechazar pedidos que no parezcan de un navegador.
     """
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/126.0 Safari/537.36"),
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8"),
+        "Accept-Language": "es-AR,es;q=0.9",
+        "Referer": BASE + "/reuniones",
+        "Upgrade-Insecure-Requests": "1",
+    })
     return s
 
 
@@ -794,32 +804,45 @@ def _traer_mes(anio, mes):
         intentos.append(("formulario", formulario["metodo"],
                          formulario["accion"], campos))
 
-    # 2) Por direccion, con el codigo si aparecio.
+    # 2) Con el campo recaptcha VACIO, tal como lo declara el formulario.
+    params_vacio = {"recaptcha": "", "mes": f"{mes:02d}", "anio": str(anio)}
+    intentos.append(("recaptcha vacio", "get", BASE + "/reuniones", params_vacio))
+
+    # 3) Por direccion, con el codigo si aparecio.
     params = {"mes": f"{mes:02d}", "anio": str(anio)}
     if codigo:
         intentos.append(("direccion con codigo", "get", BASE + "/reuniones",
                          {**params, "recaptcha": codigo}))
-    # 3) Por direccion pelada, ya con las cookies de la sesion.
+    # 4) Por direccion pelada, ya con las cookies de la sesion.
     intentos.append(("direccion con sesion", "get", BASE + "/reuniones", params))
-    # 4) Por direccion, como POST.
+    # 5) Por direccion, como POST.
     intentos.append(("direccion como POST", "post", BASE + "/reuniones", params))
+    # 6) Con el orden de campos tal cual el formulario los declara.
+    intentos.append(("orden del formulario", "get", BASE + "/reuniones",
+                     {"recaptcha": "", "mes": str(mes), "anio": str(anio)}))
 
+    detalle = []
     for etiqueta, metodo, accion, datos in intentos:
         try:
             if metodo == "post":
                 r = s.post(accion, data=datos, timeout=(5, 15))
             else:
                 r = s.get(accion, params=datos, timeout=(5, 15))
-            if r.status_code != 200:
-                continue
             reuniones = calendar_from_meetings(BeautifulSoup(r.text, "html.parser"))
             del_mes = [x for x in reuniones if x["fecha"].startswith(prefijo)]
+            meses = sorted({x["fecha"][:7] for x in reuniones})
+            detalle.append({
+                "via": etiqueta, "metodo": metodo.upper(),
+                "status": r.status_code, "url": r.url[:120],
+                "total": len(reuniones), "DEL_MES": len(del_mes),
+                "meses_que_trajo": meses,
+            })
             if del_mes:
-                return del_mes, etiqueta
-        except Exception:
-            continue
+                return del_mes, etiqueta, detalle
+        except Exception as e:
+            detalle.append({"via": etiqueta, "error": str(e)[:120]})
 
-    return [], ""
+    return [], "", detalle
 
 
 def calendario_del_mes(anio, mes):
@@ -837,7 +860,7 @@ def calendario_del_mes(anio, mes):
         return cacheado
 
     try:
-        reuniones, via = _traer_mes(anio, mes)
+        reuniones, via, _ = _traer_mes(anio, mes)
         if reuniones:
             cache_set(clave, reuniones)
         return reuniones
@@ -1632,9 +1655,9 @@ def admin_diag_calendario():
 
     # 2) Probar las vias
     try:
-        reuniones, via = _traer_mes(anio, mes)
+        reuniones, via, detalle = _traer_mes(anio, mes)
     except Exception as e:
-        reuniones, via = [], f"error: {e}"
+        reuniones, via, detalle = [], f"error: {e}", []
 
     informe["RESUMEN"] = {
         "se_puede_traer_meses_viejos": bool(reuniones),
@@ -1642,6 +1665,7 @@ def admin_diag_calendario():
         "reuniones_del_mes": len(reuniones),
         "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:5]],
     }
+    informe["DETALLE_DE_CADA_INTENTO"] = detalle
     return jsonify(ok=True, **informe)
 
 
