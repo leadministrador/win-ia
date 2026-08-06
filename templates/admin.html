@@ -207,16 +207,18 @@
   </p>
 
   <div class="caja-recolector">
-    <div class="fila-form" style="margin-bottom:18px;">
+    <div class="fila-form" style="margin-bottom:14px;">
       <div class="campo">
         <label>Fecha</label>
-        <input type="date" id="cond-fecha">
+        <input type="date" id="cond-fecha" onchange="cargarHipodromosDelDia()">
       </div>
-      <div class="campo" style="flex:1; min-width:150px;">
-        <label>Hipódromo</label>
-        <input type="text" id="cond-hipodromo" placeholder="Palermo" class="txt">
+    </div>
+
+    <div class="grupo-cond" id="grupo-hipodromos">
+      <label>Hipódromo</label>
+      <div class="ops-cond" id="ops-hipodromos">
+        <span class="progreso-txt">Elegí primero una fecha.</span>
       </div>
-      <button class="btn btn-run" onclick="cargarCondiciones()">Ver lo cargado</button>
     </div>
 
     <div id="campos-condiciones"></div>
@@ -348,21 +350,62 @@ async function detener(){
 // ---------- Condiciones de la reunion ----------
 let camposCond = [];
 let elegidasCond = {};
+let hipElegido = '';
 
 document.getElementById('cond-fecha').value = new Date().toISOString().slice(0,10);
 
+async function cargarHipodromosDelDia(){
+  const fecha = document.getElementById('cond-fecha').value;
+  const cont = document.getElementById('ops-hipodromos');
+  const est = document.getElementById('cond-estado');
+  hipElegido = '';
+  document.getElementById('campos-condiciones').innerHTML = '';
+  est.textContent = '';
+  if (!fecha){
+    cont.innerHTML = '<span class="progreso-txt">Elegí primero una fecha.</span>';
+    return;
+  }
+  cont.innerHTML = '<span class="progreso-txt">Buscando los hipódromos de ese día…</span>';
+  try{
+    const r = await fetch('/api/calendario');
+    const d = await r.json();
+    const delDia = (d.reuniones || []).filter(x => x.fecha === fecha);
+    if (!delDia.length){
+      cont.innerHTML = '<span class="progreso-txt">No hay reuniones ese día.</span>';
+      return;
+    }
+    // Un solo botón por hipódromo, sin repetir.
+    const vistos = new Set();
+    cont.innerHTML = delDia.filter(x => {
+      const k = x.hipodromo.toLowerCase();
+      if (vistos.has(k)) return false;
+      vistos.add(k); return true;
+    }).map(x => `
+      <div class="op-cond" onclick="elegirHipodromo(this,'${x.hipodromo.replace(/'/g,"\\'")}')"
+        >${x.hipodromo}</div>`).join('');
+  }catch(e){
+    cont.innerHTML = '<span class="progreso-txt">No se pudo traer el calendario.</span>';
+  }
+}
+
+async function elegirHipodromo(el, nombre){
+  document.querySelectorAll('#ops-hipodromos .op-cond').forEach(o=>o.classList.remove('sel'));
+  el.classList.add('sel');
+  hipElegido = nombre;
+  await cargarCondiciones();
+}
+
 async function cargarCondiciones(){
   const fecha = document.getElementById('cond-fecha').value;
-  const hip = document.getElementById('cond-hipodromo').value.trim();
   const est = document.getElementById('cond-estado');
-  if (!fecha || !hip){
-    est.textContent = 'Elegí la fecha y escribí el hipódromo.';
+  if (!fecha || !hipElegido){
+    est.textContent = 'Elegí la fecha y el hipódromo.';
     return;
   }
   est.textContent = 'Buscando…';
   try{
     const r = await fetch('/api/condiciones?fecha=' + encodeURIComponent(fecha) +
-                          '&hipodromo=' + encodeURIComponent(hip));
+                          '&hipodromo=' + encodeURIComponent(hipElegido));
     const d = await r.json();
     camposCond = d.campos || [];
     elegidasCond = {...(d.oficiales || {})};
@@ -398,10 +441,9 @@ function elegirCond(clave, valor){
 
 async function guardarCondiciones(){
   const fecha = document.getElementById('cond-fecha').value;
-  const hip = document.getElementById('cond-hipodromo').value.trim();
   const est = document.getElementById('cond-estado');
-  if (!fecha || !hip){
-    est.textContent = 'Elegí la fecha y escribí el hipódromo.';
+  if (!fecha || !hipElegido){
+    est.textContent = 'Elegí la fecha y el hipódromo.';
     return;
   }
   est.textContent = 'Guardando…';
@@ -409,7 +451,7 @@ async function guardarCondiciones(){
     const r = await fetch('/api/admin/condiciones?clave=' + encodeURIComponent(clave), {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        fecha, hipodromo: hip, ...elegidasCond,
+        fecha, hipodromo: hipElegido, ...elegidasCond,
         observaciones: document.getElementById('cond-obs').value,
       })
     });
@@ -474,6 +516,7 @@ setInterval(verEstado, 4000);
 verEstado();
 
 cargar();
+cargarHipodromosDelDia();
 </script>
 </body>
 </html>
