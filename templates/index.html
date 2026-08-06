@@ -744,6 +744,60 @@
   @media (max-width:360px){
     .cuadricula{ grid-template-columns:1fr; }
   }
+  /* ===== CONDICIONES DE LA REUNION ===== */
+  .oficiales-caja{
+    background:var(--pergamino); border-left:3px solid var(--carmin);
+    padding:12px 14px; border-radius:0 5px 5px 0; margin-bottom:12px;
+  }
+  .of-rot{
+    font-family:'Space Mono',monospace; font-size:9.5px; text-transform:uppercase;
+    letter-spacing:.09em; color:var(--carmin); margin-bottom:6px;
+  }
+  .of-txt{ font-size:14.5px; line-height:1.6; }
+  .of-obs{ font-size:12.5px; opacity:.75; margin-top:6px; line-height:1.5; }
+  .btn-ajustar{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:14px;
+    background:transparent; color:var(--verde-turf);
+    border:1.5px solid var(--pergamino-2); padding:13px; border-radius:7px;
+    cursor:pointer; min-height:48px;
+  }
+  .btn-ajustar:hover{ border-color:var(--bronce); background:var(--hueso); }
+  .grupo-u{ margin-top:14px; }
+  .grupo-u > label{
+    display:block; font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.08em; opacity:.6; margin-bottom:7px;
+  }
+  .ops-u{ display:flex; gap:7px; flex-wrap:wrap; }
+  .op-u{
+    font-family:'Archivo',sans-serif; font-size:14px; padding:11px 15px;
+    border-radius:7px; border:1.5px solid var(--pergamino-2);
+    background:var(--hueso); cursor:pointer; min-height:46px;
+    display:flex; align-items:center;
+  }
+  .op-u:hover{ border-color:var(--bronce); }
+  .op-u.oficial{ background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf); }
+  .op-u.mia{ background:var(--bronce); color:var(--tinta); border-color:var(--bronce); font-weight:600; }
+  .aviso-personal{
+    background:#f7f0e0; border-left:3px solid var(--bronce);
+    padding:12px 14px; border-radius:0 5px 5px 0; margin-top:14px;
+    font-size:13px; line-height:1.55; display:none;
+  }
+  .aviso-personal.visible{ display:block; }
+  .btn-volver-of{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:14px;
+    background:transparent; color:var(--verde-turf);
+    border:1.5px solid var(--bronce); padding:12px; border-radius:7px;
+    cursor:pointer; margin-top:11px; min-height:46px;
+  }
+  .pron-row.cambio{ border-color:var(--bronce); background:#fdf9f0; }
+  .flecha-sube{ color:#2b8c6b; font-size:13px; }
+  .flecha-baja{ color:var(--carmin); font-size:13px; }
+  .etiqueta-personal{
+    display:inline-block; font-family:'Space Mono',monospace; font-size:9px;
+    text-transform:uppercase; letter-spacing:.08em; background:var(--bronce);
+    color:#fff; padding:2px 7px; border-radius:3px; margin-left:8px;
+    vertical-align:2px;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1035,8 +1089,18 @@
       <div class="step-body">
         <div class="comp-list" id="comp-list"></div>
 
+        <div class="ficha-section" id="caja-condiciones" style="display:none;">
+          <h4>Condiciones de la reunión</h4>
+          <div class="oficiales-caja" id="oficiales-caja"></div>
+          <button class="btn-ajustar" id="btn-ajustar" onclick="alternarAjuste()">
+            Ajustar las condiciones
+          </button>
+          <div id="ajuste-usuario" style="display:none;"></div>
+          <div class="aviso-personal" id="aviso-personal"></div>
+        </div>
+
         <div class="ficha-section">
-          <h4>Pronóstico — primeros 4 puestos</h4>
+          <h4 id="titulo-pronostico">Pronóstico — primeros 4 puestos</h4>
           <div class="pronostico" id="pronostico"></div>
         </div>
       </div>
@@ -1287,8 +1351,11 @@ async function elegirCarrera(c, itemEl){
       fecha: fechaElegida,
       hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
     };
+    ultimoContexto = contexto;
+    ultimosParticipantes = participantesActuales;
+    await traerCondiciones(contexto.fecha, contexto.hipodromo);
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
-    renderPronostico(analisis.ranking || []);
+    renderPronostico(analisis.ranking || [], analisis);
   }catch(e){
     pron.innerHTML = estadoMsg('No se pudo calcular el pronóstico. ' + e.message, true);
   }finally{
@@ -1330,20 +1397,56 @@ function renderCompetidores(participantes){
   });
 }
 
-function renderPronostico(ranking){
+function renderPronostico(ranking, respuesta){
   const pron = document.getElementById('pronostico');
   pron.innerHTML = '';
   if (ranking.length === 0){
     pron.innerHTML = estadoMsg('No hay suficientes participantes confirmados para pronosticar.', true);
     return;
   }
+
+  const esPersonal = respuesta && respuesta.es_personal;
+  const oficial = (respuesta && respuesta.ranking_oficial)
+    ? respuesta.ranking_oficial.map(x => x.nombre) : [];
+
+  // Título y aviso
+  const titulo = document.getElementById('titulo-pronostico');
+  if (titulo){
+    titulo.innerHTML = 'Pronóstico — primeros 4 puestos' +
+      (esPersonal ? '<span class="etiqueta-personal">con tus condiciones</span>' : '');
+  }
+  const aviso = document.getElementById('aviso-personal');
+  if (aviso){
+    if (esPersonal){
+      const cambios = Object.entries(respuesta.condiciones_usadas || {})
+        .map(([k,v]) => v).join(' · ');
+      aviso.innerHTML = `Estás viendo el pronóstico con <b>${cambios}</b>.
+        Este cambio es solo tuyo: no altera el pronóstico oficial ni las
+        estadísticas de la app.
+        <button class="btn-volver-of" onclick="volverAOficial()">Volver a lo oficial</button>`;
+      aviso.classList.add('visible');
+    } else {
+      aviso.classList.remove('visible');
+      aviso.innerHTML = '';
+    }
+  }
+
   ranking.forEach((p,i)=>{
+    let flecha = '';
+    if (esPersonal && oficial.length){
+      const antes = oficial.indexOf(p.nombre);
+      if (antes !== -1 && antes !== i){
+        flecha = antes > i
+          ? '<span class="flecha-sube">▲</span>'
+          : '<span class="flecha-baja">▼</span>';
+      }
+    }
     const row = document.createElement('div');
-    row.className = 'pron-row';
+    row.className = 'pron-row' + (flecha ? ' cambio' : '');
     row.innerHTML = `
       <div class="pron-pos">${i+1}º</div>
       <div class="pron-bar-wrap">
-        <div class="pron-nombre">${p.nombre}</div>
+        <div class="pron-nombre">${p.nombre} ${flecha}</div>
         <div class="pron-bar-bg"><div class="pron-bar" style="width:${Math.min(100,p.probabilidad_relativa*2.2)}%"></div></div>
       </div>
       <div class="pron-pct">${p.probabilidad_relativa}%</div>`;
@@ -1824,6 +1927,112 @@ function alternarCampanaCompleta(){
   b.textContent = abierta
     ? 'Ver todas las carreras (' + ((caballoActual.carreras||[]).length) + ')'
     : 'Ocultar la campaña completa';
+}
+
+// ============================================================
+// CONDICIONES DE LA REUNION — el usuario las puede ajustar
+// ============================================================
+let camposCondiciones = [];
+let condicionesOficiales = {};
+let condicionesMias = {};
+let observacionesReunion = '';
+let ultimosParticipantes = [];
+let ultimoContexto = {};
+
+async function traerCondiciones(fecha, hipodromo){
+  try{
+    const d = await apiGet('/api/condiciones?fecha=' + encodeURIComponent(fecha) +
+                           '&hipodromo=' + encodeURIComponent(hipodromo));
+    camposCondiciones = d.campos || [];
+    condicionesOficiales = d.oficiales || {};
+    observacionesReunion = d.observaciones || '';
+    condicionesMias = {};
+    pintarCondiciones();
+  }catch(e){
+    document.getElementById('caja-condiciones').style.display = 'none';
+  }
+}
+
+function pintarCondiciones(){
+  const caja = document.getElementById('caja-condiciones');
+  const puestas = camposCondiciones
+    .map(c => condicionesOficiales[c.clave])
+    .filter(Boolean);
+
+  if (!puestas.length && !observacionesReunion){
+    caja.style.display = 'none';
+    return;
+  }
+  caja.style.display = 'block';
+
+  document.getElementById('oficiales-caja').innerHTML = `
+    <div class="of-rot">Condiciones oficiales</div>
+    <div class="of-txt">${puestas.join(' · ')}</div>
+    ${observacionesReunion ? '<div class="of-obs">'+observacionesReunion+'</div>' : ''}`;
+
+  const cont = document.getElementById('ajuste-usuario');
+  cont.innerHTML = camposCondiciones.map(c => {
+    const oficial = condicionesOficiales[c.clave] || '';
+    const mia = condicionesMias[c.clave] || '';
+    return `
+      <div class="grupo-u">
+        <label>${c.titulo}</label>
+        <div class="ops-u">
+          ${c.opciones.map(o => {
+            let cls = '';
+            if (mia === o) cls = 'mia';
+            else if (!mia && oficial === o) cls = 'oficial';
+            return `<div class="op-u ${cls}"
+                      onclick="ajustarCondicion('${c.clave}','${o.replace(/'/g,"\\'")}')"
+                    >${o}</div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function alternarAjuste(){
+  const c = document.getElementById('ajuste-usuario');
+  const b = document.getElementById('btn-ajustar');
+  const abierto = c.style.display === 'block';
+  c.style.display = abierto ? 'none' : 'block';
+  b.textContent = abierto ? 'Ajustar las condiciones' : 'Ocultar los ajustes';
+}
+
+async function ajustarCondicion(clave, valor){
+  const oficial = condicionesOficiales[clave] || '';
+  // Si elige lo mismo que lo oficial, se considera que no cambió nada.
+  condicionesMias[clave] = (valor === oficial || condicionesMias[clave] === valor)
+    ? '' : valor;
+  pintarCondiciones();
+  await recalcularPronostico();
+}
+
+function volverAOficial(){
+  condicionesMias = {};
+  pintarCondiciones();
+  recalcularPronostico();
+}
+
+async function recalcularPronostico(){
+  if (!ultimosParticipantes.length) return;
+  const pron = document.getElementById('pronostico');
+  pron.innerHTML = estadoMsg('Recalculando…');
+  mostrarBarra('Cruzando los datos', 'Recalculando el pronóstico');
+  try{
+    const cambios = {};
+    Object.entries(condicionesMias).forEach(([k,v])=>{ if (v) cambios[k] = v; });
+    const d = await apiPost('/api/analizar', {
+      ...ultimoContexto,
+      participantes: ultimosParticipantes,
+      condiciones_usuario: cambios,
+    });
+    renderPronostico(d.ranking || [], d);
+  }catch(e){
+    pron.innerHTML = estadoMsg('No se pudo recalcular. ' + e.message, true);
+  }finally{
+    ocultarBarra();
+  }
 }
 
 function alternarCarrera(i){
