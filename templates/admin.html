@@ -98,6 +98,27 @@
   .btn-run{ background:var(--verde-turf); color:var(--hueso); }
   .btn-run:hover{ background:var(--verde-turf-2); }
   .btn-stop{ background:var(--carmin); color:var(--hueso); }
+  .txt{
+    width:100%; font-family:'Archivo',sans-serif; font-size:14px;
+    padding:10px 12px; border:1px solid var(--pergamino-2);
+    border-radius:4px; background:var(--hueso); color:var(--tinta);
+  }
+  .grupo-cond{ margin-bottom:15px; }
+  .grupo-cond > label{
+    display:block; font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.08em; opacity:.6; margin-bottom:7px;
+  }
+  .ops-cond{ display:flex; gap:7px; flex-wrap:wrap; }
+  .op-cond{
+    font-family:'Archivo',sans-serif; font-size:13.5px; padding:10px 14px;
+    border-radius:6px; border:1.5px solid var(--pergamino-2);
+    background:var(--hueso); cursor:pointer; min-height:42px;
+    display:flex; align-items:center; color:var(--tinta);
+  }
+  .op-cond:hover{ border-color:var(--bronce); }
+  .op-cond.sel{
+    background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf);
+  }
   .btn-borrar{
     background:transparent; color:var(--carmin);
     border:1.5px solid var(--carmin);
@@ -178,6 +199,38 @@
     </div>
   </div>
 
+
+  <h2>Condiciones de la reunión</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Valen para todas las carreras de ese día y las ven todos los usuarios.
+    El usuario las puede cambiar para sí mismo, sin alterar el pronóstico oficial.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="fila-form" style="margin-bottom:18px;">
+      <div class="campo">
+        <label>Fecha</label>
+        <input type="date" id="cond-fecha">
+      </div>
+      <div class="campo" style="flex:1; min-width:150px;">
+        <label>Hipódromo</label>
+        <input type="text" id="cond-hipodromo" placeholder="Palermo" class="txt">
+      </div>
+      <button class="btn btn-run" onclick="cargarCondiciones()">Ver lo cargado</button>
+    </div>
+
+    <div id="campos-condiciones"></div>
+
+    <div class="campo" style="margin-top:16px;">
+      <label>Observaciones</label>
+      <input type="text" id="cond-obs" class="txt"
+             placeholder="Lo que no entre en las opciones de arriba">
+    </div>
+
+    <button class="btn btn-run" style="width:100%; margin-top:16px;"
+            onclick="guardarCondiciones()">Guardar para toda la reunión</button>
+    <div class="progreso-txt" id="cond-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Últimas carreras comparadas</h2>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
 
@@ -290,6 +343,81 @@ async function arrancar(){
 async function detener(){
   await fetch('/api/admin/detener?clave=' + encodeURIComponent(clave), {method:'POST'});
   setTimeout(verEstado, 500);
+}
+
+// ---------- Condiciones de la reunion ----------
+let camposCond = [];
+let elegidasCond = {};
+
+document.getElementById('cond-fecha').value = new Date().toISOString().slice(0,10);
+
+async function cargarCondiciones(){
+  const fecha = document.getElementById('cond-fecha').value;
+  const hip = document.getElementById('cond-hipodromo').value.trim();
+  const est = document.getElementById('cond-estado');
+  if (!fecha || !hip){
+    est.textContent = 'Elegí la fecha y escribí el hipódromo.';
+    return;
+  }
+  est.textContent = 'Buscando…';
+  try{
+    const r = await fetch('/api/condiciones?fecha=' + encodeURIComponent(fecha) +
+                          '&hipodromo=' + encodeURIComponent(hip));
+    const d = await r.json();
+    camposCond = d.campos || [];
+    elegidasCond = {...(d.oficiales || {})};
+    document.getElementById('cond-obs').value = d.observaciones || '';
+    pintarCampos();
+    est.textContent = d.cargado_en
+      ? 'Última carga: ' + d.cargado_en.replace('T', ' ')
+      : 'Todavía no hay condiciones cargadas para esa reunión.';
+  }catch(e){
+    est.textContent = 'No se pudo consultar: ' + e.message;
+  }
+}
+
+function pintarCampos(){
+  const cont = document.getElementById('campos-condiciones');
+  cont.innerHTML = camposCond.map(c => `
+    <div class="grupo-cond">
+      <label>${c.titulo}</label>
+      <div class="ops-cond">
+        ${c.opciones.map(o => `
+          <div class="op-cond ${elegidasCond[c.clave]===o ? 'sel' : ''}"
+               onclick="elegirCond('${c.clave}','${o.replace(/'/g,"\\'")}')">${o}</div>
+        `).join('')}
+      </div>
+    </div>`).join('');
+}
+
+function elegirCond(clave, valor){
+  // Volver a tocar la misma opción la desmarca.
+  elegidasCond[clave] = (elegidasCond[clave] === valor) ? '' : valor;
+  pintarCampos();
+}
+
+async function guardarCondiciones(){
+  const fecha = document.getElementById('cond-fecha').value;
+  const hip = document.getElementById('cond-hipodromo').value.trim();
+  const est = document.getElementById('cond-estado');
+  if (!fecha || !hip){
+    est.textContent = 'Elegí la fecha y escribí el hipódromo.';
+    return;
+  }
+  est.textContent = 'Guardando…';
+  try{
+    const r = await fetch('/api/admin/condiciones?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        fecha, hipodromo: hip, ...elegidasCond,
+        observaciones: document.getElementById('cond-obs').value,
+      })
+    });
+    const d = await r.json();
+    est.textContent = d.mensaje || d.error || 'Listo.';
+  }catch(e){
+    est.textContent = 'No se pudo guardar: ' + e.message;
+  }
 }
 
 async function reiniciarTodo(){
