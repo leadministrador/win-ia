@@ -329,6 +329,22 @@ def parse_race(soup, numero):
     }
 
 
+# Codigos que usa el Stud Book en la ficha del caballo, comprobados en el sitio.
+CODIGOS_HIPODROMO = {
+    "ARG": "Palermo", "SIS": "San Isidro", "LPA": "La Plata",
+    "ROS": "Rosario", "TAN": "Tandil", "DOL": "Dolores",
+    "AZL": "Azul", "TUC": "Tucumán", "SLU": "La Punta",
+    "CBA": "Córdoba", "MZA": "Mendoza", "SFE": "Santa Fe",
+    "NQN": "Neuquén", "SR": "San Rafael", "TDL": "Tandil",
+    "LP": "La Plata", "SI": "San Isidro",
+}
+
+def nombre_hipodromo(codigo):
+    """Devuelve el nombre del hipodromo a partir de su codigo."""
+    c = clean(codigo).upper()
+    return CODIGOS_HIPODROMO.get(c, codigo)
+
+
 def _tabla_carreras_del_perfil(soup):
     """
     Busca la tabla CARRERAS de la ficha del ejemplar y la lee por columnas:
@@ -350,8 +366,15 @@ def _tabla_carreras_del_perfil(soup):
 
         idx = {}
         for i, h in enumerate(encabezados):
-            if "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
-            elif h in ("n°", "n", "nº") and "puesto" not in idx: idx["puesto"] = i
+            # OJO con el orden de estas condiciones. Comprobado en el sitio,
+            # los encabezados son:
+            #   Hip. | N° | O | Dist. | Tiempo | Premio | Cat. | Cond. |
+            #   P | E | Kg | Jockey | Caballeriza | Pos. | Importe | Pago
+            # 'Pos.' es el PUESTO de llegada. 'N°' es el numero de reunion
+            # y 'O' el numero que llevo el caballo. No confundirlos.
+            if h.startswith("pos") and "puesto" not in idx: idx["puesto"] = i
+            elif "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
+            elif h in ("n°", "n", "nº") and "reunion" not in idx: idx["reunion"] = i
             elif h == "o" and "numero" not in idx: idx["numero"] = i
             elif "dist" in h and "distancia" not in idx: idx["distancia"] = i
             elif "tiempo" in h and "tiempo" not in idx: idx["tiempo"] = i
@@ -363,6 +386,8 @@ def _tabla_carreras_del_perfil(soup):
             elif h == "kg" and "kilos" not in idx: idx["kilos"] = i
             elif "jockey" in h and "jockey" not in idx: idx["jockey"] = i
             elif "caballeriza" in h and "caballeriza" not in idx: idx["caballeriza"] = i
+            elif "importe" in h and "importe" not in idx: idx["importe"] = i
+            elif h == "pago" and "pago" not in idx: idx["pago"] = i
 
         filas = []
         for tr in table.find_all("tr"):
@@ -397,9 +422,11 @@ def _tabla_carreras_del_perfil(soup):
             puesto_txt = col("puesto")
             filas.append({
                 "fecha": m_fecha.group(1),
-                "hipodromo": col("hipodromo"),
+                "hipodromo": nombre_hipodromo(col("hipodromo")),
+                "hipodromo_codigo": col("hipodromo"),
                 "puesto": int(puesto_txt) if puesto_txt.isdigit() else None,
                 "numero": col("numero"),
+                "reunion": col("reunion"),
                 "distancia": col("distancia"),
                 "tiempo": col("tiempo"),
                 "premio": col("premio"),
@@ -410,6 +437,8 @@ def _tabla_carreras_del_perfil(soup):
                 "kilos": col("kilos"),
                 "jockey": col("jockey"),
                 "caballeriza": col("caballeriza"),
+                "importe": col("importe"),
+                "pago": col("pago"),
                 "video": video,
                 "enlace": enlace_carrera,
             })
