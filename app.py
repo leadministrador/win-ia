@@ -17,7 +17,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
 
-def fetch(url):
+def fetch(u
     r = requests.get(url, headers=HEADERS, timeout=(4, 8))
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
@@ -1827,7 +1827,8 @@ def admin_reiniciar():
     guardar_pesos(PESOS_INICIALES)
 
     return jsonify(ok=True,
-                   mensaje=f"Se borraron {n} pronosticos y el algoritmo volvio a cero.",
+                   mensaje=(f"Se borraron {n} pronósticos. "
+                            "El algoritmo volvió a sus valores iniciales."),
                    borrados=n)
 
 
