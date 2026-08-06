@@ -554,6 +554,17 @@ def enrich_horse(horse):
         carreras = _tabla_carreras_del_perfil(soup)
         horse["carreras"] = carreras[:20]
 
+        # El estado de la pista de cada carrera viene como codigo ("5", "A").
+        # Para que el algoritmo pueda compararlo con la pista del dia hace
+        # falta la palabra. Se trae de las 6 mas recientes, que es lo que
+        # pesa en el rendimiento actual. Queda en cache, asi no se repite.
+        for c in horse["carreras"][:6]:
+            if c.get("enlace"):
+                try:
+                    c.update(detalle_de_carrera(c["enlace"]))
+                except Exception:
+                    pass
+
         # Contadores para el pronostico y para mostrar.
         puestos = [c["puesto"] for c in carreras if c["puesto"]]
         horse["victorias"] = sum(1 for p in puestos if p == 1)
@@ -666,14 +677,12 @@ def score_horse(h, context, pesos=None):
         score += min(6, (podios - victorias) * P["podio_reciente"])
         reasons.append(f"{podios} llegada(s) entre los tres primeros")
 
-    # Pista exigente: se premia el antecedente en ESE estado, no en cualquiera.
-    # Se toma de las condiciones cargadas, o de lo que publica el Stud Book.
+    # Pista exigente: se premia el antecedente en ESE estado.
+    # El dato correcto esta en cada carrera de la campana (campo 'estado'),
+    # NO en la frase resumen, donde nunca figura el tipo de piso.
     estado_dia = context.get("estado") or context.get("pista_dia") or ""
-    historial = normalize_text(campaign + " " + detail)
     if estado_dia:
         clave_estado = normalize_text(estado_dia)
-        # Pisos que se parecen entre si: un antecedente en uno vale para el otro,
-        # pero menos que el antecedente exacto.
         PARECIDOS = {
             "pesada": ["barrosa", "humeda"],
             "barrosa": ["pesada", "humeda"],
@@ -681,18 +690,59 @@ def score_horse(h, context, pesos=None):
             "liviana": ["normal"],
             "normal": ["liviana"],
         }
-        if clave_estado and clave_estado in historial:
-            score += P["pista_compatible"]
-            reasons.append(f"corrió bien en pista {estado_dia.lower()}")
-        elif any(p in historial for p in PARECIDOS.get(clave_estado, [])):
-            score += P["pista_compatible"] * 0.5
-            reasons.append(f"antecedente en pista parecida a {estado_dia.lower()}")
 
-    # Viento en contra: castiga un poco a los que llevan más peso.
+        # Como le fue en ese estado de pista, y en los parecidos.
+        exactas, parecidas = [], []
+        for c in h.get("carreras", []):
+            est = normalize_text(c.get("estado_txt") or c.get("estado") or "")
+            if not est or not c.get("puesto"):
+                continue
+            if est == clave_estado:
+                exactas.append(c["puesto"])
+            elif est in PARECIDOS.get(clave_estado, []):
+                parecidas.append(c["puesto"])
+
+        def rinde_bien(puestos):
+            # Entro entre los tres primeros en al menos un tercio de esas salidas.
+            if not puestos:
+                return False
+            return sum(1 for p in puestos if p <= 3) >= max(1, len(puestos) / 3)
+
+        if exactas:
+            if rinde_bien(exactas):
+                score += P["pista_compatible"]
+                reasons.append(
+                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} y anduvo bien")
+            else:
+                score -= P["pista_compatible"] * 0.6
+                reasons.append(
+                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} sin buen resultado")
+        elif parecidas and rinde_bien(parecidas):
+            score += P["pista_compatible"] * 0.5
+            reasons.append(f"anduvo bien en pista parecida a {estado_dia.lower()}")
+
+        # Respaldo: si no hay campana cargada, se mira la frase resumen.
+        elif not h.get("carreras"):
+            if clave_estado in normalize_text(campaign + " " + detail):
+                score += P["pista_compatible"] * 0.5
+                reasons.append(f"antecedente en pista {estado_dia.lower()}")
+
+    # Viento en contra: castiga a los que llevan más peso que el promedio.
     if context.get("viento") == "En contra" and peso_propio is not None:
         if pesos_carrera and peso_propio > (sum(pesos_carrera)/len(pesos_carrera)):
-            score += P["peso_pesado"] * 0.4
+            score += P["peso_pesado"] * 0.6
             reasons.append("viento en contra y lleva peso por encima del promedio")
+
+    # Césped: es una superficie muy distinta, el que nunca corrió ahí arranca en desventaja.
+    if normalize_text(context.get("pista", "")).startswith("cesped"):
+        en_cesped = [c for c in h.get("carreras", [])
+                     if "cesped" in normalize_text(c.get("pista_txt") or c.get("pista") or "")]
+        if h.get("carreras") and not en_cesped:
+            score -= P["pista_compatible"] * 0.5
+            reasons.append("nunca corrió en césped")
+        elif en_cesped:
+            score += P["pista_compatible"] * 0.4
+            reasons.append(f"tiene {len(en_cesped)} carrera(s) en césped")
 
     return round(max(1, min(99, score)), 1), reasons
 
