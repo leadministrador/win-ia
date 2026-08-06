@@ -1188,15 +1188,7 @@ def analizar():
     if len(horses) < 2:
         return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
     pesos = cargar_pesos()
-    ranked = []
-    for h in horses:
-        score, reasons = score_horse(h, data, pesos)
-        ranked.append({**h,"score":score,"motivos":reasons})
-    ranked.sort(key=lambda x:x["score"], reverse=True)
-    top = ranked[:4]
-    total = sum(x["score"] for x in top) or 1
-    for x in top:
-        x["probabilidad_relativa"] = round(x["score"]/total*100,1)
+    ranked, top = rankear(horses, data, pesos)
 
     # Guardar el pronostico y, si la carrera ya se corrio, comparar en el acto.
     ya_corrida = any(h.get("puesto") for h in horses)
@@ -1223,11 +1215,27 @@ def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
     """
     Guarda lo que predijo la app. Si la carrera ya tiene puestos reales,
     calcula el acierto y ajusta el algoritmo automaticamente.
+    IMPORTANTE: si ya habia un pronostico guardado, NO se pisa. El valor
+    del pronostico esta en haberse hecho antes de conocer el resultado.
     """
     if not url or numero is None:
         return
 
     predichos = [x["nombre"] for x in top]
+
+    # Si ya hay un pronostico guardado para esta carrera, se conserva ese.
+    con = db()
+    previo = con.execute(
+        "SELECT ranking FROM pronosticos WHERE url=? AND numero=?",
+        (url, int(numero))
+    ).fetchone()
+    con.close()
+    if previo:
+        try:
+            predichos = json.loads(previo["ranking"]) or predichos
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     resultado = None
     acierto_ganador = None
     aciertos_top4 = None
@@ -1269,11 +1277,42 @@ def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
         ajustar_algoritmo()
 
 
+def ordenar_para_pronosticar(participantes):
+    """
+    Ordena los caballos por su NUMERO antes de puntuarlos.
+    Es imprescindible: la tabla de una carrera ya corrida viene ordenada
+    por orden de llegada. Si se puntuara en ese orden y varios caballos
+    empataran, el desempate copiaria el resultado y el acierto seria falso.
+    """
+    return sorted(
+        participantes,
+        key=lambda p: (p.get("numero") is None, p.get("numero") or 0,
+                       p.get("nombre") or "")
+    )
+
+
+def rankear(participantes, contexto, pesos):
+    """Puntua y ordena a los participantes. Devuelve los cuatro primeros."""
+    base = ordenar_para_pronosticar(participantes)
+    ranked = []
+    for p in base:
+        score, motivos = score_horse(p, contexto, pesos)
+        ranked.append({**p, "score": score, "motivos": motivos})
+    # Desempate por nombre, para que nunca dependa del orden de llegada.
+    ranked.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
+    top = ranked[:4]
+    total = sum(x["score"] for x in top) or 1
+    for x in top:
+        x["probabilidad_relativa"] = round(x["score"] / total * 100, 1)
+    return ranked, top
+
+
 def ajustar_algoritmo():
     """
-    Compara todos los pronosticos ya resueltos y afina los pesos.
-    Metodo conservador: mueve cada peso de a poco segun si viene acertando
-    mejor o peor que el promedio historico. Nunca hace saltos bruscos.
+    Compara los pronosticos ya resueltos y afina los pesos.
+    Cada peso tiene un piso y un techo para que nunca se anule: si todos
+    los pesos llegaran a cero, todos los caballos puntuarian igual y el
+    pronostico dejaria de significar algo.
     """
     con = db()
     filas = con.execute("""
@@ -1283,8 +1322,8 @@ def ajustar_algoritmo():
     """).fetchall()
     con.close()
 
-    if len(filas) < 10:
-        return  # con menos de 10 carreras no hay con que aprender
+    if len(filas) < 20:
+        return  # con menos de 20 carreras no hay con que aprender
 
     recientes = filas[:30]
     historico = filas
@@ -1293,18 +1332,19 @@ def ajustar_algoritmo():
     tasa_historica = sum(f["aciertos_top4"] or 0 for f in historico) / (len(historico) * 4)
 
     pesos = cargar_pesos()
-    # Si lo reciente va peor que el historico, se explora un poco mas.
-    # Si va mejor, se refuerza la direccion actual. Paso chico: 3%.
     direccion = 1.0 if tasa_reciente >= tasa_historica else -1.0
-    paso = 0.03 * direccion
+    paso = 0.02 * direccion
 
     for clave in pesos:
-        nuevo = pesos[clave] * (1 + paso)
-        limite = abs(PESOS_INICIALES[clave]) * 2.5
-        if PESOS_INICIALES[clave] >= 0:
-            pesos[clave] = max(0.0, min(limite, nuevo))
+        inicial = PESOS_INICIALES[clave]
+        nuevo = pesos[clave] + (abs(inicial) * paso)   # paso fijo, no proporcional
+        # Cada peso se mueve como mucho entre la mitad y el doble del inicial.
+        piso = abs(inicial) * 0.5
+        techo = abs(inicial) * 2.0
+        if inicial >= 0:
+            pesos[clave] = max(piso, min(techo, nuevo))
         else:
-            pesos[clave] = min(0.0, max(-limite, nuevo))
+            pesos[clave] = min(-piso, max(-techo, nuevo))
 
     guardar_pesos(pesos)
 
@@ -1769,6 +1809,28 @@ def api_tabulada():
     return jsonify(ok=True, **resultado)
 
 
+@app.post("/api/admin/reiniciar")
+def admin_reiniciar():
+    """
+    Borra los pronosticos guardados y vuelve el algoritmo a sus valores
+    iniciales. Sirve cuando los datos quedaron mal por un error de calculo.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM pronosticos").fetchone()["c"]
+    con.execute("DELETE FROM pronosticos")
+    con.execute("DELETE FROM algoritmo")
+    con.commit()
+    con.close()
+    guardar_pesos(PESOS_INICIALES)
+
+    return jsonify(ok=True,
+                   mensaje=f"Se borraron {n} pronosticos y el algoritmo volvio a cero.",
+                   borrados=n)
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
@@ -1873,16 +1935,11 @@ def procesar_carrera(url_reunion, numero, fecha, hipodromo):
             participantes = [enrich_horse(dict(p)) for p in participantes]
 
         pesos = cargar_pesos()
-        ranked = []
-        for p in participantes:
-            score, motivos = score_horse(p, {"participantes": participantes,
-                                             "pista_dia": data.get("estado", "")}, pesos)
-            ranked.append({**p, "score": score, "motivos": motivos})
-        ranked.sort(key=lambda x: x["score"], reverse=True)
-        top = ranked[:4]
-        total = sum(x["score"] for x in top) or 1
-        for x in top:
-            x["probabilidad_relativa"] = round(x["score"] / total * 100, 1)
+        ranked, top = rankear(
+            participantes,
+            {"participantes": participantes, "pista_dia": data.get("estado", "")},
+            pesos,
+        )
 
         registrar_pronostico(
             url=url_reunion, numero=numero, fecha=fecha, hipodromo=hipodromo,
