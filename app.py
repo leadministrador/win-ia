@@ -61,6 +61,14 @@ def init_db():
       valor REAL NOT NULL,
       actualizado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS condiciones(
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      pista TEXT, estado TEXT, viento TEXT, clima TEXT,
+      observaciones TEXT,
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(fecha, hipodromo)
+    );
     """)
     con.commit()
     con.close()
@@ -658,11 +666,34 @@ def score_horse(h, context, pesos=None):
         score += min(6, (podios - victorias) * P["podio_reciente"])
         reasons.append(f"{podios} llegada(s) entre los tres primeros")
 
-    if context.get("pista_dia") in ["Pesada","Barrosa","Húmeda"] and any(
-        x in (campaign+" "+detail) for x in ["pesada","barrosa","húmeda","humeda"]
-    ):
-        score += P["pista_compatible"]
-        reasons.append("antecedente compatible con la pista del día")
+    # Pista exigente: se premia el antecedente en ESE estado, no en cualquiera.
+    # Se toma de las condiciones cargadas, o de lo que publica el Stud Book.
+    estado_dia = context.get("estado") or context.get("pista_dia") or ""
+    historial = normalize_text(campaign + " " + detail)
+    if estado_dia:
+        clave_estado = normalize_text(estado_dia)
+        # Pisos que se parecen entre si: un antecedente en uno vale para el otro,
+        # pero menos que el antecedente exacto.
+        PARECIDOS = {
+            "pesada": ["barrosa", "humeda"],
+            "barrosa": ["pesada", "humeda"],
+            "humeda": ["pesada", "barrosa"],
+            "liviana": ["normal"],
+            "normal": ["liviana"],
+        }
+        if clave_estado and clave_estado in historial:
+            score += P["pista_compatible"]
+            reasons.append(f"corrió bien en pista {estado_dia.lower()}")
+        elif any(p in historial for p in PARECIDOS.get(clave_estado, [])):
+            score += P["pista_compatible"] * 0.5
+            reasons.append(f"antecedente en pista parecida a {estado_dia.lower()}")
+
+    # Viento en contra: castiga un poco a los que llevan más peso.
+    if context.get("viento") == "En contra" and peso_propio is not None:
+        if pesos_carrera and peso_propio > (sum(pesos_carrera)/len(pesos_carrera)):
+            score += P["peso_pesado"] * 0.4
+            reasons.append("viento en contra y lleva peso por encima del promedio")
+
     return round(max(1, min(99, score)), 1), reasons
 
 
@@ -1326,27 +1357,67 @@ def analizar():
     horses = [h for h in data.get("participantes",[]) if not h.get("retirado")]
     if len(horses) < 2:
         return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
-    pesos = cargar_pesos()
-    ranked, top = rankear(horses, data, pesos)
 
-    # Guardar el pronostico y, si la carrera ya se corrio, comparar en el acto.
+    pesos = cargar_pesos()
+    fecha = data.get("fecha", "")
+    hipodromo = data.get("hipodromo", "")
+
+    # --- CONDICIONES OFICIALES: las que cargo el admin para esa reunion ---
+    oficiales = condiciones_de(fecha, hipodromo)
+    contexto_oficial = {
+        "participantes": horses,
+        "pista_dia": data.get("pista_dia", ""),
+    }
+    for campo in OPCIONES_CONDICIONES:
+        contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
+
+    ranked_oficial, top_oficial = rankear(horses, contexto_oficial, pesos)
+
+    # SOLO el pronostico oficial se guarda y se compara con el resultado.
     ya_corrida = any(h.get("puesto") for h in horses)
     try:
         registrar_pronostico(
-            url=data.get("url",""),
-            numero=data.get("numero"),
-            fecha=data.get("fecha",""),
-            hipodromo=data.get("hipodromo",""),
-            top=top,
-            participantes=horses,
-            pesos=pesos,
-            ya_corrida=ya_corrida,
+            url=data.get("url",""), numero=data.get("numero"),
+            fecha=fecha, hipodromo=hipodromo,
+            top=top_oficial, participantes=horses,
+            pesos=pesos, ya_corrida=ya_corrida,
         )
     except Exception:
         pass  # que un fallo al guardar nunca rompa el pronostico al usuario
 
-    return jsonify(ok=True,ranking=top,confianza=round(top[0]["score"],1),
-                   ya_corrida=ya_corrida)
+    # --- CONDICIONES DEL USUARIO: si cambio alguna, se recalcula para el ---
+    del_usuario = data.get("condiciones_usuario") or {}
+    cambiadas = {
+        c["clave"]: clean(del_usuario.get(c["clave"], ""))
+        for c in OPCIONES_CONDICIONES
+        if clean(del_usuario.get(c["clave"], ""))
+        and clean(del_usuario.get(c["clave"], "")) != contexto_oficial.get(c["clave"], "")
+    }
+
+    if cambiadas:
+        contexto_usuario = dict(contexto_oficial)
+        contexto_usuario.update(cambiadas)
+        _, top_usuario = rankear(horses, contexto_usuario, pesos)
+        return jsonify(
+            ok=True,
+            ranking=top_usuario,
+            ranking_oficial=top_oficial,
+            confianza=round(top_usuario[0]["score"], 1),
+            ya_corrida=ya_corrida,
+            condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
+                                   for c in OPCIONES_CONDICIONES},
+            condiciones_usadas=cambiadas,
+            es_personal=True,
+            aviso=("Este pronóstico usa tus condiciones. No cambia el oficial "
+                   "ni las estadísticas de la app."),
+        )
+
+    return jsonify(ok=True, ranking=top_oficial,
+                   confianza=round(top_oficial[0]["score"], 1),
+                   ya_corrida=ya_corrida,
+                   condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
+                                          for c in OPCIONES_CONDICIONES},
+                   es_personal=False)
 
 
 def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
@@ -1970,6 +2041,96 @@ def admin_reiniciar():
                    mensaje=(f"Se borraron {n} pronósticos. "
                             "El algoritmo volvió a sus valores iniciales."),
                    borrados=n)
+
+
+# ============================================================
+# CONDICIONES DE LA REUNION
+# Las carga el admin y valen para todas las carreras de ese dia.
+# El usuario las puede cambiar para si mismo: eso altera SU pronostico,
+# pero nunca el oficial ni las estadisticas de aciertos.
+# Para agregar un campo nuevo alcanza con sumarlo a esta lista.
+# ============================================================
+
+OPCIONES_CONDICIONES = [
+    {"clave": "pista", "titulo": "Pista",
+     "opciones": ["Arena", "Arena (Codo)", "Césped"]},
+    {"clave": "estado", "titulo": "Estado",
+     "opciones": ["Normal", "Liviana", "Húmeda", "Pesada", "Barrosa"]},
+    {"clave": "viento", "titulo": "Viento",
+     "opciones": ["Sin viento", "A favor", "En contra", "Cruzado"]},
+    {"clave": "clima", "titulo": "Clima",
+     "opciones": ["Despejado", "Nublado", "Llovizna", "Lluvia"]},
+]
+
+
+def condiciones_de(fecha, hipodromo):
+    """Devuelve las condiciones que cargo el admin para esa reunion."""
+    try:
+        con = db()
+        fila = con.execute(
+            "SELECT * FROM condiciones WHERE fecha=? AND hipodromo=?",
+            (fecha, normalize_text(hipodromo))
+        ).fetchone()
+        con.close()
+    except Exception:
+        return {}
+    return dict(fila) if fila else {}
+
+
+@app.get("/api/condiciones")
+def api_condiciones():
+    """Las condiciones oficiales de una reunion, y las opciones disponibles."""
+    fecha = request.args.get("fecha", "").strip()
+    hipodromo = request.args.get("hipodromo", "").strip()
+    guardadas = condiciones_de(fecha, hipodromo) if fecha and hipodromo else {}
+    return jsonify(
+        ok=True,
+        oficiales={c["clave"]: guardadas.get(c["clave"], "")
+                   for c in OPCIONES_CONDICIONES},
+        observaciones=guardadas.get("observaciones", ""),
+        cargado_en=guardadas.get("cargado_en", ""),
+        campos=OPCIONES_CONDICIONES,
+    )
+
+
+@app.post("/api/admin/condiciones")
+def admin_condiciones():
+    """El admin carga las condiciones de una reunion."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    fecha = clean(d.get("fecha", ""))
+    hipodromo = clean(d.get("hipodromo", ""))
+    if not fecha or not hipodromo:
+        return jsonify(ok=False, error="Faltan la fecha y el hipódromo."), 400
+
+    # Solo se aceptan valores de la lista, para que no entre cualquier cosa.
+    valores = {}
+    for campo in OPCIONES_CONDICIONES:
+        v = clean(d.get(campo["clave"], ""))
+        valores[campo["clave"]] = v if v in campo["opciones"] else ""
+
+    con = db()
+    con.execute("""
+        INSERT INTO condiciones(fecha,hipodromo,pista,estado,viento,clima,
+                                observaciones,cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(fecha,hipodromo) DO UPDATE SET
+          pista=excluded.pista, estado=excluded.estado,
+          viento=excluded.viento, clima=excluded.clima,
+          observaciones=excluded.observaciones, cargado_en=excluded.cargado_en
+    """, (
+        fecha, normalize_text(hipodromo),
+        valores["pista"], valores["estado"], valores["viento"], valores["clima"],
+        clean(d.get("observaciones", ""))[:400],
+        datetime.now().isoformat(timespec="seconds"),
+    ))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, mensaje="Condiciones guardadas para toda la reunión.",
+                   oficiales=valores)
 
 
 @app.get("/api/videos")
