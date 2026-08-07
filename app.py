@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 import requests, re, sqlite3, json, os, time, threading
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus, quote
 from datetime import datetime, timedelta
@@ -539,10 +540,21 @@ def detalle_de_carrera(url_carrera):
         return cacheado or {}
 
 
+TTL_FICHA_CABALLO = 6 * 60 * 60   # 6 horas: la campaña no cambia en el día
+
+
 def enrich_horse(horse):
     profile = horse.get("perfil", "")
     if not profile:
         return horse
+
+    # Si ya se consultó hace poco, se usa lo guardado y no se vuelve a pedir.
+    clave = f"ficha:{profile}"
+    guardada, fresca = cache_get(clave, TTL_FICHA_CABALLO)
+    if guardada is not None and fresca:
+        horse.update(guardada)
+        return horse
+
     try:
         soup = fetch(profile)
         texto = clean(soup.get_text(" "))
@@ -556,14 +568,16 @@ def enrich_horse(horse):
 
         # El estado de la pista de cada carrera viene como codigo ("5", "A").
         # Para que el algoritmo pueda compararlo con la pista del dia hace
-        # falta la palabra. Se trae de las 6 mas recientes, que es lo que
-        # pesa en el rendimiento actual. Queda en cache, asi no se repite.
-        for c in horse["carreras"][:6]:
-            if c.get("enlace"):
+        # falta la palabra. Se traen las 4 mas recientes, TODAS JUNTAS.
+        recientes = [c for c in horse["carreras"][:4] if c.get("enlace")]
+        if recientes:
+            def traer(c):
                 try:
                     c.update(detalle_de_carrera(c["enlace"]))
                 except Exception:
                     pass
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(traer, recientes))
 
         # Contadores para el pronostico y para mostrar.
         puestos = [c["puesto"] for c in carreras if c["puesto"]]
@@ -577,11 +591,22 @@ def enrich_horse(horse):
             for c in carreras if c["puesto"]
         ][:20]
         horse["campana"] = resumen.get("logro", "")
+        horse["cargado"] = True
+
+        # Guardar solo lo que se trajo del Stud Book, para no volver a pedirlo.
+        cache_set(clave, {
+            k: horse[k] for k in
+            ("sexo", "edad", "nacimiento", "padre", "madre", "logro",
+             "carreras", "victorias", "podios", "corridas",
+             "actuaciones", "campana", "cargado")
+            if k in horse
+        })
     except Exception:
         horse.setdefault("sexo", "")
         horse.setdefault("campana", "")
         horse.setdefault("actuaciones", [])
         horse.setdefault("carreras", [])
+        horse["cargado"] = True   # se intentó; no queda "cargando" para siempre
     return horse
 
 # ============================================================
@@ -1397,9 +1422,23 @@ def api_detalle_carrera():
 
 @app.post("/api/enriquecer")
 def enriquecer():
+    """
+    Trae la campaña de todos los participantes.
+    Se piden TODOS AL MISMO TIEMPO: antes se hacía uno por uno y con 14
+    caballos eso tardaba más de diez segundos.
+    """
     data = request.get_json(silent=True) or {}
     horses = data.get("participantes", [])
-    return jsonify(ok=True,participantes=[enrich_horse(dict(h)) for h in horses])
+    if not horses:
+        return jsonify(ok=True, participantes=[])
+
+    # Tope de pedidos simultáneos, para no castigar al Stud Book.
+    simultaneos = min(int(os.getenv("PEDIDOS_A_LA_VEZ", "8")), max(1, len(horses)))
+
+    with ThreadPoolExecutor(max_workers=simultaneos) as pool:
+        resultados = list(pool.map(lambda h: enrich_horse(dict(h)), horses))
+
+    return jsonify(ok=True, participantes=resultados)
 
 @app.post("/api/analizar")
 def analizar():
