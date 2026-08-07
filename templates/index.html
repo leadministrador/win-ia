@@ -798,6 +798,11 @@
     color:#fff; padding:2px 7px; border-radius:3px; margin-left:8px;
     vertical-align:2px;
   }
+  .tag-cargando{
+    background:var(--bronce) !important; color:#fff !important;
+    animation:latir-tag 1.4s ease-in-out infinite;
+  }
+  @keyframes latir-tag{ 50%{ opacity:.55; } }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1304,6 +1309,8 @@ async function elegirCarrera(c, itemEl){
   document.querySelectorAll('.carrera-item').forEach(x=>x.classList.remove('sel'));
   itemEl.classList.add('sel');
   document.getElementById('carrera-elegida-txt').textContent = c.titulo;
+  // La distancia y el premio se agregan apenas los devuelve el servidor.
+  window._tituloCarrera = c.titulo;
 
   document.getElementById('card-comp').style.display = 'block';
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
@@ -1319,6 +1326,18 @@ async function elegirCarrera(c, itemEl){
   try{
     const url = `/api/carrera?url=${encodeURIComponent(meetingUrlElegida)}&numero=${c.numero}`;
     carreraData = await apiGet(url);
+
+    // Completar el título con lo que devolvió el servidor.
+    const extra = [
+      carreraData.distancia ? carreraData.distancia + ' m' : '',
+      carreraData.premio || '',
+      carreraData.superficie || '',
+      carreraData.estado || '',
+    ].filter(Boolean).join(' · ');
+    if (extra){
+      document.getElementById('carrera-elegida-txt').textContent =
+        (window._tituloCarrera || '') + ' · ' + extra;
+    }
   }catch(e){
     ocultarBarra();
     list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
@@ -1625,11 +1644,16 @@ function abrirFicha(cp, idx){
   document.getElementById('ficha-sub').textContent = sub.join(' · ') || '—';
 
   const carreras = cp.carreras || [];
+  // Distinguir "todavia no llego la campaña" de "no corrio nunca".
+  const yaCargado = cp.cargado === true;
+
   document.getElementById('ficha-tags').innerHTML =
     `<span class="tag">Nº ${num}</span>` +
     (carreras.length
       ? `<span class="tag">${carreras.length} carreras</span>`
-      : `<span class="tag">Debutante</span>`);
+      : (yaCargado
+          ? `<span class="tag">Debutante</span>`
+          : `<span class="tag tag-cargando">Buscando la campaña…</span>`));
 
   // --- Próximas carreras (solo cuando se llega desde el buscador) ---
   let datos = '';
@@ -1651,9 +1675,15 @@ function abrirFicha(cp, idx){
       <div class="resumen-item"><div class="r-rot">En los 3</div><div class="r-val">${cp.podios ?? 0}</div></div>
       <div class="resumen-item"><div class="r-rot">Lleva hoy</div><div class="r-val">${cp.peso || '—'}</div></div>
     </div>`;
-  } else {
+  } else if (yaCargado){
     datos += `<div class="resumen-grid">
       <div class="resumen-item"><div class="r-rot">Campaña</div><div class="r-val">Debuta</div></div>
+      <div class="resumen-item"><div class="r-rot">Lleva hoy</div><div class="r-val">${cp.peso || '—'}</div></div>
+    </div>`;
+  } else {
+    datos += `<div class="resumen-grid">
+      <div class="resumen-item"><div class="r-rot">Campaña</div>
+        <div class="r-val" style="font-size:15px;">Buscando…</div></div>
       <div class="resumen-item"><div class="r-rot">Lleva hoy</div><div class="r-val">${cp.peso || '—'}</div></div>
     </div>`;
   }
