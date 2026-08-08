@@ -3,7 +3,21 @@ import requests, re, sqlite3, json, os, time, threading, hashlib, secrets
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus, quote
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# El servidor de Render trabaja en horario UTC, que va 3 horas adelante de
+# Argentina. Sin esto, la app da por corridas carreras que todavia no salieron.
+HUSO_ARGENTINA = timezone(timedelta(hours=-3))
+
+def ahora_argentina():
+    """La hora de Argentina, sin importar donde este el servidor."""
+    return datetime.now(HUSO_ARGENTINA)
+
+def hoy_argentina():
+    return ahora_argentina().strftime("%Y-%m-%d")
+
+def hora_argentina():
+    return ahora_argentina().strftime("%H:%M")
 
 app = Flask(__name__)
 BASE = "https://www.studbook.org.ar"
@@ -1171,7 +1185,14 @@ def reuniones():
 
     try:
         output, origen = con_cache(clave, TTL_REUNION, forzar, traer)
-        resp = {"ok": True, "reuniones": output}
+        resp = {
+            "ok": True,
+            "reuniones": output,
+            # La hora y la fecha de Argentina, para que la pantalla marque
+            # lo mismo que el servidor sin importar el reloj del usuario.
+            "hoy": hoy_argentina(),
+            "ahora": hora_argentina(),
+        }
         if origen == "cache_vencido":
             resp["aviso"] = "La fuente oficial no respondió. Se muestra la última versión guardada."
         return jsonify(**resp)
@@ -1192,7 +1213,7 @@ def _es_la_proxima(url, numero):
     Es la unica que ve el visitante que todavia no tiene cuenta.
     """
     fecha_url = meeting_date_from_url(url)
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy = hoy_argentina()
     # Solo las de hoy pueden ser "la proxima".
     if fecha_url != hoy:
         return False
@@ -1200,7 +1221,7 @@ def _es_la_proxima(url, numero):
         carreras = extract_races_from_meeting(fetch(url))
     except Exception:
         return False
-    ahora = datetime.now().strftime("%H:%M")
+    ahora = hora_argentina()
     pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
     if pendientes:
         return int(numero) == pendientes[0]["numero"]
@@ -1968,7 +1989,7 @@ def calendario_meses():
     Calendario agrupado por mes, con los hipodromos de cada fecha.
     Parametros: desde y hasta (AAAA-MM-DD). Por defecto, desde 2024.
     """
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy = hoy_argentina()
     desde = request.args.get("desde", "2024-01-01")
     hasta = request.args.get("hasta", hoy)
 
@@ -2478,8 +2499,8 @@ def api_proxima_carrera():
     que todavia no tiene cuenta.
     """
     hipodromo = clean(request.args.get("hipodromo", ""))
-    hoy = datetime.now().strftime("%Y-%m-%d")
-    ahora = datetime.now().strftime("%H:%M")
+    hoy = hoy_argentina()
+    ahora = hora_argentina()
 
     try:
         calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
@@ -2767,7 +2788,7 @@ def admin_recolectar():
         return jsonify(ok=False, error="Ya hay una recolección en curso."), 409
 
     body = request.get_json(silent=True) or {}
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy = hoy_argentina()
     desde = body.get("desde") or request.args.get("desde") or "2026-01-01"
     hasta = body.get("hasta") or request.args.get("hasta") or hoy
 
