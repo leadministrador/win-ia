@@ -1763,6 +1763,7 @@ async function elegirCarrera(c, itemEl){
     };
     ultimoContexto = contexto;
     ultimosParticipantes = participantesActuales;
+    ultimaCarreraData = carreraData;
     await traerCondiciones(contexto.fecha, contexto.hipodromo);
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
     renderPronostico(analisis.ranking || [], analisis);
@@ -2400,6 +2401,7 @@ let condicionesMias = {};
 let observacionesReunion = '';
 let ultimosParticipantes = [];
 let ultimoContexto = {};
+let ultimaCarreraData = null;
 
 async function traerCondiciones(fecha, hipodromo){
   try{
@@ -2421,20 +2423,37 @@ function pintarCondiciones(){
     .map(c => condicionesOficiales[c.clave])
     .filter(Boolean);
 
-  if (!puestas.length && !observacionesReunion){
-    caja.style.display = 'none';
-    return;
-  }
+  // El recuadro se muestra SIEMPRE, para que el usuario pueda ajustar.
   caja.style.display = 'block';
 
+  // Si el admin no cargó nada, se usan las que publica el Stud Book.
+  const delStudBook = [
+    (ultimaCarreraData && ultimaCarreraData.superficie) || '',
+    (ultimaCarreraData && ultimaCarreraData.estado) || '',
+  ].filter(Boolean);
+
+  const hayDelAdmin = puestas.length > 0;
+  const aMostrar = hayDelAdmin ? puestas : delStudBook;
+
   document.getElementById('oficiales-caja').innerHTML = `
-    <div class="of-rot">Condiciones oficiales</div>
-    <div class="of-txt">${puestas.join(' · ')}</div>
+    <div class="of-rot">${hayDelAdmin
+      ? 'Condiciones oficiales'
+      : 'Según el Stud Book'}</div>
+    <div class="of-txt">${aMostrar.length
+      ? aMostrar.join(' · ')
+      : 'Todavía no hay condiciones publicadas.'}</div>
     ${observacionesReunion ? '<div class="of-obs">'+observacionesReunion+'</div>' : ''}`;
 
   const cont = document.getElementById('ajuste-usuario');
   cont.innerHTML = camposCondiciones.map(c => {
-    const oficial = condicionesOficiales[c.clave] || '';
+    // Si el admin no cargó ese campo, se toma lo que dice el Stud Book.
+    let oficial = condicionesOficiales[c.clave] || '';
+    if (!oficial && ultimaCarreraData){
+      const delSitio = c.clave === 'pista' ? ultimaCarreraData.superficie
+                     : c.clave === 'estado' ? ultimaCarreraData.estado : '';
+      // Solo si coincide con alguna de las opciones.
+      if (delSitio && c.opciones.includes(delSitio)) oficial = delSitio;
+    }
     const mia = condicionesMias[c.clave] || '';
     return `
       <div class="grupo-u">
