@@ -825,16 +825,35 @@
   }
   @keyframes latir-tag{ 50%{ opacity:.55; } }
   /* ===== INGRESO ===== */
-  .hero-usuario{
-    font-family:'Space Mono',monospace; font-size:12px;
-    color:var(--bronce-claro); margin-bottom:14px; min-height:18px;
+  .hero-usuario{ margin-bottom:20px; min-height:52px; }
+  .btn-entrar{
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--bronce); color:var(--tinta); border:none;
+    padding:15px 26px; border-radius:8px; cursor:pointer;
+    min-height:54px; display:inline-flex; align-items:center; gap:9px;
+    box-shadow:0 4px 14px rgba(21,56,50,.22);
   }
-  .hero-usuario b{ font-family:'Fraunces',serif; font-size:14px; color:var(--hueso); }
+  .btn-entrar:hover{ background:var(--bronce-claro); }
+  .caja-saludo{
+    display:inline-flex; align-items:center; gap:13px;
+    background:rgba(250,246,238,.1); border:1px solid rgba(250,246,238,.22);
+    padding:11px 16px; border-radius:8px; min-height:52px;
+  }
+  .caja-saludo .nom{
+    font-family:'Fraunces',serif; font-size:17px; font-weight:600; color:var(--hueso);
+  }
+  .caja-saludo .rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    color:var(--bronce-claro); text-transform:uppercase; letter-spacing:.08em;
+    display:block; margin-bottom:2px;
+  }
   .link-salir{
-    background:none; border:none; color:var(--bronce-claro); cursor:pointer;
-    font-family:'Space Mono',monospace; font-size:11px; text-decoration:underline;
-    padding:4px 6px;
+    background:none; border:1px solid rgba(250,246,238,.3);
+    color:var(--bronce-claro); cursor:pointer;
+    font-family:'Archivo',sans-serif; font-size:13px; font-weight:600;
+    padding:9px 14px; border-radius:6px; min-height:40px;
   }
+  .link-salir:hover{ border-color:var(--bronce-claro); color:var(--hueso); }
   .login-overlay{
     position:fixed; inset:0; background:rgba(21,56,50,.68);
     display:none; align-items:center; justify-content:center;
@@ -939,6 +958,8 @@
       border-radius:8px; justify-content:center;
     }
     .hero-actions{ gap:11px; }
+    .btn-entrar{ width:100%; justify-content:center; font-size:17px; min-height:56px; }
+    .caja-saludo{ width:100%; justify-content:space-between; }
     .hero-actions .btn{ width:100%; }
 
     /* Titulos y textos del inicio */
@@ -2247,8 +2268,13 @@ function pintarUsuario(){
   const el = document.getElementById('hero-usuario');
   if (!el) return;
   el.innerHTML = miUsuario
-    ? `Hola, <b>${miUsuario}</b> · <button class="link-salir" onclick="salir()">Salir</button>`
-    : `<button class="link-salir" onclick="abrirLogin()">Entrar o crear cuenta</button>`;
+    ? `<div class="caja-saludo">
+         <div><span class="rot">Tu cuenta</span><span class="nom">${miUsuario}</span></div>
+         <button class="link-salir" onclick="salir()">Salir</button>
+       </div>`
+    : `<button class="btn-entrar" onclick="abrirLogin()">
+         👤 Entrar o crear cuenta
+       </button>`;
 }
 
 function abrirLogin(registro){
