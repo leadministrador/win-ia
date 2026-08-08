@@ -14,7 +14,7 @@
     --pergamino-2:#e7dcc2;
     --bronce:#b6904f;
     --bronce-claro:#d9b877;
-    --carmin:#8c2a2a;
+    --carmin:#8c2a2a; --verde-vivo:#2b8c6b; --verde-suave:#f0f7f3;
     --tinta:#241b14;
     --hueso:#faf6ee;
     --sombra: 0 10px 30px rgba(21,56,50,0.18);
@@ -923,6 +923,108 @@
     font-weight:600; font-size:15px; background:var(--bronce); color:var(--tinta);
     border:none; padding:14px; border-radius:7px; cursor:pointer; min-height:50px;
   }
+  /* ===== LO QUE ESTA POR CORRERSE ===== */
+  .fecha-chip{ position:relative; }
+  .fecha-chip.hoy{
+    border:2.5px solid var(--verde-vivo); background:var(--verde-suave);
+    box-shadow:0 4px 14px rgba(43,140,107,.22);
+  }
+  .fecha-chip.hoy .dia{ color:var(--verde-vivo); }
+  .fecha-chip.hoy.sel .dia{ color:var(--hueso); }
+  .marca-hoy{
+    position:absolute; top:-11px; left:50%; transform:translateX(-50%);
+    background:var(--verde-vivo); color:#fff; font-family:'Space Mono',monospace;
+    font-size:10px; font-weight:700; padding:3px 10px; border-radius:11px;
+    letter-spacing:.06em; white-space:nowrap; z-index:2;
+  }
+  .hip-item{ position:relative; }
+  .hip-item.corriendo{
+    border:2.5px solid var(--verde-vivo); background:var(--verde-suave);
+  }
+  .marca-vivo{
+    display:inline-flex; align-items:center; gap:6px;
+    background:var(--verde-vivo); color:#fff; font-family:'Space Mono',monospace;
+    font-size:11px; font-weight:700; padding:5px 11px; border-radius:6px;
+    letter-spacing:.05em; margin-top:8px;
+  }
+  .punto-vivo{
+    width:8px; height:8px; border-radius:50%; background:#fff;
+    animation:latir-vivo 1.2s ease-in-out infinite; flex-shrink:0;
+  }
+  @keyframes latir-vivo{ 50%{ opacity:.25; } }
+  .carrera-item{ position:relative; }
+  .carrera-item.proxima{
+    border:2.5px solid var(--verde-vivo); background:var(--verde-suave);
+    box-shadow:0 4px 14px rgba(43,140,107,.22);
+  }
+  .carrera-item.proxima .tit{ color:var(--verde-vivo); }
+  .carrera-item.proxima .hora{ font-weight:700; opacity:1; color:var(--verde-vivo); }
+  .marca-proxima{
+    position:absolute; top:-11px; left:12px;
+    background:var(--verde-vivo); color:#fff; font-family:'Space Mono',monospace;
+    font-size:10px; font-weight:700; padding:3px 10px; border-radius:11px;
+    letter-spacing:.06em; display:flex; align-items:center; gap:5px; z-index:2;
+  }
+  .carrera-item.corrida{ opacity:.5; }
+  .carrera-item.corrida .tit{ text-decoration:line-through; }
+  .marca-lista{
+    font-family:'Space Mono',monospace; font-size:10px; color:var(--verde-vivo);
+    margin-top:5px; font-weight:700;
+  }
+  .carrera-item .hora{
+    font-family:'Space Mono',monospace; font-size:14px; margin-top:5px; opacity:.75;
+  }
+  .ref-colores{
+    font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
+    margin-top:16px; line-height:1.9;
+  }
+  .ref-colores .cuadro{
+    display:inline-block; width:13px; height:13px; border-radius:3px;
+    vertical-align:-2px; margin-right:6px;
+  }
+
+  /* ===== CARTEL: HACE FALTA CUENTA ===== */
+  .aviso-overlay{
+    position:fixed; inset:0; background:rgba(21,56,50,.66);
+    display:none; align-items:center; justify-content:center;
+    z-index:70; padding:18px; backdrop-filter:blur(3px);
+  }
+  .aviso-overlay.visible{ display:flex; }
+  .aviso-caja{
+    background:var(--hueso); border-radius:12px; width:100%; max-width:420px;
+    padding:32px 26px 26px; text-align:center;
+  }
+  .aviso-icono{
+    width:64px; height:64px; border-radius:50%; margin:0 auto 16px;
+    background:var(--verde-suave); border:2.5px solid var(--verde-vivo);
+    display:flex; align-items:center; justify-content:center; font-size:30px;
+  }
+  .aviso-tit{
+    font-family:'Fraunces',serif; font-size:23px; font-weight:600; margin-bottom:9px;
+  }
+  .aviso-txt{ font-size:15px; line-height:1.6; opacity:.8; margin-bottom:22px; }
+  .aviso-txt b{ color:var(--verde-vivo); }
+  .btn-crear{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--verde-vivo); color:#fff; border:none;
+    padding:16px; border-radius:8px; cursor:pointer; min-height:54px;
+  }
+  .btn-crear:hover{ background:#25795c; }
+  .btn-luego{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+    background:transparent; color:var(--verde-turf);
+    border:1.5px solid var(--pergamino-2);
+    padding:14px; border-radius:8px; cursor:pointer; margin-top:10px; min-height:50px;
+  }
+  .aviso-entra{
+    margin-top:16px; padding-top:14px; border-top:1px solid var(--pergamino-2);
+    font-size:14px;
+  }
+  .aviso-entra button{
+    background:none; border:none; color:var(--verde-vivo); cursor:pointer;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:14px;
+    text-decoration:underline; padding:4px;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1331,6 +1433,27 @@
   </div>
 </div>
 
+
+<div class="aviso-overlay" id="aviso-cuenta" onclick="if(event.target===this) cerrarAvisoCuenta()">
+  <div class="aviso-caja">
+    <div class="aviso-icono">🔒</div>
+    <div class="aviso-tit">Necesitás una cuenta</div>
+    <div class="aviso-txt">
+      Sin cuenta podés ver <b>la carrera que está por correrse</b>.
+      Creá tu cuenta gratis y accedé a todas las carreras, todas las fechas
+      y el buscador de caballos.
+    </div>
+    <button class="btn-crear" onclick="cerrarAvisoCuenta(); abrirLogin(true);">
+      Crear mi cuenta gratis
+    </button>
+    <button class="btn-luego" onclick="cerrarAvisoCuenta()">Ahora no</button>
+    <div class="aviso-entra">
+      ¿Ya tenés una?
+      <button onclick="cerrarAvisoCuenta(); abrirLogin(false);">Entrá</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1350,6 +1473,13 @@ let meetingUrlElegida = null;  // url de la reunion (para pedir /api/carrera)
 let participantesActuales = [];
 let caballoActual = null;
 let seguidos = [];
+
+function abrirAvisoCuenta(){
+  document.getElementById('aviso-cuenta').classList.add('visible');
+}
+function cerrarAvisoCuenta(){
+  document.getElementById('aviso-cuenta').classList.remove('visible');
+}
 
 function invitacionCuenta(mensaje){
   return `<div class="solo-usuarios">
@@ -1413,8 +1543,11 @@ async function cargarCalendario(){
     fechasUnicas.forEach(f=>{
       const d = new Date(f + 'T00:00:00');
       const chip = document.createElement('div');
-      chip.className = 'fecha-chip';
-      chip.innerHTML = `<span class="dia">${d.getDate()}</span><span class="mes">${diasCorto[d.getDay()]} ${mesesLargo[d.getMonth()].slice(0,3).toUpperCase()}</span>`;
+      const esHoy = f === new Date().toISOString().slice(0,10);
+      chip.className = 'fecha-chip' + (esHoy ? ' hoy' : '');
+      chip.innerHTML =
+        (esHoy ? '<div class="marca-hoy">HOY</div>' : '') +
+        `<span class="dia">${d.getDate()}</span><span class="mes">${diasCorto[d.getDay()]} ${mesesLargo[d.getMonth()].slice(0,3).toUpperCase()}</span>`;
       chip.onclick = ()=> elegirFecha(f, d, chip);
       grid.appendChild(chip);
     });
@@ -1440,8 +1573,12 @@ function elegirFecha(fecha, d, chipEl){
   } else {
     hips.forEach(h=>{
       const item = document.createElement('div');
-      item.className = 'hip-item';
-      item.innerHTML = `<div><div class="hip-nombre">${h.hipodromo}</div><div class="hip-meta">Reunión oficial</div></div><span class="chev">→</span>`;
+      const hoyEs = fecha === new Date().toISOString().slice(0,10);
+      item.className = 'hip-item' + (hoyEs ? ' corriendo' : '');
+      item.innerHTML = `<div><div class="hip-nombre">${h.hipodromo}</div>
+        <div class="hip-meta">Reunión oficial</div>
+        ${hoyEs ? '<span class="marca-vivo"><span class="punto-vivo"></span>CORRIENDO HOY</span>' : ''}
+        </div><span class="chev">→</span>`;
       item.onclick = ()=> elegirHip(h, item);
       list.appendChild(item);
     });
@@ -1479,13 +1616,44 @@ async function elegirHip(h, itemEl){
     }
     meetingUrlElegida = reunion.url;
     gridC.innerHTML = '';
-    reunion.carreras.forEach(c=>{
+    // ¿Cuál es la próxima a correrse? Solo si la reunión es de hoy.
+    const esHoy = fechaElegida === new Date().toISOString().slice(0,10);
+    const ahora = new Date().toTimeString().slice(0,5);
+    let idxProxima = -1;
+    if (esHoy){
+      idxProxima = reunion.carreras.findIndex(c => c.hora && c.hora >= ahora);
+      if (idxProxima === -1 && reunion.carreras.length){
+        idxProxima = reunion.carreras.length - 1;   // ya corrieron todas
+      }
+    }
+
+    reunion.carreras.forEach((c,i)=>{
       const item = document.createElement('div');
-      item.className = 'carrera-item';
-      item.innerHTML = `<div class="num">Nº ${c.numero}</div><div class="tit">${c.titulo}</div>`;
+      const esProxima = (i === idxProxima);
+      const yaCorrio = esHoy && idxProxima > -1 && i < idxProxima;
+      item.className = 'carrera-item'
+        + (esProxima ? ' proxima' : '')
+        + (yaCorrio ? ' corrida' : '');
+      // El título ya trae la hora, se saca para no repetirla.
+      const titulo = (c.titulo || '').replace(/\s*[-–]\s*\d{1,2}:\d{2}\s*$/, '');
+      item.innerHTML =
+        (esProxima ? '<div class="marca-proxima"><span class="punto-vivo"></span>LA PRÓXIMA</div>' : '') +
+        `<div class="num">Nº ${c.numero}</div>
+         <div class="tit">${titulo}</div>
+         ${c.hora ? '<div class="hora">'+c.hora+'</div>' : ''}
+         ${yaCorrio ? '<div class="marca-lista">✓ con resultado</div>' : ''}`;
       item.onclick = ()=> elegirCarrera(c, item);
       gridC.appendChild(item);
     });
+
+    if (esHoy){
+      const ref = document.createElement('div');
+      ref.className = 'ref-colores';
+      ref.innerHTML =
+        '<span class="cuadro" style="background:var(--verde-vivo)"></span>Lo que está por correrse<br>' +
+        '<span class="cuadro" style="background:var(--pergamino-2)"></span>Ya se corrió';
+      gridC.appendChild(ref);
+    }
     if (data.aviso){ gridC.innerHTML += estadoMsg(data.aviso, true); }
   }catch(e){
     gridC.innerHTML = estadoMsg('No se pudo cargar la reunión. ' + e.message, true);
@@ -1534,6 +1702,7 @@ async function elegirCarrera(c, itemEl){
       document.getElementById('pronostico').innerHTML = '';
       const caja = document.getElementById('caja-condiciones');
       if (caja) caja.style.display = 'none';
+      abrirAvisoCuenta();
     } else {
       list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
     }
@@ -1757,9 +1926,12 @@ async function consultarSugerencias(q){
   }catch(e){
     if (miNumero !== sugPeticion) return;
     sugUltimos = [];
-    sug.innerHTML = e.necesitaCuenta
-      ? invitacionCuenta(e.message)
-      : '<div class="sug-estado">' + e.message + '</div>';
+    if (e.necesitaCuenta){
+      sug.innerHTML = invitacionCuenta(e.message);
+      abrirAvisoCuenta();
+    } else {
+      sug.innerHTML = '<div class="sug-estado">' + e.message + '</div>';
+    }
   }
 }
 
