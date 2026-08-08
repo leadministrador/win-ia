@@ -199,6 +199,14 @@ def _map_headers(header_cells):
     """
     idx = {}
     kg_positions = []
+    # En la tabla de RESULTADOS el puesto es la primera 'P'. En la de PROGRAMA
+    # no hay puesto, y esa 'P' es el pelaje. Se distinguen porque la de
+    # resultados trae columnas que la otra no tiene.
+    hay_resultado = any(
+        _cell_text(c).lower().rstrip(".") in ("cpos", "acum", "pago")
+        for c in header_cells
+    )
+    p_usada = False
     for i, cell in enumerate(header_cells):
         h = _cell_text(cell).lower().rstrip(".")
         if h == "ejemplar" and "nombre" not in idx:
@@ -207,12 +215,16 @@ def _map_headers(header_cells):
             idx["jockey"] = i
         elif h == "entrenador" and "entrenador" not in idx:
             idx["entrenador"] = i
-        elif h == "caballeriza" and "caballeriza" not in idx:
+        elif h.startswith("caballeriza") and "caballeriza" not in idx:
             idx["caballeriza"] = i
         elif h == "o" and "numero" not in idx:
             idx["numero"] = i
-        elif h == "p" and "puesto" not in idx:
-            idx["puesto"] = i          # el primer 'P' es el puesto final
+        elif h == "p" and not p_usada:
+            p_usada = True
+            if hay_resultado:
+                idx["puesto"] = i      # tabla de resultados
+            else:
+                idx["pelaje"] = i      # tabla de programa
         elif h == "e" and "edad" not in idx:
             idx["edad"] = i
         elif h == "s" and "sexo" not in idx:
@@ -225,6 +237,10 @@ def _map_headers(header_cells):
             idx["acumulado"] = i
         elif h == "pago":
             idx["pago"] = i
+        elif "ultimas" in h or "últimas" in h:
+            idx["ultimas"] = i
+        elif "campa" in h:
+            idx["campana_resumen"] = i
 
     # Resolver cual de los dos 'Kg' es el peso que lleva encima.
     jockey_i = idx.get("jockey")
@@ -279,6 +295,14 @@ def _parse_participants_table(table):
         if not name:
             continue
 
+        # El sitio marca al retirado DENTRO del nombre: "NOMBRE (RETIRADO)".
+        # Hay que sacarlo del nombre y anotarlo aparte.
+        texto_celda = _cell_text(name_cell)
+        retirado_aqui = bool(re.search(r"\(\s*RETIRADO\s*\)", texto_celda, re.I))
+        name = re.sub(r"\s*\(\s*RETIRADO\s*\)\s*", "", name, flags=re.I).strip()
+        if not name:
+            continue
+
         def col(key):
             i = idx.get(key)
             if i is None or i >= len(cells):
@@ -287,6 +311,33 @@ def _parse_participants_table(table):
 
         peso = col("peso").replace(",", ".")
         peso = peso if re.fullmatch(r"\d{2}(\.\d)?", peso or "") else ""
+
+        # "8 últimas": trae la forma reciente (1S1S) y los dias sin correr.
+        celda_ultimas = col("ultimas")
+        forma = ""
+        dias_sin_correr = None
+        if celda_ultimas:
+            m_dias = re.search(r"\((\d+)\s*d[ií]as?\)", celda_ultimas, re.I)
+            if m_dias:
+                dias_sin_correr = int(m_dias.group(1))
+            # La forma son letras y numeros pegados, antes del parentesis.
+            m_forma = re.match(r"\s*([0-9A-Za-z]+)", celda_ultimas)
+            if m_forma and not m_forma.group(1).isdigit():
+                forma = m_forma.group(1)
+
+        # "Campaña (efect.)": 6 - 2 - 2 - 0 - 2 - 0 - 0 (33.3%) - $ 25.165.500
+        celda_campana = col("campana_resumen")
+        campana_nums, efectividad, ganado = [], "", ""
+        if celda_campana:
+            m_n = re.match(r"\s*((?:\d+\s*-\s*)+\d+)", celda_campana)
+            if m_n:
+                campana_nums = [int(x) for x in re.findall(r"\d+", m_n.group(1))]
+            m_e = re.search(r"\(([\d.,]+)\s*%\)", celda_campana)
+            if m_e:
+                efectividad = m_e.group(1) + "%"
+            m_g = re.search(r"\$\s*([\d.,]+)", celda_campana)
+            if m_g:
+                ganado = "$" + m_g.group(1)
 
         numero_raw = col("numero")
         numero = int(numero_raw) if numero_raw.isdigit() else None
@@ -318,7 +369,13 @@ def _parse_participants_table(table):
             "acumulado": col("acumulado"),
             "pago": col("pago"),
             "detalle": " · ".join(p for p in detalle_partes if p)[:700],
-            "retirado": False,
+            "retirado": retirado_aqui,
+            # Datos de la tabla PROGRAMA
+            "forma": forma,                    # las ultimas, ej "4P1P2S"
+            "dias_sin_correr": dias_sin_correr,
+            "campana_nums": campana_nums,      # corridas, 1os, 2os, 3os...
+            "efectividad": efectividad,
+            "ganado": ganado,
         })
 
     return participants
@@ -370,7 +427,8 @@ def parse_race(soup, numero):
         tablas_vistas.add(id(node))
         filas = _parse_participants_table(node)
         for fila in filas:
-            fila["retirado"] = en_retirados
+            # Si ya venía marcado en el nombre, se respeta.
+            fila["retirado"] = fila.get("retirado") or en_retirados
         if filas:
             participants.extend(filas)
 
@@ -716,14 +774,30 @@ def score_horse(h, context, pesos=None):
     campaign = h.get("campana", "").lower()
     detail = h.get("detalle", "").lower()
 
+    # La campaña puede venir de dos lados: de la ficha del caballo, o del
+    # programa de la carrera. Se toma la que esté disponible.
+    nums = h.get("campana_nums") or []
+    if len(nums) >= 4 and not h.get("corridas"):
+        # [corridas, 1os, 2os, 3os, 4os, 5os, NP]
+        h = dict(h)
+        h["corridas"] = nums[0]
+        h["victorias"] = nums[1]
+        h["podios"] = nums[1] + nums[2] + nums[3]
+
     if acts:
         score += min(14, len(acts) * P["campana_disponible"])
         reasons.append("tiene campaña reciente disponible")
     if "ganador" in campaign or "ganadora" in campaign:
         score += P["registra_victorias"]; reasons.append("registra victorias")
-    if "debut" in campaign or not acts:
+    corridas = h.get("corridas")
+    es_debutante = (corridas == 0) if isinstance(corridas, int) else (not acts)
+    if "debut" in campaign or es_debutante:
         score += 1
-        reasons.append("debutante o historial limitado: se mantiene sin penalización fuerte")
+        reasons.append("debuta o tiene historial limitado")
+    elif isinstance(corridas, int) and corridas > 0:
+        # Premia la experiencia, con tope.
+        score += min(8, corridas * 0.7)
+        reasons.append(f"{corridas} carreras corridas")
     if any(x in campaign for x in ["palermo","san isidro","la plata"]):
         score += P["hipodromos_principales"]
         reasons.append("experiencia en hipódromos principales")
@@ -825,6 +899,54 @@ def score_horse(h, context, pesos=None):
         elif en_cesped:
             score += P["pista_compatible"] * 0.4
             reasons.append(f"tiene {len(en_cesped)} carrera(s) en césped")
+
+    # --- Datos del programa: forma reciente, descanso y efectividad ---
+    # Vienen de la tabla que publica el Stud Book antes de cada carrera.
+
+    # "8 últimas": los numeros son los puestos, del mas reciente al mas viejo.
+    forma = h.get("forma", "")
+    if forma:
+        puestos_recientes = [int(x) for x in re.findall(r"\d", forma)][:6]
+        if puestos_recientes:
+            buenos = sum(1 for p in puestos_recientes if p <= 3)
+            if buenos >= len(puestos_recientes) * 0.6:
+                score += P["podio_reciente"] * 2
+                reasons.append(
+                    f"viene fino: {buenos} de sus últimas {len(puestos_recientes)} entre los tres primeros")
+            elif buenos == 0:
+                score -= P["podio_reciente"] * 1.5
+                reasons.append("no entra entre los tres primeros hace varias salidas")
+            # La ultima carrera pesa mas que las anteriores.
+            if puestos_recientes[0] == 1:
+                score += P["victoria_reciente"] * 0.8
+                reasons.append("ganó su última carrera")
+
+    # Días sin correr: muy poco descanso o demasiado, los dos restan.
+    dias = h.get("dias_sin_correr")
+    if isinstance(dias, int):
+        if dias < 10:
+            score -= 2
+            reasons.append(f"corrió hace apenas {dias} días")
+        elif 15 <= dias <= 45:
+            score += 3
+            reasons.append(f"descanso justo: {dias} días")
+        elif dias > 120:
+            score -= 4
+            reasons.append(f"hace {dias} días que no corre")
+
+    # Efectividad: el porcentaje de carreras ganadas que publica el sitio.
+    efec = h.get("efectividad", "")
+    if efec:
+        try:
+            valor = float(efec.replace("%", "").replace(",", "."))
+            if valor >= 30:
+                score += 6
+                reasons.append(f"gana el {efec} de las carreras que corre")
+            elif valor >= 15:
+                score += 3
+                reasons.append(f"efectividad del {efec}")
+        except ValueError:
+            pass
 
     return round(max(1, min(99, score)), 1), reasons
 
@@ -1545,7 +1667,16 @@ def enriquecer():
 @app.post("/api/analizar")
 def analizar():
     data = request.get_json(silent=True) or {}
-    horses = [h for h in data.get("participantes",[]) if not h.get("retirado")]
+    todos = data.get("participantes", [])
+
+    # El usuario puede marcar como retirado a un caballo que el Stud Book
+    # todavia no actualizo. Eso cambia SU pronostico, nunca el oficial.
+    retirados_usuario = {
+        normalize_text(n) for n in (data.get("retirados_usuario") or [])
+    }
+
+    # Para el pronostico OFICIAL solo cuentan los retiros del Stud Book.
+    horses = [h for h in todos if not h.get("retirado")]
     if len(horses) < 2:
         return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
 
@@ -1585,10 +1716,25 @@ def analizar():
         and clean(del_usuario.get(c["clave"], "")) != contexto_oficial.get(c["clave"], "")
     }
 
-    if cambiadas:
+    if cambiadas or retirados_usuario:
         contexto_usuario = dict(contexto_oficial)
         contexto_usuario.update(cambiadas)
-        _, top_usuario = rankear(horses, contexto_usuario, pesos)
+        # Se sacan los que el usuario marco como retirados.
+        suyos = [h for h in horses
+                 if normalize_text(h.get("nombre","")) not in retirados_usuario]
+        if len(suyos) < 2:
+            suyos = horses   # no dejar la carrera sin participantes
+        contexto_usuario["participantes"] = suyos
+        _, top_usuario = rankear(suyos, contexto_usuario, pesos)
+
+        avisos = []
+        if cambiadas:
+            avisos.append("tus condiciones")
+        if retirados_usuario:
+            n = len(horses) - len(suyos)
+            if n:
+                avisos.append(f"{n} retiro(s) que marcaste")
+
         return jsonify(
             ok=True,
             ranking=top_usuario,
@@ -1598,9 +1744,10 @@ def analizar():
             condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
                                    for c in OPCIONES_CONDICIONES},
             condiciones_usadas=cambiadas,
+            retirados_usuario=sorted(retirados_usuario),
             es_personal=True,
-            aviso=("Este pronóstico usa tus condiciones. No cambia el oficial "
-                   "ni las estadísticas de la app."),
+            aviso=("Este pronóstico usa " + " y ".join(avisos) +
+                   ". No cambia el oficial ni las estadísticas de la app."),
         )
 
     return jsonify(ok=True, ranking=top_oficial,
