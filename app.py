@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify
-import requests, re, sqlite3, json, os, time, threading
+import requests, re, sqlite3, json, os, time, threading, hashlib, secrets
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus, quote
@@ -70,6 +70,23 @@ def init_db():
       cargado_en TEXT NOT NULL,
       PRIMARY KEY(fecha, hipodromo)
     );
+    CREATE TABLE IF NOT EXISTS usuarios(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      usuario TEXT NOT NULL UNIQUE,       -- en minusculas, para no repetir
+      usuario_visible TEXT NOT NULL,      -- como lo escribio el
+      clave_hash TEXT NOT NULL,
+      telefono TEXT,                      -- opcional, para recuperar la clave
+      email TEXT,                         -- opcional
+      creado_en TEXT NOT NULL,
+      ultimo_ingreso TEXT,
+      bloqueado INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS sesiones(
+      token TEXT PRIMARY KEY,
+      usuario_id INTEGER NOT NULL,
+      creada_en TEXT NOT NULL,
+      ultima_vez TEXT NOT NULL
+    );
     """)
     con.commit()
     con.close()
@@ -122,12 +139,37 @@ def con_cache(clave, ttl_seg, forzar, fetch_fn):
         raise
 
 def extract_races_from_meeting(soup):
+    """
+    Lee las carreras de una reunion. Ademas del numero y el titulo,
+    saca la HORA, que hace falta para saber cual es la proxima a correrse.
+    """
     races = []
-    for h in soup.find_all(["h2","h3"]):
-        m = re.search(r"(\d+)\s*[º°ª]?\s*Carrera\b", clean(h.get_text(" ")), re.I)
-        if m:
-            races.append({"numero": int(m.group(1)), "titulo": clean(h.get_text(" "))})
-    return races
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        texto = clean(h.get_text(" "))
+        m = re.search(r"(\d+)\s*[º°ª]?\s*Carrera\b", texto, re.I)
+        if not m:
+            continue
+        # La hora viene en el mismo titulo: "1º Carrera - 13:30"
+        mh = re.search(r"(\d{1,2}):(\d{2})", texto)
+        hora = ""
+        if mh:
+            h_, mi = int(mh.group(1)), int(mh.group(2))
+            if 0 <= h_ <= 23 and 0 <= mi <= 59:
+                hora = f"{h_:02d}:{mi:02d}"
+        races.append({
+            "numero": int(m.group(1)),
+            "titulo": texto,
+            "hora": hora,
+        })
+    # Sin repetidos, en orden de numero.
+    vistos, unicas = set(), []
+    for r in races:
+        if r["numero"] in vistos:
+            continue
+        vistos.add(r["numero"])
+        unicas.append(r)
+    unicas.sort(key=lambda r: r["numero"])
+    return unicas
 
 def _cell_text(cell):
     return clean(cell.get_text(" ", strip=True))
@@ -2222,6 +2264,290 @@ def admin_condiciones():
 
     return jsonify(ok=True, mensaje="Condiciones guardadas para toda la reunión.",
                    oficiales=valores)
+
+
+# ============================================================
+# USUARIOS
+# Usuario y contraseña, sin correo obligatorio.
+# La contraseña NUNCA se guarda tal cual: se guarda cifrada.
+# Recuperar la clave hoy es manual (el admin la resetea). El sistema
+# queda preparado para sumar SMS, WhatsApp o correo sin rehacer nada.
+# ============================================================
+
+DIAS_SESION = 90     # cuanto dura la sesion sin volver a entrar
+
+
+def _cifrar_clave(clave, sal=None):
+    """Cifra la contraseña. Nunca se guarda como la escribió el usuario."""
+    sal = sal or secrets.token_hex(16)
+    mezcla = hashlib.pbkdf2_hmac("sha256", clave.encode(), sal.encode(), 120_000)
+    return f"{sal}${mezcla.hex()}"
+
+
+def _clave_correcta(clave, guardada):
+    try:
+        sal, _ = guardada.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    return secrets.compare_digest(_cifrar_clave(clave, sal), guardada)
+
+
+def usuario_actual():
+    """Devuelve el usuario de la sesión, o None si no ingresó."""
+    token = (request.headers.get("X-Sesion", "")
+             or request.cookies.get("lea_sesion", "")).strip()
+    if not token:
+        return None
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT u.id, u.usuario, u.usuario_visible, u.telefono, u.bloqueado,
+                   s.creada_en
+            FROM sesiones s JOIN usuarios u ON u.id = s.usuario_id
+            WHERE s.token = ?
+        """, (token,)).fetchone()
+        if not fila:
+            con.close()
+            return None
+        # Sesión vencida
+        edad = (datetime.now() - datetime.fromisoformat(fila["creada_en"])).days
+        if edad > DIAS_SESION or fila["bloqueado"]:
+            con.execute("DELETE FROM sesiones WHERE token=?", (token,))
+            con.commit()
+            con.close()
+            return None
+        con.execute("UPDATE sesiones SET ultima_vez=? WHERE token=?",
+                    (datetime.now().isoformat(timespec="seconds"), token))
+        con.commit()
+        con.close()
+        return dict(fila)
+    except Exception:
+        return None
+
+
+def _validar_registro(usuario, clave):
+    """Devuelve un mensaje de error, o None si está todo bien."""
+    if len(usuario) < 3:
+        return "El usuario tiene que tener al menos 3 letras."
+    if len(usuario) > 24:
+        return "El usuario no puede tener más de 24 letras."
+    if not re.fullmatch(r"[A-Za-z0-9_.\- ]+", usuario):
+        return "El usuario solo puede tener letras, números, guiones y puntos."
+    if len(clave) < 4:
+        return "La contraseña tiene que tener al menos 4 caracteres."
+    return None
+
+
+@app.post("/api/registro")
+def api_registro():
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    clave = d.get("clave", "")
+    telefono = clean(d.get("telefono", ""))[:30]
+
+    error = _validar_registro(usuario, clave)
+    if error:
+        return jsonify(ok=False, error=error), 400
+
+    clave_usuario = normalize_text(usuario)
+    con = db()
+    ya = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                     (clave_usuario,)).fetchone()
+    if ya:
+        con.close()
+        return jsonify(ok=False,
+                       error="Ese nombre de usuario ya está tomado."), 409
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    cur = con.execute("""
+        INSERT INTO usuarios(usuario, usuario_visible, clave_hash, telefono,
+                             creado_en, ultimo_ingreso)
+        VALUES(?,?,?,?,?,?)
+    """, (clave_usuario, usuario, _cifrar_clave(clave), telefono, ahora, ahora))
+    uid = cur.lastrowid
+    token = secrets.token_urlsafe(32)
+    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
+                (token, uid, ahora, ahora))
+    con.commit()
+    con.close()
+
+    resp = jsonify(ok=True, usuario=usuario, token=token,
+                   mensaje=f"Bienvenido, {usuario}.")
+    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
+                    samesite="Lax", secure=True, httponly=False)
+    return resp
+
+
+@app.post("/api/ingresar")
+def api_ingresar():
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    clave = d.get("clave", "")
+    if not usuario or not clave:
+        return jsonify(ok=False, error="Poné el usuario y la contraseña."), 400
+
+    con = db()
+    fila = con.execute("SELECT * FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila or not _clave_correcta(clave, fila["clave_hash"]):
+        con.close()
+        # Mismo mensaje para los dos casos, para no dar pistas.
+        return jsonify(ok=False, error="Usuario o contraseña incorrectos."), 401
+    if fila["bloqueado"]:
+        con.close()
+        return jsonify(ok=False, error="Esta cuenta está bloqueada."), 403
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    token = secrets.token_urlsafe(32)
+    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
+                (token, fila["id"], ahora, ahora))
+    con.execute("UPDATE usuarios SET ultimo_ingreso=? WHERE id=?", (ahora, fila["id"]))
+    con.commit()
+    con.close()
+
+    resp = jsonify(ok=True, usuario=fila["usuario_visible"], token=token)
+    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
+                    samesite="Lax", secure=True, httponly=False)
+    return resp
+
+
+@app.post("/api/salir")
+def api_salir():
+    token = (request.headers.get("X-Sesion", "")
+             or request.cookies.get("lea_sesion", "")).strip()
+    if token:
+        con = db()
+        con.execute("DELETE FROM sesiones WHERE token=?", (token,))
+        con.commit()
+        con.close()
+    resp = jsonify(ok=True, mensaje="Sesión cerrada.")
+    resp.set_cookie("lea_sesion", "", max_age=0)
+    return resp
+
+
+@app.get("/api/quien-soy")
+def api_quien_soy():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False)
+    return jsonify(ok=True, ingresado=True, usuario=u["usuario_visible"])
+
+
+@app.get("/api/proxima-carrera")
+def api_proxima_carrera():
+    """
+    La proxima carrera segun el horario oficial, para el visitante
+    que todavia no tiene cuenta.
+    """
+    hipodromo = clean(request.args.get("hipodromo", ""))
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    ahora = datetime.now().strftime("%H:%M")
+
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return jsonify(ok=False, error="No se pudo consultar el calendario."), 503
+
+    del_dia = [r for r in calendario if r["fecha"] == hoy]
+    if hipodromo:
+        del_dia = [r for r in del_dia
+                   if normalize_text(r["hipodromo"]) == normalize_text(hipodromo)]
+    if not del_dia:
+        return jsonify(ok=True, hay=False,
+                       mensaje="No hay carreras hoy en ese hipódromo.",
+                       hipodromos=[r["hipodromo"] for r in calendario
+                                   if r["fecha"] == hoy])
+
+    reunion = del_dia[0]
+    try:
+        carreras = extract_races_from_meeting(fetch(reunion["url"]))
+    except Exception:
+        return jsonify(ok=False, error="No se pudo abrir la reunión."), 503
+
+    # La primera cuya hora todavia no paso.
+    pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
+    proxima = pendientes[0] if pendientes else (carreras[-1] if carreras else None)
+    if not proxima:
+        return jsonify(ok=True, hay=False,
+                       mensaje="Todavía no hay carreras publicadas.")
+
+    return jsonify(
+        ok=True, hay=True,
+        fecha=hoy, hipodromo=reunion["hipodromo"], url=reunion["url"],
+        carrera=proxima,
+        ya_corrieron=len([c for c in carreras
+                          if c.get("hora") and c["hora"] < ahora]),
+        total=len(carreras),
+        hipodromos=[r["hipodromo"] for r in calendario if r["fecha"] == hoy],
+    )
+
+
+@app.get("/api/admin/usuarios")
+def admin_usuarios():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    filas = con.execute("""
+        SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso, bloqueado
+        FROM usuarios ORDER BY id DESC LIMIT 200
+    """).fetchall()
+    total = con.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
+    con.close()
+    return jsonify(ok=True, total=total, usuarios=[dict(f) for f in filas])
+
+
+@app.post("/api/admin/resetear-clave")
+def admin_resetear_clave():
+    """
+    El admin le pone una clave nueva a un usuario que la olvidó.
+    Hoy es manual; mañana esto mismo puede dispararse por SMS o WhatsApp.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    nueva = d.get("clave", "")
+    if not usuario or len(nueva) < 4:
+        return jsonify(ok=False,
+                       error="Falta el usuario o la clave es muy corta."), 400
+
+    con = db()
+    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET clave_hash=? WHERE id=?",
+                (_cifrar_clave(nueva), fila["id"]))
+    # Se cierran sus sesiones abiertas, por seguridad.
+    con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
+    con.commit()
+    con.close()
+    return jsonify(ok=True,
+                   mensaje=f"Clave nueva para {usuario}. Avisale cuál es.")
+
+
+@app.post("/api/admin/bloquear")
+def admin_bloquear():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    bloquear = 1 if d.get("bloquear") else 0
+    con = db()
+    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET bloqueado=? WHERE id=?", (bloquear, fila["id"]))
+    if bloquear:
+        con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
+    con.commit()
+    con.close()
+    return jsonify(ok=True,
+                   mensaje=("Usuario bloqueado." if bloquear else "Usuario habilitado."))
 
 
 @app.get("/api/videos")
