@@ -1186,6 +1186,28 @@ def reuniones():
         ), 404
 
 
+def _es_la_proxima(url, numero):
+    """
+    Dice si esa carrera es la proxima a correrse en su reunion.
+    Es la unica que ve el visitante que todavia no tiene cuenta.
+    """
+    fecha_url = meeting_date_from_url(url)
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    # Solo las de hoy pueden ser "la proxima".
+    if fecha_url != hoy:
+        return False
+    try:
+        carreras = extract_races_from_meeting(fetch(url))
+    except Exception:
+        return False
+    ahora = datetime.now().strftime("%H:%M")
+    pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
+    if pendientes:
+        return int(numero) == pendientes[0]["numero"]
+    # Si ya corrieron todas, la ultima queda como la de referencia.
+    return bool(carreras) and int(numero) == carreras[-1]["numero"]
+
+
 @app.get("/api/carrera")
 def carrera():
     url = request.args.get("url","")
@@ -1193,6 +1215,16 @@ def carrera():
     forzar = request.args.get("refresh") == "1"
     if not url.startswith(BASE) or not numero.isdigit():
         return jsonify(ok=False,error="Datos inválidos."),400
+
+    # Sin cuenta solo se ve la proxima carrera a correrse.
+    if not usuario_actual() and not es_admin():
+        if not _es_la_proxima(url, numero):
+            return jsonify(
+                ok=False,
+                necesita_cuenta=True,
+                error=("Sin cuenta solo podés ver la carrera que está por correrse. "
+                       "Creá una cuenta gratis para ver todas."),
+            ), 401
 
     clave = f"carrera:{url}:{numero}"
 
@@ -1369,6 +1401,12 @@ def buscar_ejemplares(termino):
 
 @app.get("/api/buscar-caballo")
 def api_buscar_caballo():
+    if not usuario_actual() and not es_admin():
+        return jsonify(
+            ok=False, necesita_cuenta=True,
+            error="Creá una cuenta gratis para buscar cualquier caballo.",
+            resultados=[],
+        ), 401
     termino = request.args.get("q", "").strip()
     if len(termino) < 3:
         return jsonify(ok=False, error="Escribí al menos 3 letras."), 400
