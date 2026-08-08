@@ -1033,6 +1033,22 @@
     font-family:'Archivo',sans-serif; font-weight:600; font-size:14px;
     text-decoration:underline; padding:4px;
   }
+  .pron-silk{
+    width:34px; height:34px; font-size:14px; flex-shrink:0;
+  }
+  .ver-motivos{
+    background:none; border:none; cursor:pointer; padding:6px 0 2px;
+    font-family:'Space Mono',monospace; font-size:11px;
+    color:var(--carmin); text-decoration:underline;
+  }
+  .motivos{
+    display:none; margin-top:4px; padding:9px 11px;
+    background:var(--pergamino); border-radius:5px;
+  }
+  .motivos.abierto{ display:block; }
+  .motivo{
+    font-size:12.5px; line-height:1.55; opacity:.85; padding:2px 0;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1846,17 +1862,41 @@ function renderPronostico(ranking, respuesta){
           : '<span class="flecha-baja">▼</span>';
       }
     }
+
+    // La bolita con el número, del mismo color que en la lista de arriba.
+    const pos = participantesActuales.findIndex(x => x.nombre === p.nombre);
+    const color = silks[(pos >= 0 ? pos : i) % silks.length];
+    const num = p.numero != null ? p.numero : '?';
+
+    const motivos = (p.motivos || []).slice(0, 3);
+    const idMot = 'mot-' + i;
+
     const row = document.createElement('div');
     row.className = 'pron-row' + (flecha ? ' cambio' : '');
     row.innerHTML = `
       <div class="pron-pos">${i+1}º</div>
+      <div class="silk pron-silk" style="background:${color}">${num}</div>
       <div class="pron-bar-wrap">
         <div class="pron-nombre">${p.nombre} ${flecha}</div>
         <div class="pron-bar-bg"><div class="pron-bar" style="width:${Math.min(100,p.probabilidad_relativa*2.2)}%"></div></div>
+        ${motivos.length
+          ? `<button class="ver-motivos" onclick="alternarMotivos('${idMot}')">¿Por qué? ⌄</button>
+             <div class="motivos" id="${idMot}">
+               ${motivos.map(m => '<div class="motivo">• ' + m + '</div>').join('')}
+             </div>`
+          : ''}
       </div>
       <div class="pron-pct">${p.probabilidad_relativa}%</div>`;
     pron.appendChild(row);
   });
+}
+
+function alternarMotivos(id){
+  const el = document.getElementById(id);
+  if (!el) return;
+  const abierto = el.classList.toggle('abierto');
+  const btn = el.previousElementSibling;
+  if (btn) btn.innerHTML = abierto ? '¿Por qué? ⌃' : '¿Por qué? ⌄';
 }
 
 // ---------- Buscador de caballo con autocompletado ----------
