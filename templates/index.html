@@ -1049,6 +1049,18 @@
   .motivo{
     font-size:12.5px; line-height:1.55; opacity:.85; padding:2px 0;
   }
+  .btn-retirar{
+    width:34px; height:34px; border-radius:50%; flex-shrink:0;
+    border:1.5px solid var(--pergamino-2); background:var(--hueso);
+    color:#999; cursor:pointer; font-size:16px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .btn-retirar:hover{ border-color:var(--carmin); color:var(--carmin); }
+  .btn-retirar.activo{
+    background:var(--carmin); border-color:var(--carmin); color:#fff;
+  }
+  .comp-item.retirado-por-mi{ opacity:.45; }
+  .comp-item.retirado-por-mi .comp-nombre{ text-decoration:line-through; }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1764,6 +1776,7 @@ async function elegirCarrera(c, itemEl){
     ultimoContexto = contexto;
     ultimosParticipantes = participantesActuales;
     ultimaCarreraData = carreraData;
+    retiradosPorMi = [];
     await traerCondiciones(contexto.fecha, contexto.hipodromo);
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
     renderPronostico(analisis.ranking || [], analisis);
@@ -1785,6 +1798,26 @@ function ocultarBarra(){
   document.getElementById('barra-top').classList.remove('visible');
 }
 
+// Retiros que marca el usuario, cuando el Stud Book todavia no los actualizo.
+let retiradosPorMi = [];
+
+function marcadoRetirado(nombre){
+  return retiradosPorMi.includes((nombre||'').toLowerCase());
+}
+
+async function alternarRetirado(nombre){
+  const n = (nombre||'').toLowerCase();
+  if (retiradosPorMi.includes(n)){
+    retiradosPorMi = retiradosPorMi.filter(x => x !== n);
+    mostrarToast(nombre + ' vuelve a contar en tu pronóstico.');
+  } else {
+    retiradosPorMi.push(n);
+    mostrarToast(nombre + ' marcado como retirado. Solo afecta tu pronóstico.');
+  }
+  renderCompetidores(ultimosParticipantes);
+  await recalcularPronostico();
+}
+
 function renderCompetidores(participantes){
   const list = document.getElementById('comp-list');
   list.innerHTML = '';
@@ -1796,6 +1829,7 @@ function renderCompetidores(participantes){
       ? 'RETIRADO — no corre'
       : [cp.jockey, cp.entrenador].filter(Boolean).join(' · ') || 'Sin datos de jockey';
     row.style.opacity = cp.retirado ? '0.45' : '1';
+    if (marcadoRetirado(cp.nombre)) row.classList.add('retirado-por-mi');
 
     // Si la carrera ya se corrió, se muestra el puesto y lo que pagó.
     const yaCorrio = cp.puesto != null;
@@ -1813,6 +1847,12 @@ function renderCompetidores(participantes){
         ${yaCorrio ? `<span class="llego ${clasePuesto}">${cp.puesto}º</span>` : ''}
         ${yaCorrio && cp.pago ? `<span class="pago">$${cp.pago}</span>` : ''}
         <span class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</span>
+        ${(!cp.retirado && !yaCorrio)
+          ? `<button class="btn-retirar ${marcadoRetirado(cp.nombre)?'activo':''}"
+                title="Marcar como retirado"
+                onclick="event.stopPropagation(); alternarRetirado('${(cp.nombre||'').replace(/'/g,"\\'")}')"
+             >${marcadoRetirado(cp.nombre) ? '✕' : '−'}</button>`
+          : ''}
       </div>`;
     row.onclick = ()=> abrirFicha(cp, idx);
     list.appendChild(row);
@@ -2507,6 +2547,7 @@ async function recalcularPronostico(){
       ...ultimoContexto,
       participantes: ultimosParticipantes,
       condiciones_usuario: cambios,
+      retirados_usuario: retiradosPorMi,
     });
     renderPronostico(d.ranking || [], d);
   }catch(e){
