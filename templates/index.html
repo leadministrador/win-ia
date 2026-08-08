@@ -1351,6 +1351,18 @@ let participantesActuales = [];
 let caballoActual = null;
 let seguidos = [];
 
+function invitacionCuenta(mensaje){
+  return `<div class="solo-usuarios">
+    <div class="su-tit">Creá tu cuenta gratis</div>
+    <div class="su-txt">${mensaje}</div>
+    <button onclick="abrirLogin(true)">Crear mi cuenta</button>
+    <div style="text-align:center; margin-top:10px; font-size:13px;">
+      ¿Ya tenés una?
+      <button class="link-login" onclick="abrirLogin(false)">Entrá</button>
+    </div>
+  </div>`;
+}
+
 function estadoMsg(texto, esError=false){
   return `<div class="estado-msg${esError?' error':''}">${esError?'':'<span class="spinner"></span>'}${texto}</div>`;
 }
@@ -1364,7 +1376,11 @@ function cabecerasSesion(){
 async function apiGet(url){
   const r = await fetch(url, {headers: cabecerasSesion()});
   const data = await r.json();
-  if (!r.ok || data.ok === false) throw new Error(data.error || 'Error de conexión con el servidor.');
+  if (!r.ok || data.ok === false){
+    const err = new Error(data.error || 'Error de conexión con el servidor.');
+    err.necesitaCuenta = !!data.necesita_cuenta;
+    throw err;
+  }
   return data;
 }
 async function apiPost(url, body){
@@ -1513,7 +1529,14 @@ async function elegirCarrera(c, itemEl){
     }
   }catch(e){
     ocultarBarra();
-    list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
+    if (e.necesitaCuenta){
+      list.innerHTML = invitacionCuenta(e.message);
+      document.getElementById('pronostico').innerHTML = '';
+      const caja = document.getElementById('caja-condiciones');
+      if (caja) caja.style.display = 'none';
+    } else {
+      list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
+    }
     return;
   }
 
@@ -1734,7 +1757,9 @@ async function consultarSugerencias(q){
   }catch(e){
     if (miNumero !== sugPeticion) return;
     sugUltimos = [];
-    sug.innerHTML = '<div class="sug-estado">' + e.message + '</div>';
+    sug.innerHTML = e.necesitaCuenta
+      ? invitacionCuenta(e.message)
+      : '<div class="sug-estado">' + e.message + '</div>';
   }
 }
 
