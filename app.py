@@ -260,6 +260,7 @@ def _parse_participants_table(table):
             "puesto": puesto,
             "cuerpos": col("cuerpos"),
             "acumulado": col("acumulado"),
+            "pago": col("pago"),
             "detalle": " · ".join(p for p in detalle_partes if p)[:700],
             "retirado": False,
         })
@@ -2085,6 +2086,7 @@ def api_tabulada():
             "nombre": p.get("nombre"),
             "cuerpos": p.get("cuerpos", ""),
             "acumulado": p.get("acumulado", ""),
+            "pago": p.get("pago", ""),
             "peso": p.get("peso", ""),
             "jockey": p.get("jockey", ""),
             "entrenador": p.get("entrenador", ""),
