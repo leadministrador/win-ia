@@ -784,11 +784,12 @@ def score_horse(h, context, pesos=None):
         h["victorias"] = nums[1]
         h["podios"] = nums[1] + nums[2] + nums[3]
 
+    # Estos dos suman puntaje pero NO se anuncian: los cumple casi cualquier
+    # caballo con campaña, y como motivo no le dicen nada al usuario.
     if acts:
         score += min(14, len(acts) * P["campana_disponible"])
-        reasons.append("tiene campaña reciente disponible")
     if "ganador" in campaign or "ganadora" in campaign:
-        score += P["registra_victorias"]; reasons.append("registra victorias")
+        score += P["registra_victorias"]
     corridas = h.get("corridas")
     es_debutante = (corridas == 0) if isinstance(corridas, int) else (not acts)
     if "debut" in campaign or es_debutante:
@@ -948,7 +949,10 @@ def score_horse(h, context, pesos=None):
         except ValueError:
             pass
 
-    return round(max(1, min(99, score)), 1), reasons
+    # No se corta arriba: si se pusiera un techo, los mejores empatarian y
+    # el pronostico dejaria de distinguirlos. La diferencia se ve despues,
+    # al comparar cada caballo con los demas de SU carrera.
+    return round(max(1, score), 1), reasons
 
 
 def _to_float(value):
@@ -1891,9 +1895,28 @@ def rankear(participantes, contexto, pesos):
     # Desempate por nombre, para que nunca dependa del orden de llegada.
     ranked.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
     top = ranked[:4]
-    total = sum(x["score"] for x in top) or 1
-    for x in top:
-        x["probabilidad_relativa"] = round(x["score"] / total * 100, 1)
+
+    # El porcentaje se calcula sobre la DIFERENCIA entre caballos, no sobre
+    # la suma de puntajes. Si se hiciera sobre la suma, cuatro caballos con
+    # puntajes 90, 85, 80 y 75 darian casi 25% cada uno y no se notaria
+    # quien es favorito.
+    if top:
+        puntajes = [x["score"] for x in ranked]
+        piso = min(puntajes)
+        # Cuanto se despega cada uno del peor de la carrera, mas una base
+        # para que el ultimo no quede en un numero irrisorio.
+        base_minima = 12
+        ventajas = [max(1.0, x["score"] - piso) + base_minima for x in top]
+        suma = sum(ventajas) or 1
+        for x, v in zip(top, ventajas):
+            x["probabilidad_relativa"] = round(v / suma * 100, 1)
+
+        # Ajuste: que la suma de al 100 exacto.
+        diferencia = round(100 - sum(x["probabilidad_relativa"] for x in top), 1)
+        if top and abs(diferencia) >= 0.1:
+            top[0]["probabilidad_relativa"] = round(
+                top[0]["probabilidad_relativa"] + diferencia, 1)
+
     return ranked, top
 
 
