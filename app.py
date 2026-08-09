@@ -1331,24 +1331,66 @@ def reuniones():
 
 def _es_la_proxima(url, numero):
     """
-    Dice si esa carrera es la proxima a correrse en su reunion.
-    Es la unica que ve el visitante que todavia no tiene cuenta.
+    Dice si esa carrera es una de las que el visitante sin cuenta puede ver.
+    Vale la proxima de CADA hipodromo, sean uno o diez el mismo dia.
+    Si ya termino la jornada de hoy, valen las primeras de la fecha siguiente.
     """
     fecha_url = meeting_date_from_url(url)
     hoy = hoy_argentina()
-    # Solo las de hoy pueden ser "la proxima".
-    if fecha_url != hoy:
-        return False
+    ahora = hora_argentina()
+
     try:
         carreras = extract_races_from_meeting(fetch(url))
     except Exception:
         return False
+    if not carreras:
+        return False
+
+    if fecha_url == hoy:
+        pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
+        if pendientes:
+            return int(numero) == pendientes[0]["numero"]
+        # Ya corrieron todas las de hoy: la jornada de hoy no habilita nada,
+        # se pasa a la fecha siguiente (se resuelve mas abajo).
+        return False
+
+    # Una reunion posterior: vale su PRIMERA carrera, pero solo si hoy ya
+    # termino o si esa reunion es la mas proxima que viene.
+    if fecha_url and fecha_url > hoy:
+        if int(numero) != carreras[0]["numero"]:
+            return False
+        return _hoy_ya_termino() and _es_la_fecha_mas_proxima(fecha_url)
+
+    return False
+
+
+def _hoy_ya_termino():
+    """True si no queda ninguna carrera por correrse hoy."""
+    hoy = hoy_argentina()
     ahora = hora_argentina()
-    pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
-    if pendientes:
-        return int(numero) == pendientes[0]["numero"]
-    # Si ya corrieron todas, la ultima queda como la de referencia.
-    return bool(carreras) and int(numero) == carreras[-1]["numero"]
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return False
+    for r in [x for x in calendario if x["fecha"] == hoy]:
+        try:
+            carreras = extract_races_from_meeting(fetch(r["url"]))
+        except Exception:
+            continue
+        if any(c.get("hora") and c["hora"] >= ahora for c in carreras):
+            return False
+    return True
+
+
+def _es_la_fecha_mas_proxima(fecha):
+    """True si no hay ninguna reunion entre hoy y esa fecha."""
+    hoy = hoy_argentina()
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return False
+    futuras = sorted({r["fecha"] for r in calendario if r["fecha"] > hoy})
+    return bool(futuras) and fecha == futuras[0]
 
 
 @app.get("/api/carrera")
