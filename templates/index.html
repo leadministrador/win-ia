@@ -1656,13 +1656,16 @@ async function elegirHip(h, itemEl){
     // La fecha y la hora las manda el servidor, en horario argentino.
     const hoyArg = data.hoy || new Date().toISOString().slice(0,10);
     const esHoy = fechaElegida === hoyArg;
+    const esFutura = fechaElegida > hoyArg;
     const ahora = data.ahora || new Date().toTimeString().slice(0,5);
     let idxProxima = -1;
+
     if (esHoy){
       idxProxima = reunion.carreras.findIndex(c => c.hora && c.hora >= ahora);
-      if (idxProxima === -1 && reunion.carreras.length){
-        idxProxima = reunion.carreras.length - 1;   // ya corrieron todas
-      }
+      // Si ya corrieron todas, hoy no marca ninguna: la próxima es de otro día.
+    } else if (esFutura){
+      // En una fecha por venir, la próxima es la primera de esa reunión.
+      idxProxima = 0;
     }
 
     reunion.carreras.forEach((c,i)=>{
@@ -1684,7 +1687,7 @@ async function elegirHip(h, itemEl){
       gridC.appendChild(item);
     });
 
-    if (esHoy){
+    if (esHoy || esFutura){
       const ref = document.createElement('div');
       ref.className = 'ref-colores';
       ref.innerHTML =
