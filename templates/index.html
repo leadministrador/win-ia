@@ -1512,6 +1512,7 @@ let seguidos = [];
 
 function abrirAvisoCuenta(){
   document.getElementById('aviso-cuenta').classList.add('visible');
+  sumarAlHistorial();
 }
 function cerrarAvisoCuenta(){
   document.getElementById('aviso-cuenta').classList.remove('visible');
@@ -1623,6 +1624,7 @@ function elegirFecha(fecha, d, chipEl){
   document.getElementById('card-hip').style.display = 'block';
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
   document.getElementById('paso-hip').classList.add('open');
+  sumarAlHistorial();
   document.getElementById('card-carreras').style.display = 'none';
   document.getElementById('card-comp').style.display = 'none';
 }
@@ -1637,6 +1639,7 @@ async function elegirHip(h, itemEl){
   document.getElementById('card-carreras').style.display = 'block';
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
   document.getElementById('paso-carreras').classList.add('open');
+  sumarAlHistorial();
   document.getElementById('card-comp').style.display = 'none';
 
   const gridC = document.getElementById('carrera-grid');
@@ -1713,6 +1716,7 @@ async function elegirCarrera(c, itemEl){
   document.getElementById('card-comp').style.display = 'block';
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('open'));
   document.getElementById('paso-comp').classList.add('open');
+  sumarAlHistorial();
 
   const list = document.getElementById('comp-list');
   const pron = document.getElementById('pronostico');
@@ -2218,6 +2222,7 @@ function abrirFicha(cp, idx){
 
   actualizarBotonSeguir();
   document.getElementById('overlay').classList.add('show');
+  sumarAlHistorial();
 }
 
 // ============================================================
@@ -2346,6 +2351,7 @@ async function abrirTabulada(i, c){
   const dias = diasDesde(c.fecha);
 
   document.getElementById('tab-overlay').classList.add('visible');
+  sumarAlHistorial();
   cont.innerHTML = `
     <button class="tab-cerrar" onclick="cerrarTabulada()">✕</button>
     <div class="g-titulo">${c.fecha} · ${c.hipodromo||''}</div>
@@ -2592,6 +2598,7 @@ function abrirLogin(registro){
   actualizarModo();
   document.getElementById('login-error').textContent = '';
   document.getElementById('login-overlay').classList.add('visible');
+  sumarAlHistorial();
   setTimeout(()=> document.getElementById('login-usuario').focus(), 250);
 }
 
@@ -2663,6 +2670,95 @@ async function salir(){
   window._sesion = null;
   pintarUsuario();
   mostrarToast('Cerraste la sesión.');
+}
+
+// ============================================================
+// BOTON ATRAS DEL NAVEGADOR
+// Sin esto, "atrás" saca de la app aunque estés en el paso 4.
+// Ahora cierra primero lo que esté abierto encima, después vuelve
+// un paso, y recién en el paso 1 deja salir.
+// ============================================================
+
+// Ventanas que se abren encima, en el orden en que se cierran.
+const VENTANAS = [
+  {id: 'aviso-cuenta', clase: 'visible', cerrar: () => cerrarAvisoCuenta()},
+  {id: 'login-overlay', clase: 'visible', cerrar: () => cerrarLogin()},
+  {id: 'tab-overlay',   clase: 'visible', cerrar: () => cerrarTabulada()},
+  {id: 'seg-overlay',   clase: 'show',    cerrar: () => cerrarSeguidos()},
+  {id: 'overlay',       clase: 'show',    cerrar: () => cerrarFicha()},
+];
+
+function hayVentanaAbierta(){
+  return VENTANAS.some(v => {
+    const el = document.getElementById(v.id);
+    return el && el.classList.contains(v.clase);
+  });
+}
+
+function cerrarUnaVentana(){
+  for (const v of VENTANAS){
+    const el = document.getElementById(v.id);
+    if (el && el.classList.contains(v.clase)){
+      v.cerrar();
+      return true;
+    }
+  }
+  return false;
+}
+
+// En qué paso estamos, de mayor a menor.
+function pasoActual(){
+  const abiertos = ['paso-comp','paso-carreras','paso-hip','paso-fecha'];
+  for (const id of abiertos){
+    const el = document.getElementById(id);
+    const tarjeta = el && el.closest('.card');
+    if (el && el.classList.contains('open') &&
+        tarjeta && tarjeta.style.display !== 'none'){
+      return id;
+    }
+  }
+  return null;
+}
+
+function volverUnPaso(){
+  const paso = pasoActual();
+  const anterior = {
+    'paso-comp': 'paso-carreras',
+    'paso-carreras': 'paso-hip',
+    'paso-hip': 'paso-fecha',
+  }[paso];
+  if (!anterior) return false;
+
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('open'));
+  document.getElementById(anterior).classList.add('open');
+  document.getElementById(anterior).scrollIntoView({behavior:'smooth', block:'center'});
+  return true;
+}
+
+function sumarAlHistorial(){
+  history.pushState({lea: 1}, '');
+}
+
+function iniciarBotonAtras(){
+  // Se agrega un estado al historial: sin esto el navegador sale directo.
+  history.pushState({lea: 1}, '');
+
+  window.addEventListener('popstate', () => {
+    let quedaAlgo = false;
+
+    if (hayVentanaAbierta()){
+      cerrarUnaVentana();
+      quedaAlgo = true;
+    } else if (volverUnPaso()){
+      quedaAlgo = true;
+    }
+
+    if (quedaAlgo){
+      // Se repone el estado, así el próximo "atrás" sigue funcionando.
+      history.pushState({lea: 1}, '');
+    }
+    // Si no queda nada, no se repone: el siguiente "atrás" sale de la app.
+  });
 }
 
 function alternarCarrera(i){
@@ -2799,6 +2895,7 @@ function abrirSeguidos(){
     });
   }
   document.getElementById('seg-overlay').classList.add('show');
+  sumarAlHistorial();
 }
 function cerrarSeguidos(){ document.getElementById('seg-overlay').classList.remove('show'); }
 function quitarSeguido(nombre){
@@ -2811,6 +2908,7 @@ function quitarSeguido(nombre){
 cargarCalendario();
 iniciarBuscador();
 verQuienSoy();
+iniciarBotonAtras();
 </script>
 </body>
 </html>
