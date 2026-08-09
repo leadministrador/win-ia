@@ -381,6 +381,78 @@ def _parse_participants_table(table):
     return participants
 
 
+def _rendimientos_de_la_carrera(soup):
+    """
+    Lee el rendimiento de jockey, entrenador y caballeriza que publica el
+    Stud Book al costado de cada carrera. Vienen en dos formatos:
+        Año: 603 C / 146 G      /      Año: 146 CC / 18 CG - (12.3%)
+        SIS: 278 C / 71 G       /      ARG: 76 CC / 10 CG - (13.2%)
+    La sigla es el hipodromo: ese numero vale mas que el general, porque
+    dice como le va EN ESA PISTA.
+    Devuelve {nombre en minusculas: {corridas, ganadas, pct, ...}}
+    """
+    texto = re.sub(r"[ \t]+", " ", soup.get_text("\n"))
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+
+    # "Año: 603 C / 146 G"  o  "Año: 146 CC / 18 CG - (12.3%)"
+    re_anio = re.compile(r"^A\w*o\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G", re.I)
+    # "SIS: 278 C / 71 G"  — la sigla es el hipodromo
+    re_hip = re.compile(r"^([A-Za-z]{2,5})\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G")
+
+    rendimientos = {}
+    for i, linea in enumerate(lineas):
+        m = re_anio.match(linea)
+        if not m or i == 0:
+            continue
+        nombre = clean(lineas[i - 1])
+        # La linea anterior tiene que ser un nombre, no otro dato.
+        if not nombre or len(nombre) < 3 or ":" in nombre:
+            continue
+
+        corridas, ganadas = int(m.group(1)), int(m.group(2))
+        dato = {
+            "corridas_anio": corridas,
+            "ganadas_anio": ganadas,
+            "pct_anio": round(ganadas / corridas * 100, 1) if corridas else 0.0,
+        }
+        if i + 1 < len(lineas):
+            mh = re_hip.match(lineas[i + 1])
+            # Que no sea otra vez la linea del año.
+            if mh and not re_anio.match(lineas[i + 1]):
+                c_h, g_h = int(mh.group(2)), int(mh.group(3))
+                dato["hipodromo"] = mh.group(1).upper()
+                dato["corridas_hip"] = c_h
+                dato["ganadas_hip"] = g_h
+                dato["pct_hip"] = round(g_h / c_h * 100, 1) if c_h else 0.0
+
+        rendimientos[normalize_text(nombre)] = dato
+    return rendimientos
+
+
+def _buscar_rendimiento(rendimientos, nombre):
+    """
+    Busca el rendimiento de una persona. Los nombres no siempre coinciden
+    exactamente: en la tabla dice "Candia Gutierrez E." y al costado
+    "Candia Gutierrez Elvio G.". Se compara por las primeras palabras.
+    """
+    if not nombre or not rendimientos:
+        return None
+    clave = normalize_text(nombre).replace(".", "").replace("-", " ").strip()
+    if clave in rendimientos:
+        return rendimientos[clave]
+
+    palabras = [p for p in clave.split() if len(p) > 2]
+    if not palabras:
+        return None
+    # El apellido y el nombre alcanzan para reconocerlo.
+    inicio = " ".join(palabras[:2])
+    for k, v in rendimientos.items():
+        limpio = k.replace(".", "").replace("-", " ")
+        if limpio.startswith(inicio) or inicio in limpio:
+            return v
+    return None
+
+
 def parse_race(soup, numero):
     heading = None
     pat = re.compile(rf"^{numero}\s*[º°ª]?\s*Carrera\b", re.I)
@@ -440,6 +512,17 @@ def parse_race(soup, numero):
         vistos.add(p["nombre"])
         unicos.append(p)
     participants = unicos
+
+    # Rendimiento de jockey, entrenador y caballeriza, que el sitio publica
+    # al costado de la carrera.
+    rendimientos = _rendimientos_de_la_carrera(soup)
+    for p in participants:
+        for quien, campo in [("jockey", "jockey"),
+                             ("entrenador", "entrenador"),
+                             ("caballeriza", "caballeriza")]:
+            r = _buscar_rendimiento(rendimientos, p.get(campo, ""))
+            if r:
+                p[f"rend_{quien}"] = r
 
     return {
         "carrera": numero,
@@ -738,6 +821,13 @@ PESOS_INICIALES = {
     "victoria_reciente": 4.0,
     "podio_reciente": 2.0,
     "pista_compatible": 7.0,
+    # Rendimiento de la gente que rodea al caballo. Empiezan sin castigar
+    # al que no gana: el aprendizaje decide despues si conviene castigarlo.
+    "jockey_ganador": 8.0,
+    "jockey_en_esa_pista": 5.0,
+    "jockey_sin_ganar": 0.0,
+    "entrenador_ganador": 5.0,
+    "caballeriza_ganadora": 3.0,
 }
 
 def cargar_pesos():
@@ -949,9 +1039,69 @@ def score_horse(h, context, pesos=None):
         except ValueError:
             pass
 
-    # No se corta arriba: si se pusiera un techo, los mejores empatarian y
-    # el pronostico dejaria de distinguirlos. La diferencia se ve despues,
-    # al comparar cada caballo con los demas de SU carrera.
+    # --- Jockey, entrenador y caballeriza ---
+    # El sitio publica cuántas corrió y cuántas ganó cada uno, en el año y
+    # en ESE hipódromo. Lo del hipódromo pesa distinto porque dice cómo le
+    # va en esa pista.
+    def sumar_rendimiento(clave, titulo, peso_gana, peso_pista=None):
+        nonlocal score
+        r = h.get("clave_no_existe") if False else h.get(clave)
+        if not r:
+            return
+        # Rendimiento del año
+        pct = r.get("pct_anio", 0)
+        corridas = r.get("corridas_anio", 0)
+        if corridas >= 10:
+            if pct >= 18:
+                score += peso_gana
+                reasons.append(f"{titulo} gana el {pct}% este año")
+            elif pct >= 10:
+                score += peso_gana * 0.5
+                reasons.append(f"{titulo} gana el {pct}% este año")
+            elif pct == 0:
+                # Arranca sin castigo: el peso vale 0 hasta que el
+                # aprendizaje diga otra cosa.
+                score -= P["jockey_sin_ganar"]
+                if P["jockey_sin_ganar"] > 0:
+                    reasons.append(f"{titulo} no ganó ninguna en {corridas} salidas")
+
+        # Rendimiento en ese hipódromo
+        if peso_pista and r.get("corridas_hip", 0) >= 8:
+            pct_h = r.get("pct_hip", 0)
+            if pct_h >= 18:
+                score += peso_pista
+                reasons.append(
+                    f"{titulo} gana el {pct_h}% en {r.get('hipodromo','esa pista')}")
+
+    sumar_rendimiento("rend_jockey", "el jockey",
+                      P["jockey_ganador"], P["jockey_en_esa_pista"])
+    sumar_rendimiento("rend_entrenador", "el entrenador",
+                      P["entrenador_ganador"])
+    sumar_rendimiento("rend_caballeriza", "la caballeriza",
+                      P["caballeriza_ganadora"])
+
+    # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
+    # Sin esto, los genericos tapan a los que de verdad explican el puesto.
+    PRIORIDAD = [
+        "viene fino", "no entra entre", "ganó su última",
+        "el jockey gana", "el jockey no ganó",
+        "gana el", "efectividad",
+        "corrió", "anduvo bien", "nunca corrió",
+        "el entrenador", "la caballeriza",
+        "descanso justo", "hace", "corrió hace",
+        "victoria", "llegada",
+        "lleva", "viento",
+        "carreras corridas", "experiencia", "debuta",
+    ]
+
+    def peso_motivo(m):
+        bajo = m.lower()
+        for i, clave in enumerate(PRIORIDAD):
+            if clave in bajo:
+                return i
+        return len(PRIORIDAD)
+
+    reasons.sort(key=peso_motivo)
     return round(max(1, score), 1), reasons
 
 
@@ -2819,6 +2969,126 @@ def admin_bloquear():
     con.close()
     return jsonify(ok=True,
                    mensaje=("Usuario bloqueado." if bloquear else "Usuario habilitado."))
+
+
+@app.get("/api/admin/diag-viejos")
+def admin_diag_viejos():
+    """
+    Prueba tres vias NUEVAS para llegar a carreras de meses anteriores.
+    Las que ya fallaron (direccion, formulario, sesion, POST) no se repiten.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    anio = int(request.args.get("anio", "2026"))
+    mes = int(request.args.get("mes", "3"))
+    informe = {"pedido": f"{anio}-{mes:02d}"}
+    s = _sesion_studbook()
+
+    # ---------- VIA A: entrar directo a una reunion vieja ----------
+    # Las direcciones tienen la forma /reuniones/detalle/ID/AAAAMMDD-hipodromo-N
+    # Si se puede abrir una vieja directamente, se pueden recorrer todas.
+    via_a = {"nombre": "A) entrar directo a una reunion vieja", "intentos": []}
+    try:
+        actuales = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception as e:
+        actuales = []
+        via_a["error_calendario"] = str(e)
+
+    if actuales:
+        # Se toma una direccion de ejemplo para ver como esta armada.
+        ejemplo = actuales[0]["url"]
+        via_a["ejemplo_de_direccion"] = ejemplo
+        m = re.search(r"/reuniones/detalle/(\d+)/(\d{8})-(.+)$", ejemplo)
+        if m:
+            id_actual, fecha_actual, resto = m.groups()
+            via_a["id_actual"] = int(id_actual)
+            # Las reuniones viejas tienen un ID mas chico. Se prueban algunos
+            # hacia atras para ver si responden.
+            for resta in (30, 100, 300, 600):
+                idv = int(id_actual) - resta
+                if idv < 1:
+                    continue
+                url = f"{BASE}/reuniones/detalle/{idv}/x"
+                try:
+                    r = s.get(url, timeout=(5, 15))
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    texto = clean(soup.get_text(" "))
+                    mf = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
+                    carreras = extract_races_from_meeting(soup)
+                    via_a["intentos"].append({
+                        "id": idv, "status": r.status_code,
+                        "fecha_que_trajo": mf.group(1) if mf else "",
+                        "carreras": len(carreras),
+                        "SIRVE": r.status_code == 200 and len(carreras) > 0,
+                    })
+                except Exception as e:
+                    via_a["intentos"].append({"id": idv, "error": str(e)[:90]})
+    informe["VIA_A"] = via_a
+
+    # ---------- VIA B: otra seccion del sitio con el historico ----------
+    via_b = {"nombre": "B) otra seccion con el historico", "intentos": []}
+    for ruta in ["/reuniones/historico", "/reuniones/listado", "/reuniones/todas",
+                 "/estadisticas/reuniones", "/consultas/reuniones",
+                 f"/reuniones/{anio}", f"/reuniones/{anio}/{mes:02d}"]:
+        try:
+            r = s.get(BASE + ruta, timeout=(5, 12))
+            enlaces = 0
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                enlaces = len(soup.select('a[href*="/reuniones/detalle/"]'))
+            via_b["intentos"].append({
+                "ruta": ruta, "status": r.status_code,
+                "enlaces_a_reuniones": enlaces,
+                "SIRVE": r.status_code == 200 and enlaces > 0,
+            })
+        except Exception as e:
+            via_b["intentos"].append({"ruta": ruta, "error": str(e)[:90]})
+    informe["VIA_B"] = via_b
+
+    # ---------- VIA C: desde la ficha de un caballo ----------
+    # En la campaña de cualquier ejemplar aparecen carreras de años anteriores,
+    # con su enlace. Si esos enlaces abren, se puede recorrer el historico.
+    via_c = {"nombre": "C) desde la campaña de un caballo", "intentos": []}
+    try:
+        muestra = buscar_ejemplares("candy")
+        if muestra:
+            perfil = muestra[0]["perfil"]
+            via_c["caballo_probado"] = muestra[0]["nombre"]
+            soup = fetch(perfil)
+            carreras = _tabla_carreras_del_perfil(soup)
+            viejas = [c for c in carreras
+                      if c.get("fecha", "").endswith(("2024", "2025"))
+                      and c.get("enlace")]
+            via_c["carreras_en_su_campana"] = len(carreras)
+            via_c["de_2024_o_2025"] = len(viejas)
+            for c in viejas[:3]:
+                try:
+                    r = s.get(c["enlace"], timeout=(5, 12))
+                    sp = BeautifulSoup(r.text, "html.parser")
+                    n = len(sp.select('a[href*="/ejemplares/perfil/"]'))
+                    via_c["intentos"].append({
+                        "fecha": c["fecha"], "status": r.status_code,
+                        "ejemplares_en_la_pagina": n,
+                        "SIRVE": r.status_code == 200 and n > 0,
+                    })
+                except Exception as e:
+                    via_c["intentos"].append({"fecha": c["fecha"], "error": str(e)[:90]})
+        else:
+            via_c["nota"] = "No se encontro ningun caballo para probar."
+    except Exception as e:
+        via_c["error"] = str(e)[:150]
+    informe["VIA_C"] = via_c
+
+    # ---------- RESUMEN ----------
+    def sirve(via):
+        return any(i.get("SIRVE") for i in via.get("intentos", []))
+    funcionan = [n for n, v in [("A", via_a), ("B", via_b), ("C", via_c)] if sirve(v)]
+    informe["RESUMEN"] = {
+        "VIAS_QUE_FUNCIONAN": funcionan,
+        "se_puede": bool(funcionan),
+    }
+    return jsonify(ok=True, **informe)
 
 
 @app.get("/api/videos")
