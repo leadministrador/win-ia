@@ -1384,7 +1384,38 @@ def calendario():
             lambda: calendar_from_meetings(fetch(BASE + "/reuniones"))
         )
         if meetings:
-            resp = {"ok": True, "reuniones": meetings, "fuente": "Stud Book"}
+            hoy = hoy_argentina()
+            ahora = hora_argentina()
+            fechas = sorted({m["fecha"] for m in meetings})
+
+            # Cual es la fecha donde hay que entrar: hoy si todavia queda
+            # alguna carrera por correrse, si no la siguiente con reunion.
+            fecha_activa = hoy if hoy in fechas else ""
+            jornada_terminada = False
+            if fecha_activa:
+                try:
+                    de_hoy = [m for m in meetings if m["fecha"] == hoy]
+                    quedan = False
+                    for m in de_hoy:
+                        cs = extract_races_from_meeting(fetch(m["url"]))
+                        if any(c.get("hora") and c["hora"] >= ahora for c in cs):
+                            quedan = True
+                            break
+                    jornada_terminada = not quedan
+                except Exception:
+                    jornada_terminada = False
+            if not fecha_activa or jornada_terminada:
+                futuras = [f for f in fechas if f > hoy]
+                fecha_activa = futuras[0] if futuras else fecha_activa
+
+            resp = {
+                "ok": True, "reuniones": meetings, "fuente": "Stud Book",
+                "hoy": hoy,
+                "ahora": ahora,
+                # La unica fecha que se marca: donde hay que entrar.
+                "fecha_activa": fecha_activa,
+                "jornada_terminada": jornada_terminada,
+            }
             if origen == "cache_vencido":
                 resp["aviso"] = "La fuente oficial no respondió. Se muestra el último calendario guardado."
             return jsonify(**resp)
