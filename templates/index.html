@@ -1577,6 +1577,8 @@ function abrirPaso(id){ document.getElementById(id).classList.add('open'); }
 
 // ---------- PASO 1: calendario ----------
 let hoyYaTermino = false;
+let hoyArgentina = '';
+let fechaActiva = '';
 
 async function cargarCalendario(){
   const grid = document.getElementById('fecha-grid');
@@ -1584,6 +1586,9 @@ async function cargarCalendario(){
   try{
     const data = await apiGet('/api/calendario');
     calendarioCache = data.reuniones || [];
+    hoyArgentina = data.hoy || '';
+    fechaActiva = data.fecha_activa || '';
+    hoyYaTermino = !!data.jornada_terminada;
     if (calendarioCache.length === 0){
       grid.innerHTML = estadoMsg('No hay reuniones publicadas por ahora.', true);
       return;
@@ -1593,15 +1598,15 @@ async function cargarCalendario(){
     fechasUnicas.forEach(f=>{
       const d = new Date(f + 'T00:00:00');
       const chip = document.createElement('div');
-      const hoyStr = new Date().toISOString().slice(0,10);
-      const esHoy = f === hoyStr;
-      // Cuál es el próximo día con carreras después de hoy.
-      const proximoDia = fechasUnicas.find(x => x > hoyStr);
-      const esProximo = !esHoy && f === proximoDia;
-      chip.className = 'fecha-chip' + (esHoy ? ' hoy' : '') + (esProximo ? ' proximo-dia' : '');
+      // UNA SOLA marca: la fecha donde hay que entrar. Si hoy ya terminó,
+      // es la del día siguiente. Nunca dos marcas juntas: confunden.
+      const esLaQueVa = (f === fechaActiva);
+      chip.className = 'fecha-chip' + (esLaQueVa ? ' hoy' : '');
       chip.innerHTML =
-        (esHoy ? '<div class="marca-hoy"><span class="punto-vivo"></span>HOY</div>' : '') +
-        (esProximo ? '<div class="marca-hoy">SIGUE</div>' : '') +
+        (esLaQueVa
+          ? '<div class="marca-hoy"><span class="punto-vivo"></span>' +
+            (f === hoyArgentina ? 'HOY' : 'PRÓXIMA') + '</div>'
+          : '') +
         `<span class="dia">${d.getDate()}</span><span class="mes">${diasCorto[d.getDay()]} ${mesesLargo[d.getMonth()].slice(0,3).toUpperCase()}</span>`;
       chip.onclick = ()=> elegirFecha(f, d, chip);
       grid.appendChild(chip);
@@ -1675,7 +1680,7 @@ async function elegirHip(h, itemEl){
     gridC.innerHTML = '';
     // ¿Cuál es la próxima a correrse? Solo si la reunión es de hoy.
     // La fecha y la hora las manda el servidor, en horario argentino.
-    const hoyArg = data.hoy || new Date().toISOString().slice(0,10);
+    const hoyArg = data.hoy || hoyArgentina || new Date().toISOString().slice(0,10);
     const esHoy = fechaElegida === hoyArg;
     const esFutura = fechaElegida > hoyArg;
     const esPasada = fechaElegida < hoyArg;
