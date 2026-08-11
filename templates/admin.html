@@ -233,6 +233,35 @@
             onclick="guardarCondiciones()">Guardar para toda la reunión</button>
     <div class="progreso-txt" id="cond-estado" style="margin-top:11px;"></div>
   </div>
+
+  <h2>Avisos al celular</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Los usuarios reciben un aviso cuando su caballo sale inscripto y una hora
+    antes de la carrera. Desde acá podés mandar un aviso a todos.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-avisos" style="margin-bottom:16px;"></div>
+
+    <button class="btn btn-run" style="width:100%;" onclick="probarAviso()">
+      Mandar un aviso de prueba
+    </button>
+
+    <div class="campo" style="margin-top:18px;">
+      <label>Título del aviso</label>
+      <input type="text" id="aviso-titulo" class="txt"
+             placeholder="Por ejemplo: Remate este sábado">
+    </div>
+    <div class="campo" style="margin-top:12px;">
+      <label>Texto</label>
+      <input type="text" id="aviso-cuerpo" class="txt"
+             placeholder="Lo que quieras contarles">
+    </div>
+
+    <button class="btn btn-borrar" style="width:100%; margin-top:14px;"
+            onclick="avisarATodos()">Mandar a todos</button>
+    <div class="progreso-txt" id="aviso-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Últimas carreras comparadas</h2>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
 
@@ -462,6 +491,50 @@ async function guardarCondiciones(){
   }
 }
 
+// ---------- Avisos al celular ----------
+async function verEstadoAvisos(){
+  try{
+    const r = await fetch('/api/admin/estado-avisos?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+    document.getElementById('chips-avisos').innerHTML = `
+      <div class="chip-dato"><b>${d.celulares_suscriptos}</b>celulares</div>
+      <div class="chip-dato"><b>${d.caballos_seguidos}</b>seguidos</div>
+      <div class="chip-dato"><b>${d.avisos_enviados}</b>avisos enviados</div>
+      <div class="chip-dato"><b>${d.claves_cargadas ? 'Sí' : 'NO'}</b>claves cargadas</div>`;
+  }catch(e){}
+}
+
+async function probarAviso(){
+  const est = document.getElementById('aviso-estado');
+  est.textContent = 'Enviando…';
+  try{
+    const r = await fetch('/api/admin/probar-aviso?clave=' + encodeURIComponent(clave),
+                          {method:'POST'});
+    const d = await r.json();
+    est.textContent = d.mensaje || d.error;
+    verEstadoAvisos();
+  }catch(e){ est.textContent = 'No se pudo enviar: ' + e.message; }
+}
+
+async function avisarATodos(){
+  const titulo = document.getElementById('aviso-titulo').value.trim();
+  const cuerpo = document.getElementById('aviso-cuerpo').value.trim();
+  const est = document.getElementById('aviso-estado');
+  if (!titulo){ est.textContent = 'Poné al menos un título.'; return; }
+  if (!confirm('Esto le manda un aviso a TODOS los celulares suscriptos.\n\n¿Seguro?')) return;
+  est.textContent = 'Enviando…';
+  try{
+    const r = await fetch('/api/admin/avisar-a-todos?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({titulo, cuerpo})
+    });
+    const d = await r.json();
+    est.textContent = d.mensaje || d.error;
+    verEstadoAvisos();
+  }catch(e){ est.textContent = 'No se pudo enviar: ' + e.message; }
+}
+
 async function reiniciarTodo(){
   if (!confirm('Esto borra TODOS los pronósticos guardados y vuelve el algoritmo ' +
                'a sus valores iniciales.\n\n¿Seguro?')) return;
@@ -517,6 +590,7 @@ verEstado();
 
 cargar();
 cargarHipodromosDelDia();
+verEstadoAvisos();
 </script>
 </body>
 </html>
