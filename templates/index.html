@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LEA WIN IA — Prototipo</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#153832">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LEA WIN IA">
+<link rel="apple-touch-icon" href="/static/icono-192.png">
+<link rel="icon" href="/static/icono-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Archivo:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
@@ -1072,6 +1079,20 @@
   }
   .comp-item.retirado-por-mi{ opacity:.45; }
   .comp-item.retirado-por-mi .comp-nombre{ text-decoration:line-through; }
+  .estado-avisos{
+    background:var(--pergamino); border-left:3px solid #999;
+    padding:14px 15px; border-radius:0 6px 6px 0; margin-bottom:16px;
+  }
+  .estado-avisos.activo{ border-left-color:var(--verde-vivo); }
+  .ea-txt{ font-size:14px; line-height:1.5; }
+  .ea-txt b{ color:var(--verde-vivo); }
+  .btn-activar{
+    width:100%; margin-top:12px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:15px; background:var(--verde-vivo);
+    color:#fff; border:none; padding:14px; border-radius:8px;
+    cursor:pointer; min-height:50px;
+  }
+  .btn-activar:hover{ background:#25795c; }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -2879,64 +2900,205 @@ async function cargarDetalleCarrera(i, c){
 }
 function cerrarFicha(){ document.getElementById('overlay').classList.remove('show'); }
 
-// ---------- Seguir caballo (solo visual por ahora, sin backend/login todavía) ----------
+// ============================================================
+// SEGUIR CABALLOS Y AVISOS AL CELULAR
+// El aviso llega aunque la app esté cerrada. En iPhone hace falta
+// agregar la app a la pantalla de inicio.
+// ============================================================
+
+let avisosActivos = false;
+let clavePush = '';
+
 function actualizarBotonSeguir(){
   const btn = document.getElementById('btn-seguir');
-  const yaSigue = seguidos.some(s => s.nombre === caballoActual.nombre);
-  btn.textContent = yaSigue ? '✓ Siguiendo — te avisamos cuando vuelva a correr' : '🔔 Seguir a este caballo';
+  if (!btn || !caballoActual) return;
+  const yaSigue = seguidos.some(s =>
+    normalizarTexto(s.nombre) === normalizarTexto(caballoActual.nombre));
+  btn.textContent = yaSigue
+    ? '✓ Siguiendo — te avisamos cuando vuelva a correr'
+    : '🔔 Seguir a este caballo';
   btn.classList.toggle('activo', yaSigue);
 }
-function toggleSeguir(){
-  const yaSigue = seguidos.some(s => s.nombre === caballoActual.nombre);
-  if (yaSigue){
-    seguidos = seguidos.filter(s => s.nombre !== caballoActual.nombre);
-    mostrarToast(`Dejaste de seguir a ${caballoActual.nombre}.`);
-  } else {
-    seguidos.push({nombre: caballoActual.nombre, num: caballoActual.numero});
-    mostrarToast(`Vas a recibir una notificación apenas se confirme cuándo vuelve a correr ${caballoActual.nombre}. (Función completa disponible cuando agreguemos login)`);
+
+async function toggleSeguir(){
+  if (!caballoActual) return;
+  const btn = document.getElementById('btn-seguir');
+  if (btn) btn.disabled = true;
+  try{
+    const d = await apiPost('/api/seguir', {
+      caballo: caballoActual.nombre,
+      perfil: caballoActual.perfil || '',
+    });
+    if (d.siguiendo){
+      seguidos.push({nombre: caballoActual.nombre, num: caballoActual.numero});
+      // Recién acá se pide el permiso: cuando ya sabe para qué sirve.
+      if (!avisosActivos) await pedirPermisoAvisos();
+    } else {
+      seguidos = seguidos.filter(s =>
+        normalizarTexto(s.nombre) !== normalizarTexto(caballoActual.nombre));
+    }
+    mostrarToast(d.mensaje);
+    actualizarBotonSeguir();
+    actualizarContadorSeguidos();
+  }catch(e){
+    if (e.necesitaCuenta){
+      cerrarFicha();
+      abrirAvisoCuenta();
+    } else {
+      mostrarToast('No se pudo guardar. ' + e.message);
+    }
+  }finally{
+    if (btn) btn.disabled = false;
   }
-  actualizarBotonSeguir();
-  actualizarContadorSeguidos();
 }
+
 function actualizarContadorSeguidos(){
   const c = document.getElementById('contador-seguidos');
+  if (!c) return;
   if (seguidos.length > 0){ c.style.display = 'inline'; c.textContent = seguidos.length; }
   else { c.style.display = 'none'; }
 }
+
+async function traerSeguidos(){
+  try{
+    const d = await apiGet('/api/seguidos');
+    seguidos = (d.seguidos || []).map(s => ({
+      nombre: s.caballo_visible, perfil: s.perfil, num: null,
+    }));
+    actualizarContadorSeguidos();
+  }catch(e){ /* sin cuenta, queda vacío */ }
+}
+
 function mostrarToast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(()=> t.classList.remove('show'), 3600);
+  window._toastTimer = setTimeout(()=> t.classList.remove('show'), 4200);
 }
-function abrirSeguidos(){
+
+async function abrirSeguidos(){
   const lista = document.getElementById('seg-lista');
-  lista.innerHTML = '';
-  if (seguidos.length === 0){
-    lista.innerHTML = '<div class="seg-empty">Todavía no seguís ningún caballo.<br>Abrí la ficha de un competidor y tocá "Seguir a este caballo".</div>';
-  } else {
-    seguidos.forEach(s=>{
-      const row = document.createElement('div');
-      row.className = 'seg-item';
-      row.innerHTML = `
-        <div class="silk" style="background:${silks[(s.num||1) % silks.length]}; width:30px; height:30px; font-size:12px;">${s.num||'—'}</div>
-        <div class="seg-info">
-          <div class="seg-nombre">${s.nombre}</div>
-          <div class="seg-aviso">Notificaciones activas cuando haya login</div>
-        </div>
-        <button class="seg-quitar" onclick="quitarSeguido('${s.nombre.replace(/'/g,"\\'")}')">✕</button>`;
-      lista.appendChild(row);
-    });
-  }
+  lista.innerHTML = '<div class="seg-empty">Buscando…</div>';
   document.getElementById('seg-overlay').classList.add('show');
   sumarAlHistorial();
+
+  if (!miUsuario){
+    lista.innerHTML = `<div class="seg-empty">
+      Creá tu cuenta gratis para seguir caballos y recibir un aviso
+      cuando vuelvan a correr.
+      <button class="btn-crear" style="margin-top:14px;"
+        onclick="cerrarSeguidos(); abrirLogin(true);">Crear mi cuenta</button>
+    </div>`;
+    return;
+  }
+
+  await traerSeguidos();
+
+  let html = '';
+  // Estado de los avisos, arriba de todo
+  html += `<div class="estado-avisos ${avisosActivos ? 'activo' : ''}">
+    <div class="ea-txt">
+      ${avisosActivos
+        ? '🔔 <b>Avisos activados</b> en este celular.'
+        : '🔕 Los avisos están apagados en este celular.'}
+    </div>
+    ${!avisosActivos
+      ? '<button class="btn-activar" onclick="pedirPermisoAvisos()">Activar los avisos</button>'
+      : ''}
+  </div>`;
+
+  if (seguidos.length === 0){
+    html += `<div class="seg-empty">Todavía no seguís ningún caballo.<br>
+      Abrí la ficha de un competidor y tocá "Seguir a este caballo".</div>`;
+  } else {
+    seguidos.forEach((s,i)=>{
+      html += `<div class="seg-item">
+        <div class="silk" style="background:${silks[i % silks.length]}; width:32px; height:32px; font-size:12px;">🐎</div>
+        <div class="seg-info">
+          <div class="seg-nombre">${s.nombre}</div>
+          <div class="seg-aviso">${avisosActivos
+            ? 'Te avisamos cuando salga inscripto y una hora antes'
+            : 'Activá los avisos para recibir la notificación'}</div>
+        </div>
+        <button class="seg-quitar" onclick="quitarSeguido('${s.nombre.replace(/'/g,"\\'")}')">✕</button>
+      </div>`;
+    });
+  }
+  lista.innerHTML = html;
 }
-function cerrarSeguidos(){ document.getElementById('seg-overlay').classList.remove('show'); }
-function quitarSeguido(nombre){
-  seguidos = seguidos.filter(s => s.nombre !== nombre);
-  actualizarContadorSeguidos();
+
+function cerrarSeguidos(){
+  document.getElementById('seg-overlay').classList.remove('show');
+}
+
+async function quitarSeguido(nombre){
+  try{
+    await apiPost('/api/seguir', {caballo: nombre});
+    mostrarToast('Dejaste de seguir a ' + nombre + '.');
+  }catch(e){}
   abrirSeguidos();
+}
+
+// ---------- Permiso y suscripción ----------
+
+function base64AArray(base64){
+  const relleno = '='.repeat((4 - base64.length % 4) % 4);
+  const limpio = (base64 + relleno).replace(/-/g, '+').replace(/_/g, '/');
+  const crudo = atob(limpio);
+  return Uint8Array.from([...crudo].map(c => c.charCodeAt(0)));
+}
+
+async function iniciarAvisos(){
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try{
+    const d = await apiGet('/api/push/clave');
+    if (!d.disponible) return;
+    clavePush = d.clave;
+    await navigator.serviceWorker.register('/sw.js');
+    const reg = await navigator.serviceWorker.ready;
+    const sus = await reg.pushManager.getSubscription();
+    avisosActivos = !!sus && Notification.permission === 'granted';
+  }catch(e){ avisosActivos = false; }
+}
+
+async function pedirPermisoAvisos(){
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)){
+    mostrarToast('Este navegador no puede recibir avisos.');
+    return false;
+  }
+  if (!clavePush){
+    try{
+      const d = await apiGet('/api/push/clave');
+      clavePush = d.clave;
+    }catch(e){ return false; }
+  }
+
+  try{
+    const permiso = await Notification.requestPermission();
+    if (permiso !== 'granted'){
+      mostrarToast('Sin permiso no podemos avisarte. Podés activarlo más tarde.');
+      return false;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    let sus = await reg.pushManager.getSubscription();
+    if (!sus){
+      sus = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: base64AArray(clavePush),
+      });
+    }
+    const datos = sus.toJSON();
+    await apiPost('/api/push/suscribir', {
+      endpoint: datos.endpoint, keys: datos.keys,
+    });
+    avisosActivos = true;
+    mostrarToast('Listo. Vas a recibir los avisos en este celular.');
+    return true;
+  }catch(e){
+    mostrarToast('No se pudieron activar los avisos. ' + e.message);
+    return false;
+  }
 }
 
 // ---------- Arranque ----------
@@ -2944,6 +3106,7 @@ cargarCalendario();
 iniciarBuscador();
 verQuienSoy();
 iniciarBotonAtras();
+iniciarAvisos();
 </script>
 </body>
 </html>
