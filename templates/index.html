@@ -915,6 +915,29 @@
     font-family:'Archivo',sans-serif; font-weight:600; font-size:13.5px;
     text-decoration:underline; padding:4px;
   }
+  .login-o{
+    text-align:center; margin:16px 0 12px; position:relative;
+  }
+  .login-o::before{
+    content:''; position:absolute; top:50%; left:0; right:0;
+    height:1px; background:var(--pergamino-2);
+  }
+  .login-o span{
+    position:relative; background:var(--hueso); padding:0 14px;
+    font-family:'Space Mono',monospace; font-size:11px; opacity:.5;
+  }
+  .btn-crear-cuenta{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--bronce); color:var(--tinta); border:none;
+    padding:16px; border-radius:8px; cursor:pointer; min-height:54px;
+  }
+  .btn-crear-cuenta:hover{ background:var(--bronce-claro); }
+  .btn-crear-aqui{
+    display:block; width:100%; margin-top:12px;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+    background:var(--bronce); color:var(--tinta); border:none;
+    padding:14px; border-radius:8px; cursor:pointer; min-height:50px;
+  }
   .login-olvide{
     text-align:center; margin-top:16px; padding-top:14px;
     border-top:1px solid var(--pergamino-2);
@@ -1490,10 +1513,13 @@
 
     <button class="btn-login" id="btn-login" onclick="enviarLogin()">Entrar</button>
 
-    <div class="login-cambiar">
-      <span id="login-pregunta">¿Todavía no tenés cuenta?</span>
-      <button class="link-login" id="login-cambiar" onclick="alternarModo()">Creá una</button>
+    <div class="login-o" id="login-o">
+      <span>o</span>
     </div>
+
+    <button class="btn-crear-cuenta" id="btn-cambiar-modo" onclick="alternarModo()">
+      Crear una cuenta gratis
+    </button>
 
     <div class="login-olvide" id="login-olvide">
       ¿Olvidaste la contraseña? Escribinos y te la cambiamos.
@@ -1578,6 +1604,7 @@ async function apiGet(url){
   if (!r.ok || data.ok === false){
     const err = new Error(data.error || 'Error de conexión con el servidor.');
     err.necesitaCuenta = !!data.necesita_cuenta;
+    err.noExiste = !!data.no_existe;
     throw err;
   }
   return data;
@@ -2678,10 +2705,8 @@ function actualizarModo(){
     modoRegistro ? 'Crear la cuenta' : 'Entrar';
   document.getElementById('campo-telefono').style.display =
     modoRegistro ? 'block' : 'none';
-  document.getElementById('login-pregunta').textContent =
-    modoRegistro ? '¿Ya tenés cuenta?' : '¿Todavía no tenés cuenta?';
-  document.getElementById('login-cambiar').textContent =
-    modoRegistro ? 'Entrá' : 'Creá una';
+  document.getElementById('btn-cambiar-modo').textContent =
+    modoRegistro ? 'Ya tengo cuenta, quiero entrar' : 'Crear una cuenta gratis';
   document.getElementById('login-olvide').style.display =
     modoRegistro ? 'none' : 'block';
   document.getElementById('login-clave').setAttribute(
@@ -2714,10 +2739,23 @@ async function enviarLogin(){
       : `Hola de nuevo, ${d.usuario}.`);
     document.getElementById('login-clave').value = '';
   }catch(e){
-    err.textContent = e.message;
+    err.innerHTML = e.message;
+    // Si ese usuario no existe, se le ofrece crearlo con ese mismo nombre.
+    if (e.noExiste){
+      err.innerHTML = e.message +
+        '<button class="btn-crear-aqui" onclick="pasarACrear()">' +
+        'Crear la cuenta «' + usuario + '»</button>';
+    }
   }finally{
     btn.disabled = false;
   }
+}
+
+function pasarACrear(){
+  modoRegistro = true;
+  actualizarModo();
+  document.getElementById('login-error').textContent = '';
+  document.getElementById('login-clave').focus();
 }
 
 async function salir(){
