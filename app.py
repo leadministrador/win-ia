@@ -2868,10 +2868,15 @@ def api_ingresar():
     con = db()
     fila = con.execute("SELECT * FROM usuarios WHERE usuario=?",
                        (normalize_text(usuario),)).fetchone()
-    if not fila or not _clave_correcta(clave, fila["clave_hash"]):
+    if not fila:
         con.close()
-        # Mismo mensaje para los dos casos, para no dar pistas.
-        return jsonify(ok=False, error="Usuario o contraseña incorrectos."), 401
+        # Se avisa que no existe para poder ofrecerle crearlo con ese nombre.
+        return jsonify(ok=False, no_existe=True, usuario_probado=usuario,
+                       error=f"No existe el usuario «{usuario}»."), 401
+    if not _clave_correcta(clave, fila["clave_hash"]):
+        con.close()
+        return jsonify(ok=False, clave_mal=True,
+                       error="La contraseña no es correcta."), 401
     if fila["bloqueado"]:
         con.close()
         return jsonify(ok=False, error="Esta cuenta está bloqueada."), 403
