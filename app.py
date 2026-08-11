@@ -101,6 +101,33 @@ def init_db():
       creada_en TEXT NOT NULL,
       ultima_vez TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS suscripciones(
+      endpoint TEXT PRIMARY KEY,      -- la direccion del celular
+      usuario_id INTEGER,
+      p256dh TEXT NOT NULL,           -- claves que da el navegador
+      auth TEXT NOT NULL,
+      creada_en TEXT NOT NULL,
+      ultimo_aviso TEXT,
+      fallos INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS seguidos(
+      usuario_id INTEGER NOT NULL,
+      caballo TEXT NOT NULL,          -- en minusculas, para no repetir
+      caballo_visible TEXT NOT NULL,
+      perfil TEXT,
+      creado_en TEXT NOT NULL,
+      PRIMARY KEY(usuario_id, caballo)
+    );
+    CREATE TABLE IF NOT EXISTS avisos_enviados(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      usuario_id INTEGER,
+      caballo TEXT,
+      tipo TEXT NOT NULL,             -- inscripto | una_hora | general
+      fecha TEXT,                     -- fecha de la carrera
+      hipodromo TEXT,
+      enviado_en TEXT NOT NULL,
+      UNIQUE(usuario_id, caballo, tipo, fecha, hipodromo)
+    );
     """)
     con.commit()
     con.close()
@@ -3122,6 +3149,424 @@ def admin_diag_viejos():
     return jsonify(ok=True, **informe)
 
 
+# ============================================================
+# NOTIFICACIONES AL CELULAR
+# Llegan aunque la app este cerrada. Hacen falta dos claves que se
+# cargan en Render: VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY.
+# En iPhone solo funcionan si el usuario agrega la app a la pantalla
+# de inicio; en Android funcionan siempre.
+# ============================================================
+
+VAPID_PUBLIC = os.getenv("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE = os.getenv("VAPID_PRIVATE_KEY", "")
+VAPID_CONTACTO = os.getenv("VAPID_CONTACTO", "mailto:admin@win-ia.onrender.com")
+
+
+def hay_notificaciones():
+    return bool(VAPID_PUBLIC and VAPID_PRIVATE)
+
+
+@app.get("/api/push/clave")
+def push_clave():
+    """La clave publica, que el navegador necesita para suscribirse."""
+    return jsonify(ok=True, disponible=hay_notificaciones(),
+                   clave=VAPID_PUBLIC)
+
+
+@app.post("/api/push/suscribir")
+def push_suscribir():
+    """Guarda la direccion del celular para poder avisarle."""
+    d = request.get_json(silent=True) or {}
+    endpoint = clean(d.get("endpoint", ""))
+    claves = d.get("keys") or {}
+    p256dh = clean(claves.get("p256dh", ""))
+    auth = clean(claves.get("auth", ""))
+
+    if not endpoint or not p256dh or not auth:
+        return jsonify(ok=False, error="Faltan datos de la suscripción."), 400
+
+    u = usuario_actual()
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones(endpoint, usuario_id, p256dh, auth, creada_en)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+          usuario_id=COALESCE(excluded.usuario_id, suscripciones.usuario_id),
+          p256dh=excluded.p256dh, auth=excluded.auth, fallos=0
+    """, (endpoint, u["id"] if u else None, p256dh, auth,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Vas a recibir los avisos en este celular.")
+
+
+@app.post("/api/push/borrar")
+def push_borrar():
+    d = request.get_json(silent=True) or {}
+    endpoint = clean(d.get("endpoint", ""))
+    if endpoint:
+        con = db()
+        con.execute("DELETE FROM suscripciones WHERE endpoint=?", (endpoint,))
+        con.commit()
+        con.close()
+    return jsonify(ok=True, mensaje="No vas a recibir más avisos en este celular.")
+
+
+def enviar_aviso(suscripcion, titulo, cuerpo, url="/", etiqueta="lea"):
+    """
+    Manda un aviso a un celular. Devuelve True si salio bien.
+    Si el celular ya no existe, se borra la suscripcion.
+    """
+    if not hay_notificaciones():
+        return False
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return False
+
+    datos = json.dumps({
+        "titulo": titulo, "cuerpo": cuerpo, "url": url, "etiqueta": etiqueta,
+    }, ensure_ascii=False)
+
+    try:
+        webpush(
+            subscription_info={
+                "endpoint": suscripcion["endpoint"],
+                "keys": {"p256dh": suscripcion["p256dh"],
+                         "auth": suscripcion["auth"]},
+            },
+            data=datos,
+            vapid_private_key=VAPID_PRIVATE,
+            vapid_claims={"sub": VAPID_CONTACTO},
+            ttl=3600,
+        )
+        con = db()
+        con.execute("UPDATE suscripciones SET ultimo_aviso=?, fallos=0 WHERE endpoint=?",
+                    (datetime.now().isoformat(timespec="seconds"),
+                     suscripcion["endpoint"]))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:
+        # 404 o 410 significan que ese celular ya no acepta avisos.
+        texto = str(e)
+        con = db()
+        if "404" in texto or "410" in texto:
+            con.execute("DELETE FROM suscripciones WHERE endpoint=?",
+                        (suscripcion["endpoint"],))
+        else:
+            con.execute("UPDATE suscripciones SET fallos=fallos+1 WHERE endpoint=?",
+                        (suscripcion["endpoint"],))
+            con.execute("DELETE FROM suscripciones WHERE fallos > 8")
+        con.commit()
+        con.close()
+        return False
+
+
+def avisar_a_usuario(usuario_id, titulo, cuerpo, url="/", etiqueta="lea"):
+    """Manda el aviso a todos los celulares de ese usuario."""
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones WHERE usuario_id=?",
+                       (usuario_id,)).fetchall()
+    con.close()
+    enviados = 0
+    for s in subs:
+        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
+            enviados += 1
+    return enviados
+
+
+def avisar_a_todos(titulo, cuerpo, url="/", etiqueta="general"):
+    """Aviso general: remates, torneos, novedades."""
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones").fetchall()
+    con.close()
+    enviados = 0
+    for s in subs:
+        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
+            enviados += 1
+    return enviados
+
+
+# ---------- CABALLOS SEGUIDOS ----------
+
+@app.get("/api/seguidos")
+def api_seguidos():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, seguidos=[])
+    con = db()
+    filas = con.execute("""
+        SELECT caballo_visible, perfil, creado_en FROM seguidos
+        WHERE usuario_id=? ORDER BY creado_en DESC
+    """, (u["id"],)).fetchall()
+    con.close()
+    return jsonify(ok=True, ingresado=True,
+                   seguidos=[dict(f) for f in filas])
+
+
+@app.post("/api/seguir")
+def api_seguir():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá una cuenta gratis para seguir caballos."), 401
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    if not nombre:
+        return jsonify(ok=False, error="Falta el nombre del caballo."), 400
+
+    clave = normalize_text(nombre)
+    con = db()
+    ya = con.execute("SELECT 1 FROM seguidos WHERE usuario_id=? AND caballo=?",
+                     (u["id"], clave)).fetchone()
+    if ya:
+        con.execute("DELETE FROM seguidos WHERE usuario_id=? AND caballo=?",
+                    (u["id"], clave))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, siguiendo=False,
+                       mensaje=f"Dejaste de seguir a {nombre}.")
+
+    con.execute("""
+        INSERT INTO seguidos(usuario_id, caballo, caballo_visible, perfil, creado_en)
+        VALUES(?,?,?,?,?)
+    """, (u["id"], clave, nombre, clean(d.get("perfil", "")),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, siguiendo=True,
+                   mensaje=f"Vas a recibir un aviso cuando {nombre} vuelva a correr.")
+
+
+def _ya_se_aviso(usuario_id, caballo, tipo, fecha, hipodromo):
+    con = db()
+    fila = con.execute("""
+        SELECT 1 FROM avisos_enviados
+        WHERE usuario_id=? AND caballo=? AND tipo=? AND fecha=? AND hipodromo=?
+    """, (usuario_id, caballo, tipo, fecha, hipodromo)).fetchone()
+    con.close()
+    return bool(fila)
+
+
+def _marcar_avisado(usuario_id, caballo, tipo, fecha, hipodromo):
+    con = db()
+    con.execute("""
+        INSERT OR IGNORE INTO avisos_enviados
+        (usuario_id, caballo, tipo, fecha, hipodromo, enviado_en)
+        VALUES(?,?,?,?,?,?)
+    """, (usuario_id, caballo, tipo, fecha, hipodromo,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+
+def revisar_caballos_seguidos():
+    """
+    Recorre las reuniones de hoy y de manana buscando caballos que alguien
+    sigue. Manda dos avisos distintos:
+      - cuando aparece inscripto en el boletin
+      - una hora antes de su carrera
+    Cada aviso se manda UNA sola vez por carrera.
+    """
+    if not hay_notificaciones():
+        return {"enviados": 0, "motivo": "faltan las claves"}
+
+    con = db()
+    seguidos = con.execute("""
+        SELECT s.usuario_id, s.caballo, s.caballo_visible
+        FROM seguidos s
+        JOIN suscripciones u ON u.usuario_id = s.usuario_id
+        GROUP BY s.usuario_id, s.caballo
+    """).fetchall()
+    con.close()
+    if not seguidos:
+        return {"enviados": 0, "motivo": "nadie sigue caballos todavia"}
+
+    buscados = {s["caballo"]: s for s in seguidos}
+    hoy = hoy_argentina()
+    ahora = ahora_argentina()
+    manana = (ahora + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return {"enviados": 0, "motivo": "no se pudo abrir el calendario"}
+
+    reuniones = [r for r in calendario if r["fecha"] in (hoy, manana)]
+    enviados = 0
+
+    for reunion in reuniones:
+        try:
+            soup = fetch(reunion["url"])
+            carreras = extract_races_from_meeting(soup)
+        except Exception:
+            continue
+
+        for c in carreras:
+            try:
+                data = parse_race(soup, c["numero"])
+            except Exception:
+                continue
+            if not data:
+                continue
+
+            for p in data.get("participantes", []):
+                clave = normalize_text(p.get("nombre", ""))
+                if clave not in buscados or p.get("retirado"):
+                    continue
+
+                seg = buscados[clave]
+                uid = seg["usuario_id"]
+                visible = seg["caballo_visible"]
+                hip = reunion["hipodromo"]
+                hora = c.get("hora", "")
+                enlace = f"/?fecha={reunion['fecha']}&hipodromo={quote_plus(hip)}"
+
+                # 1) Aviso de inscripcion
+                if not _ya_se_aviso(uid, clave, "inscripto", reunion["fecha"], hip):
+                    n = avisar_a_usuario(
+                        uid,
+                        f"{visible} corre el {reunion['fecha'][8:10]}/{reunion['fecha'][5:7]}",
+                        f"{hip} · {c['numero']}ª carrera"
+                        + (f" · {hora}" if hora else ""),
+                        enlace, "inscripto",
+                    )
+                    if n:
+                        _marcar_avisado(uid, clave, "inscripto", reunion["fecha"], hip)
+                        enviados += n
+
+                # 2) Aviso una hora antes
+                if reunion["fecha"] == hoy and hora:
+                    try:
+                        h, m = [int(x) for x in hora.split(":")]
+                        largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+                        faltan = (largada - ahora).total_seconds() / 60
+                    except Exception:
+                        faltan = None
+
+                    if faltan is not None and 0 < faltan <= 75:
+                        if not _ya_se_aviso(uid, clave, "una_hora", reunion["fecha"], hip):
+                            n = avisar_a_usuario(
+                                uid,
+                                f"{visible} corre en {int(faltan)} minutos",
+                                f"{hip} · {c['numero']}ª carrera · {hora}",
+                                enlace, "una_hora",
+                            )
+                            if n:
+                                _marcar_avisado(uid, clave, "una_hora",
+                                                reunion["fecha"], hip)
+                                enviados += n
+
+    return {"enviados": enviados, "reuniones_revisadas": len(reuniones)}
+
+
+def revision_de_avisos():
+    """
+    Tarea de fondo: revisa cada 15 minutos si hay que avisarle a alguien.
+    Cada 15 minutos porque el aviso de 'una hora antes' necesita precision.
+    """
+    time.sleep(90)
+    while True:
+        try:
+            revisar_caballos_seguidos()
+        except Exception:
+            pass
+        time.sleep(15 * 60)
+
+
+@app.post("/api/admin/avisar-a-todos")
+def admin_avisar_a_todos():
+    """Aviso general: remates, torneos, novedades."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    titulo = clean(d.get("titulo", ""))
+    cuerpo = clean(d.get("cuerpo", ""))
+    if not titulo:
+        return jsonify(ok=False, error="Falta el título del aviso."), 400
+    n = avisar_a_todos(titulo, cuerpo, clean(d.get("url", "/")) or "/")
+    return jsonify(ok=True, enviados=n,
+                   mensaje=f"Aviso enviado a {n} celular(es).")
+
+
+@app.post("/api/admin/probar-aviso")
+def admin_probar_aviso():
+    """Manda un aviso de prueba a los celulares del admin."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones ORDER BY creada_en DESC LIMIT 3").fetchall()
+    con.close()
+    if not subs:
+        return jsonify(ok=False,
+                       error="Todavía no hay ningún celular suscripto."), 404
+    n = sum(1 for s in subs
+            if enviar_aviso(dict(s), "Prueba de LEA WIN IA",
+                            "Si ves esto, los avisos funcionan.", "/", "prueba"))
+    return jsonify(ok=True, enviados=n,
+                   mensaje=f"Prueba enviada a {n} de {len(subs)} celular(es).")
+
+
+@app.get("/api/admin/estado-avisos")
+def admin_estado_avisos():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    subs = con.execute("SELECT COUNT(*) c FROM suscripciones").fetchone()["c"]
+    seg = con.execute("SELECT COUNT(*) c FROM seguidos").fetchone()["c"]
+    env = con.execute("SELECT COUNT(*) c FROM avisos_enviados").fetchone()["c"]
+    ultimos = con.execute("""
+        SELECT caballo, tipo, fecha, hipodromo, enviado_en
+        FROM avisos_enviados ORDER BY id DESC LIMIT 20
+    """).fetchall()
+    con.close()
+    return jsonify(
+        ok=True,
+        claves_cargadas=hay_notificaciones(),
+        celulares_suscriptos=subs,
+        caballos_seguidos=seg,
+        avisos_enviados=env,
+        ultimos=[dict(u) for u in ultimos],
+    )
+
+
+@app.get("/sw.js")
+def service_worker():
+    """
+    El archivo que recibe los avisos. Tiene que servirse desde la raiz,
+    si no el navegador no le permite trabajar en toda la app.
+    """
+    from flask import send_from_directory
+    resp = send_from_directory("static", "sw.js", mimetype="application/javascript")
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/manifest.json")
+def manifiesto():
+    """
+    Permite instalar la app en la pantalla de inicio del celular.
+    En iPhone esto es OBLIGATORIO para que lleguen los avisos.
+    """
+    return jsonify({
+        "name": "LEA WIN IA",
+        "short_name": "LEA WIN",
+        "description": "Pronóstico de carreras del Stud Book Argentino",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#153832",
+        "theme_color": "#153832",
+        "orientation": "portrait",
+        "icons": [
+            {"src": "/static/icono-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icono-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    })
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
@@ -3348,6 +3793,10 @@ init_db()
 
 if os.getenv("REVISION_AUTOMATICA", "1") == "1":
     threading.Thread(target=revision_diaria, daemon=True).start()
+
+# Revision de avisos: cada 15 minutos, para que el "una hora antes" llegue a tiempo.
+if os.getenv("AVISOS_AUTOMATICOS", "1") == "1":
+    threading.Thread(target=revision_de_avisos, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
