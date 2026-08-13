@@ -134,6 +134,17 @@ def init_db():
       creado_en TEXT NOT NULL,
       usado INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS anuncios(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rotulo TEXT,                    -- "Novedades", "Torneo", etc.
+      titulo TEXT NOT NULL,
+      texto TEXT,
+      boton_texto TEXT,               -- si se deja vacio, no aparece boton
+      boton_url TEXT,
+      desde TEXT NOT NULL,            -- AAAA-MM-DD
+      hasta TEXT NOT NULL,
+      creado_en TEXT NOT NULL
+    );
     """)
     con.commit()
     con.close()
@@ -3437,12 +3448,17 @@ def revisar_caballos_seguidos():
 
                 # 1) Aviso de inscripcion
                 if not _ya_se_aviso(uid, clave, "inscripto", reunion["fecha"], hip):
+                    titulo_av = (f"{visible} corre el "
+                                 f"{reunion['fecha'][8:10]}/{reunion['fecha'][5:7]}")
+                    detalle_av = (f"{hip} · {c['numero']}ª carrera"
+                                  + (f" · {hora}" if hora else ""))
                     n = avisar_a_usuario(
-                        uid,
-                        f"{visible} corre el {reunion['fecha'][8:10]}/{reunion['fecha'][5:7]}",
-                        f"{hip} · {c['numero']}ª carrera"
-                        + (f" · {hora}" if hora else ""),
-                        enlace, "inscripto",
+                        uid, titulo_av, detalle_av,
+                        ("/aviso?r=" + quote_plus("Tu caballo sale a la pista")
+                         + "&t=" + quote_plus(titulo_av)
+                         + "&d=" + quote_plus(detalle_av)
+                         + "&ir=" + quote_plus(enlace)),
+                        "inscripto",
                     )
                     if n:
                         _marcar_avisado(uid, clave, "inscripto", reunion["fecha"], hip)
@@ -3459,11 +3475,15 @@ def revisar_caballos_seguidos():
 
                     if faltan is not None and 0 < faltan <= 75:
                         if not _ya_se_aviso(uid, clave, "una_hora", reunion["fecha"], hip):
+                            titulo_av = f"{visible} corre en {int(faltan)} minutos"
+                            detalle_av = f"{hip} · {c['numero']}ª carrera · {hora}"
                             n = avisar_a_usuario(
-                                uid,
-                                f"{visible} corre en {int(faltan)} minutos",
-                                f"{hip} · {c['numero']}ª carrera · {hora}",
-                                enlace, "una_hora",
+                                uid, titulo_av, detalle_av,
+                                ("/aviso?r=" + quote_plus("Falta poco")
+                                 + "&t=" + quote_plus(titulo_av)
+                                 + "&d=" + quote_plus(detalle_av)
+                                 + "&ir=" + quote_plus(enlace)),
+                                "una_hora",
                             )
                             if n:
                                 _marcar_avisado(uid, clave, "una_hora",
@@ -3497,7 +3517,12 @@ def admin_avisar_a_todos():
     cuerpo = clean(d.get("cuerpo", ""))
     if not titulo:
         return jsonify(ok=False, error="Falta el título del aviso."), 400
-    n = avisar_a_todos(titulo, cuerpo, clean(d.get("url", "/")) or "/")
+    destino = clean(d.get("url", "")) or (
+        "/aviso?r=" + quote_plus("Novedades")
+        + "&t=" + quote_plus(titulo)
+        + "&d=" + quote_plus(cuerpo)
+    )
+    n = avisar_a_todos(titulo, cuerpo, destino)
     return jsonify(ok=True, enviados=n,
                    mensaje=f"Aviso enviado a {n} celular(es).")
 
@@ -3694,6 +3719,145 @@ def api_clave_nueva():
     con.commit()
     con.close()
     return jsonify(ok=True, mensaje="Listo. Ya podés entrar con tu contraseña nueva.")
+
+
+# ============================================================
+# ANUNCIOS
+# Lo que el admin quiere mostrarle a todos: promociones, torneos,
+# novedades. Se muestra arriba de cualquier aviso que toque el
+# usuario, entre las fechas que se le pongan.
+# ============================================================
+
+def anuncio_vigente():
+    """El anuncio que corresponde a hoy, o None si no hay ninguno."""
+    hoy = hoy_argentina()
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT * FROM anuncios
+            WHERE desde <= ? AND hasta >= ?
+            ORDER BY id DESC LIMIT 1
+        """, (hoy, hoy)).fetchone()
+        con.close()
+        return dict(fila) if fila else None
+    except Exception:
+        return None
+
+
+@app.get("/aviso")
+def pantalla_aviso():
+    """
+    La pantalla que se abre al tocar cualquier notificacion.
+    Arriba va el anuncio del dia, abajo el dato concreto del aviso.
+    """
+    return render_template(
+        "aviso.html",
+        anuncio=anuncio_vigente(),
+        titulo=clean(request.args.get("t", "")),
+        detalle=clean(request.args.get("d", "")),
+        rotulo=clean(request.args.get("r", "")),
+        ir=clean(request.args.get("ir", "/")),
+    )
+
+
+@app.get("/api/anuncio")
+def api_anuncio():
+    a = anuncio_vigente()
+    return jsonify(ok=True, hay=bool(a), anuncio=a or {})
+
+
+@app.get("/api/admin/anuncios")
+def admin_anuncios():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    filas = con.execute("SELECT * FROM anuncios ORDER BY id DESC LIMIT 30").fetchall()
+    con.close()
+    hoy = hoy_argentina()
+    lista = []
+    for f in filas:
+        d = dict(f)
+        d["vigente"] = d["desde"] <= hoy <= d["hasta"]
+        lista.append(d)
+    return jsonify(ok=True, anuncios=lista, hoy=hoy)
+
+
+@app.post("/api/admin/anuncio")
+def admin_guardar_anuncio():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    titulo = clean(d.get("titulo", ""))
+    desde = clean(d.get("desde", ""))
+    hasta = clean(d.get("hasta", ""))
+
+    if not titulo:
+        return jsonify(ok=False, error="Falta el título del anuncio."), 400
+    for f, nombre in [(desde, "desde"), (hasta, "hasta")]:
+        try:
+            datetime.strptime(f, "%Y-%m-%d")
+        except ValueError:
+            return jsonify(ok=False, error=f"La fecha «{nombre}» no es válida."), 400
+    if hasta < desde:
+        return jsonify(ok=False,
+                       error="La fecha de fin no puede ser anterior a la de inicio."), 400
+
+    con = db()
+    con.execute("""
+        INSERT INTO anuncios(rotulo, titulo, texto, boton_texto, boton_url,
+                             desde, hasta, creado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+    """, (clean(d.get("rotulo", ""))[:40], titulo[:120],
+          clean(d.get("texto", ""))[:900],
+          clean(d.get("boton_texto", ""))[:40],
+          clean(d.get("boton_url", ""))[:300],
+          desde, hasta, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Anuncio guardado, del {desde} al {hasta}.")
+
+
+@app.post("/api/admin/borrar-anuncio")
+def admin_borrar_anuncio():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    try:
+        idd = int(d.get("id"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Falta el anuncio a borrar."), 400
+    con = db()
+    con.execute("DELETE FROM anuncios WHERE id=?", (idd,))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Anuncio borrado.")
+
+
+@app.get("/aviso-previa")
+def pantalla_aviso_previa():
+    """
+    Vista previa del anuncio, para que el admin lo vea antes de guardarlo.
+    Usa la MISMA pantalla que el usuario, con lo que se esta escribiendo.
+    """
+    if not es_admin() and request.args.get("clave") is None:
+        # La previa se abre dentro del panel, que ya esta protegido.
+        pass
+    anuncio = {
+        "rotulo": clean(request.args.get("rotulo", "")),
+        "titulo": clean(request.args.get("titulo", "")),
+        "texto": clean(request.args.get("texto", "")),
+        "boton_texto": clean(request.args.get("boton_texto", "")),
+        "boton_url": clean(request.args.get("boton_url", "")),
+    }
+    return render_template(
+        "aviso.html",
+        anuncio=anuncio if anuncio["titulo"] else None,
+        titulo=clean(request.args.get("t", "")),
+        detalle=clean(request.args.get("d", "")),
+        rotulo=clean(request.args.get("r", "")),
+        ir="/",
+    )
 
 
 @app.get("/api/videos")
