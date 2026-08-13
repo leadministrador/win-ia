@@ -1,23 +1,9 @@
+
 from flask import Flask, render_template, request, jsonify
-import requests, re, sqlite3, json, os, time, threading, hashlib, secrets
-from concurrent.futures import ThreadPoolExecutor
+import requests, re, sqlite3, json, os, time, threading
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus, quote
-from datetime import datetime, timedelta, timezone
-
-# El servidor de Render trabaja en horario UTC, que va 3 horas adelante de
-# Argentina. Sin esto, la app da por corridas carreras que todavia no salieron.
-HUSO_ARGENTINA = timezone(timedelta(hours=-3))
-
-def ahora_argentina():
-    """La hora de Argentina, sin importar donde este el servidor."""
-    return datetime.now(HUSO_ARGENTINA)
-
-def hoy_argentina():
-    return ahora_argentina().strftime("%Y-%m-%d")
-
-def hora_argentina():
-    return ahora_argentina().strftime("%H:%M")
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 BASE = "https://www.studbook.org.ar"
@@ -31,7 +17,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
 
-def fetch(url):
+def fetch(u
     r = requests.get(url, headers=HEADERS, timeout=(4, 8))
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
@@ -75,58 +61,6 @@ def init_db():
       clave TEXT PRIMARY KEY,
       valor REAL NOT NULL,
       actualizado_en TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS condiciones(
-      fecha TEXT NOT NULL,
-      hipodromo TEXT NOT NULL,
-      pista TEXT, estado TEXT, viento TEXT, clima TEXT,
-      observaciones TEXT,
-      cargado_en TEXT NOT NULL,
-      PRIMARY KEY(fecha, hipodromo)
-    );
-    CREATE TABLE IF NOT EXISTS usuarios(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      usuario TEXT NOT NULL UNIQUE,       -- en minusculas, para no repetir
-      usuario_visible TEXT NOT NULL,      -- como lo escribio el
-      clave_hash TEXT NOT NULL,
-      telefono TEXT,                      -- opcional, para recuperar la clave
-      email TEXT,                         -- opcional
-      creado_en TEXT NOT NULL,
-      ultimo_ingreso TEXT,
-      bloqueado INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS sesiones(
-      token TEXT PRIMARY KEY,
-      usuario_id INTEGER NOT NULL,
-      creada_en TEXT NOT NULL,
-      ultima_vez TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS suscripciones(
-      endpoint TEXT PRIMARY KEY,      -- la direccion del celular
-      usuario_id INTEGER,
-      p256dh TEXT NOT NULL,           -- claves que da el navegador
-      auth TEXT NOT NULL,
-      creada_en TEXT NOT NULL,
-      ultimo_aviso TEXT,
-      fallos INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS seguidos(
-      usuario_id INTEGER NOT NULL,
-      caballo TEXT NOT NULL,          -- en minusculas, para no repetir
-      caballo_visible TEXT NOT NULL,
-      perfil TEXT,
-      creado_en TEXT NOT NULL,
-      PRIMARY KEY(usuario_id, caballo)
-    );
-    CREATE TABLE IF NOT EXISTS avisos_enviados(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      usuario_id INTEGER,
-      caballo TEXT,
-      tipo TEXT NOT NULL,             -- inscripto | una_hora | general
-      fecha TEXT,                     -- fecha de la carrera
-      hipodromo TEXT,
-      enviado_en TEXT NOT NULL,
-      UNIQUE(usuario_id, caballo, tipo, fecha, hipodromo)
     );
     """)
     con.commit()
@@ -180,37 +114,12 @@ def con_cache(clave, ttl_seg, forzar, fetch_fn):
         raise
 
 def extract_races_from_meeting(soup):
-    """
-    Lee las carreras de una reunion. Ademas del numero y el titulo,
-    saca la HORA, que hace falta para saber cual es la proxima a correrse.
-    """
     races = []
-    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
-        texto = clean(h.get_text(" "))
-        m = re.search(r"(\d+)\s*[º°ª]?\s*Carrera\b", texto, re.I)
-        if not m:
-            continue
-        # La hora viene en el mismo titulo: "1º Carrera - 13:30"
-        mh = re.search(r"(\d{1,2}):(\d{2})", texto)
-        hora = ""
-        if mh:
-            h_, mi = int(mh.group(1)), int(mh.group(2))
-            if 0 <= h_ <= 23 and 0 <= mi <= 59:
-                hora = f"{h_:02d}:{mi:02d}"
-        races.append({
-            "numero": int(m.group(1)),
-            "titulo": texto,
-            "hora": hora,
-        })
-    # Sin repetidos, en orden de numero.
-    vistos, unicas = set(), []
-    for r in races:
-        if r["numero"] in vistos:
-            continue
-        vistos.add(r["numero"])
-        unicas.append(r)
-    unicas.sort(key=lambda r: r["numero"])
-    return unicas
+    for h in soup.find_all(["h2","h3"]):
+        m = re.search(r"(\d+)\s*[º°ª]?\s*Carrera\b", clean(h.get_text(" ")), re.I)
+        if m:
+            races.append({"numero": int(m.group(1)), "titulo": clean(h.get_text(" "))})
+    return races
 
 def _cell_text(cell):
     return clean(cell.get_text(" ", strip=True))
@@ -226,14 +135,6 @@ def _map_headers(header_cells):
     """
     idx = {}
     kg_positions = []
-    # En la tabla de RESULTADOS el puesto es la primera 'P'. En la de PROGRAMA
-    # no hay puesto, y esa 'P' es el pelaje. Se distinguen porque la de
-    # resultados trae columnas que la otra no tiene.
-    hay_resultado = any(
-        _cell_text(c).lower().rstrip(".") in ("cpos", "acum", "pago")
-        for c in header_cells
-    )
-    p_usada = False
     for i, cell in enumerate(header_cells):
         h = _cell_text(cell).lower().rstrip(".")
         if h == "ejemplar" and "nombre" not in idx:
@@ -242,16 +143,12 @@ def _map_headers(header_cells):
             idx["jockey"] = i
         elif h == "entrenador" and "entrenador" not in idx:
             idx["entrenador"] = i
-        elif h.startswith("caballeriza") and "caballeriza" not in idx:
+        elif h == "caballeriza" and "caballeriza" not in idx:
             idx["caballeriza"] = i
         elif h == "o" and "numero" not in idx:
             idx["numero"] = i
-        elif h == "p" and not p_usada:
-            p_usada = True
-            if hay_resultado:
-                idx["puesto"] = i      # tabla de resultados
-            else:
-                idx["pelaje"] = i      # tabla de programa
+        elif h == "p" and "puesto" not in idx:
+            idx["puesto"] = i          # el primer 'P' es el puesto final
         elif h == "e" and "edad" not in idx:
             idx["edad"] = i
         elif h == "s" and "sexo" not in idx:
@@ -264,10 +161,6 @@ def _map_headers(header_cells):
             idx["acumulado"] = i
         elif h == "pago":
             idx["pago"] = i
-        elif "ultimas" in h or "últimas" in h:
-            idx["ultimas"] = i
-        elif "campa" in h:
-            idx["campana_resumen"] = i
 
     # Resolver cual de los dos 'Kg' es el peso que lleva encima.
     jockey_i = idx.get("jockey")
@@ -322,14 +215,6 @@ def _parse_participants_table(table):
         if not name:
             continue
 
-        # El sitio marca al retirado DENTRO del nombre: "NOMBRE (RETIRADO)".
-        # Hay que sacarlo del nombre y anotarlo aparte.
-        texto_celda = _cell_text(name_cell)
-        retirado_aqui = bool(re.search(r"\(\s*RETIRADO\s*\)", texto_celda, re.I))
-        name = re.sub(r"\s*\(\s*RETIRADO\s*\)\s*", "", name, flags=re.I).strip()
-        if not name:
-            continue
-
         def col(key):
             i = idx.get(key)
             if i is None or i >= len(cells):
@@ -338,33 +223,6 @@ def _parse_participants_table(table):
 
         peso = col("peso").replace(",", ".")
         peso = peso if re.fullmatch(r"\d{2}(\.\d)?", peso or "") else ""
-
-        # "8 últimas": trae la forma reciente (1S1S) y los dias sin correr.
-        celda_ultimas = col("ultimas")
-        forma = ""
-        dias_sin_correr = None
-        if celda_ultimas:
-            m_dias = re.search(r"\((\d+)\s*d[ií]as?\)", celda_ultimas, re.I)
-            if m_dias:
-                dias_sin_correr = int(m_dias.group(1))
-            # La forma son letras y numeros pegados, antes del parentesis.
-            m_forma = re.match(r"\s*([0-9A-Za-z]+)", celda_ultimas)
-            if m_forma and not m_forma.group(1).isdigit():
-                forma = m_forma.group(1)
-
-        # "Campaña (efect.)": 6 - 2 - 2 - 0 - 2 - 0 - 0 (33.3%) - $ 25.165.500
-        celda_campana = col("campana_resumen")
-        campana_nums, efectividad, ganado = [], "", ""
-        if celda_campana:
-            m_n = re.match(r"\s*((?:\d+\s*-\s*)+\d+)", celda_campana)
-            if m_n:
-                campana_nums = [int(x) for x in re.findall(r"\d+", m_n.group(1))]
-            m_e = re.search(r"\(([\d.,]+)\s*%\)", celda_campana)
-            if m_e:
-                efectividad = m_e.group(1) + "%"
-            m_g = re.search(r"\$\s*([\d.,]+)", celda_campana)
-            if m_g:
-                ganado = "$" + m_g.group(1)
 
         numero_raw = col("numero")
         numero = int(numero_raw) if numero_raw.isdigit() else None
@@ -394,90 +252,11 @@ def _parse_participants_table(table):
             "puesto": puesto,
             "cuerpos": col("cuerpos"),
             "acumulado": col("acumulado"),
-            "pago": col("pago"),
             "detalle": " · ".join(p for p in detalle_partes if p)[:700],
-            "retirado": retirado_aqui,
-            # Datos de la tabla PROGRAMA
-            "forma": forma,                    # las ultimas, ej "4P1P2S"
-            "dias_sin_correr": dias_sin_correr,
-            "campana_nums": campana_nums,      # corridas, 1os, 2os, 3os...
-            "efectividad": efectividad,
-            "ganado": ganado,
+            "retirado": False,
         })
 
     return participants
-
-
-def _rendimientos_de_la_carrera(soup):
-    """
-    Lee el rendimiento de jockey, entrenador y caballeriza que publica el
-    Stud Book al costado de cada carrera. Vienen en dos formatos:
-        Año: 603 C / 146 G      /      Año: 146 CC / 18 CG - (12.3%)
-        SIS: 278 C / 71 G       /      ARG: 76 CC / 10 CG - (13.2%)
-    La sigla es el hipodromo: ese numero vale mas que el general, porque
-    dice como le va EN ESA PISTA.
-    Devuelve {nombre en minusculas: {corridas, ganadas, pct, ...}}
-    """
-    texto = re.sub(r"[ \t]+", " ", soup.get_text("\n"))
-    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
-
-    # "Año: 603 C / 146 G"  o  "Año: 146 CC / 18 CG - (12.3%)"
-    re_anio = re.compile(r"^A\w*o\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G", re.I)
-    # "SIS: 278 C / 71 G"  — la sigla es el hipodromo
-    re_hip = re.compile(r"^([A-Za-z]{2,5})\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G")
-
-    rendimientos = {}
-    for i, linea in enumerate(lineas):
-        m = re_anio.match(linea)
-        if not m or i == 0:
-            continue
-        nombre = clean(lineas[i - 1])
-        # La linea anterior tiene que ser un nombre, no otro dato.
-        if not nombre or len(nombre) < 3 or ":" in nombre:
-            continue
-
-        corridas, ganadas = int(m.group(1)), int(m.group(2))
-        dato = {
-            "corridas_anio": corridas,
-            "ganadas_anio": ganadas,
-            "pct_anio": round(ganadas / corridas * 100, 1) if corridas else 0.0,
-        }
-        if i + 1 < len(lineas):
-            mh = re_hip.match(lineas[i + 1])
-            # Que no sea otra vez la linea del año.
-            if mh and not re_anio.match(lineas[i + 1]):
-                c_h, g_h = int(mh.group(2)), int(mh.group(3))
-                dato["hipodromo"] = mh.group(1).upper()
-                dato["corridas_hip"] = c_h
-                dato["ganadas_hip"] = g_h
-                dato["pct_hip"] = round(g_h / c_h * 100, 1) if c_h else 0.0
-
-        rendimientos[normalize_text(nombre)] = dato
-    return rendimientos
-
-
-def _buscar_rendimiento(rendimientos, nombre):
-    """
-    Busca el rendimiento de una persona. Los nombres no siempre coinciden
-    exactamente: en la tabla dice "Candia Gutierrez E." y al costado
-    "Candia Gutierrez Elvio G.". Se compara por las primeras palabras.
-    """
-    if not nombre or not rendimientos:
-        return None
-    clave = normalize_text(nombre).replace(".", "").replace("-", " ").strip()
-    if clave in rendimientos:
-        return rendimientos[clave]
-
-    palabras = [p for p in clave.split() if len(p) > 2]
-    if not palabras:
-        return None
-    # El apellido y el nombre alcanzan para reconocerlo.
-    inicio = " ".join(palabras[:2])
-    for k, v in rendimientos.items():
-        limpio = k.replace(".", "").replace("-", " ")
-        if limpio.startswith(inicio) or inicio in limpio:
-            return v
-    return None
 
 
 def parse_race(soup, numero):
@@ -526,8 +305,7 @@ def parse_race(soup, numero):
         tablas_vistas.add(id(node))
         filas = _parse_participants_table(node)
         for fila in filas:
-            # Si ya venía marcado en el nombre, se respeta.
-            fila["retirado"] = fila.get("retirado") or en_retirados
+            fila["retirado"] = en_retirados
         if filas:
             participants.extend(filas)
 
@@ -540,17 +318,6 @@ def parse_race(soup, numero):
         unicos.append(p)
     participants = unicos
 
-    # Rendimiento de jockey, entrenador y caballeriza, que el sitio publica
-    # al costado de la carrera.
-    rendimientos = _rendimientos_de_la_carrera(soup)
-    for p in participants:
-        for quien, campo in [("jockey", "jockey"),
-                             ("entrenador", "entrenador"),
-                             ("caballeriza", "caballeriza")]:
-            r = _buscar_rendimiento(rendimientos, p.get(campo, ""))
-            if r:
-                p[f"rend_{quien}"] = r
-
     return {
         "carrera": numero,
         "premio": get(r"Premio:\s*(.+?)\s+Distancia:"),
@@ -561,22 +328,6 @@ def parse_race(soup, numero):
         "categoria": get(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)"),
         "participantes": participants
     }
-
-
-# Codigos que usa el Stud Book en la ficha del caballo, comprobados en el sitio.
-CODIGOS_HIPODROMO = {
-    "ARG": "Palermo", "SIS": "San Isidro", "LPA": "La Plata",
-    "ROS": "Rosario", "TAN": "Tandil", "DOL": "Dolores",
-    "AZL": "Azul", "TUC": "Tucumán", "SLU": "La Punta",
-    "CBA": "Córdoba", "MZA": "Mendoza", "SFE": "Santa Fe",
-    "NQN": "Neuquén", "SR": "San Rafael", "TDL": "Tandil",
-    "LP": "La Plata", "SI": "San Isidro",
-}
-
-def nombre_hipodromo(codigo):
-    """Devuelve el nombre del hipodromo a partir de su codigo."""
-    c = clean(codigo).upper()
-    return CODIGOS_HIPODROMO.get(c, codigo)
 
 
 def _tabla_carreras_del_perfil(soup):
@@ -600,15 +351,8 @@ def _tabla_carreras_del_perfil(soup):
 
         idx = {}
         for i, h in enumerate(encabezados):
-            # OJO con el orden de estas condiciones. Comprobado en el sitio,
-            # los encabezados son:
-            #   Hip. | N° | O | Dist. | Tiempo | Premio | Cat. | Cond. |
-            #   P | E | Kg | Jockey | Caballeriza | Pos. | Importe | Pago
-            # 'Pos.' es el PUESTO de llegada. 'N°' es el numero de reunion
-            # y 'O' el numero que llevo el caballo. No confundirlos.
-            if h.startswith("pos") and "puesto" not in idx: idx["puesto"] = i
-            elif "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
-            elif h in ("n°", "n", "nº") and "reunion" not in idx: idx["reunion"] = i
+            if "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
+            elif h in ("n°", "n", "nº") and "puesto" not in idx: idx["puesto"] = i
             elif h == "o" and "numero" not in idx: idx["numero"] = i
             elif "dist" in h and "distancia" not in idx: idx["distancia"] = i
             elif "tiempo" in h and "tiempo" not in idx: idx["tiempo"] = i
@@ -620,8 +364,6 @@ def _tabla_carreras_del_perfil(soup):
             elif h == "kg" and "kilos" not in idx: idx["kilos"] = i
             elif "jockey" in h and "jockey" not in idx: idx["jockey"] = i
             elif "caballeriza" in h and "caballeriza" not in idx: idx["caballeriza"] = i
-            elif "importe" in h and "importe" not in idx: idx["importe"] = i
-            elif h == "pago" and "pago" not in idx: idx["pago"] = i
 
         filas = []
         for tr in table.find_all("tr"):
@@ -656,11 +398,9 @@ def _tabla_carreras_del_perfil(soup):
             puesto_txt = col("puesto")
             filas.append({
                 "fecha": m_fecha.group(1),
-                "hipodromo": nombre_hipodromo(col("hipodromo")),
-                "hipodromo_codigo": col("hipodromo"),
+                "hipodromo": col("hipodromo"),
                 "puesto": int(puesto_txt) if puesto_txt.isdigit() else None,
                 "numero": col("numero"),
-                "reunion": col("reunion"),
                 "distancia": col("distancia"),
                 "tiempo": col("tiempo"),
                 "premio": col("premio"),
@@ -671,8 +411,6 @@ def _tabla_carreras_del_perfil(soup):
                 "kilos": col("kilos"),
                 "jockey": col("jockey"),
                 "caballeriza": col("caballeriza"),
-                "importe": col("importe"),
-                "pago": col("pago"),
                 "video": video,
                 "enlace": enlace_carrera,
             })
@@ -765,21 +503,10 @@ def detalle_de_carrera(url_carrera):
         return cacheado or {}
 
 
-TTL_FICHA_CABALLO = 6 * 60 * 60   # 6 horas: la campaña no cambia en el día
-
-
 def enrich_horse(horse):
     profile = horse.get("perfil", "")
     if not profile:
         return horse
-
-    # Si ya se consultó hace poco, se usa lo guardado y no se vuelve a pedir.
-    clave = f"ficha:{profile}"
-    guardada, fresca = cache_get(clave, TTL_FICHA_CABALLO)
-    if guardada is not None and fresca:
-        horse.update(guardada)
-        return horse
-
     try:
         soup = fetch(profile)
         texto = clean(soup.get_text(" "))
@@ -790,19 +517,6 @@ def enrich_horse(horse):
 
         carreras = _tabla_carreras_del_perfil(soup)
         horse["carreras"] = carreras[:20]
-
-        # El estado de la pista de cada carrera viene como codigo ("5", "A").
-        # Para que el algoritmo pueda compararlo con la pista del dia hace
-        # falta la palabra. Se traen las 4 mas recientes, TODAS JUNTAS.
-        recientes = [c for c in horse["carreras"][:4] if c.get("enlace")]
-        if recientes:
-            def traer(c):
-                try:
-                    c.update(detalle_de_carrera(c["enlace"]))
-                except Exception:
-                    pass
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                list(pool.map(traer, recientes))
 
         # Contadores para el pronostico y para mostrar.
         puestos = [c["puesto"] for c in carreras if c["puesto"]]
@@ -816,22 +530,11 @@ def enrich_horse(horse):
             for c in carreras if c["puesto"]
         ][:20]
         horse["campana"] = resumen.get("logro", "")
-        horse["cargado"] = True
-
-        # Guardar solo lo que se trajo del Stud Book, para no volver a pedirlo.
-        cache_set(clave, {
-            k: horse[k] for k in
-            ("sexo", "edad", "nacimiento", "padre", "madre", "logro",
-             "carreras", "victorias", "podios", "corridas",
-             "actuaciones", "campana", "cargado")
-            if k in horse
-        })
     except Exception:
         horse.setdefault("sexo", "")
         horse.setdefault("campana", "")
         horse.setdefault("actuaciones", [])
         horse.setdefault("carreras", [])
-        horse["cargado"] = True   # se intentó; no queda "cargando" para siempre
     return horse
 
 # ============================================================
@@ -848,13 +551,6 @@ PESOS_INICIALES = {
     "victoria_reciente": 4.0,
     "podio_reciente": 2.0,
     "pista_compatible": 7.0,
-    # Rendimiento de la gente que rodea al caballo. Empiezan sin castigar
-    # al que no gana: el aprendizaje decide despues si conviene castigarlo.
-    "jockey_ganador": 8.0,
-    "jockey_en_esa_pista": 5.0,
-    "jockey_sin_ganar": 0.0,
-    "entrenador_ganador": 5.0,
-    "caballeriza_ganadora": 3.0,
 }
 
 def cargar_pesos():
@@ -891,31 +587,14 @@ def score_horse(h, context, pesos=None):
     campaign = h.get("campana", "").lower()
     detail = h.get("detalle", "").lower()
 
-    # La campaña puede venir de dos lados: de la ficha del caballo, o del
-    # programa de la carrera. Se toma la que esté disponible.
-    nums = h.get("campana_nums") or []
-    if len(nums) >= 4 and not h.get("corridas"):
-        # [corridas, 1os, 2os, 3os, 4os, 5os, NP]
-        h = dict(h)
-        h["corridas"] = nums[0]
-        h["victorias"] = nums[1]
-        h["podios"] = nums[1] + nums[2] + nums[3]
-
-    # Estos dos suman puntaje pero NO se anuncian: los cumple casi cualquier
-    # caballo con campaña, y como motivo no le dicen nada al usuario.
     if acts:
         score += min(14, len(acts) * P["campana_disponible"])
+        reasons.append("tiene campaña reciente disponible")
     if "ganador" in campaign or "ganadora" in campaign:
-        score += P["registra_victorias"]
-    corridas = h.get("corridas")
-    es_debutante = (corridas == 0) if isinstance(corridas, int) else (not acts)
-    if "debut" in campaign or es_debutante:
+        score += P["registra_victorias"]; reasons.append("registra victorias")
+    if "debut" in campaign or not acts:
         score += 1
-        reasons.append("debuta o tiene historial limitado")
-    elif isinstance(corridas, int) and corridas > 0:
-        # Premia la experiencia, con tope.
-        score += min(8, corridas * 0.7)
-        reasons.append(f"{corridas} carreras corridas")
+        reasons.append("debutante o historial limitado: se mantiene sin penalización fuerte")
     if any(x in campaign for x in ["palermo","san isidro","la plata"]):
         score += P["hipodromos_principales"]
         reasons.append("experiencia en hipódromos principales")
@@ -951,185 +630,12 @@ def score_horse(h, context, pesos=None):
         score += min(6, (podios - victorias) * P["podio_reciente"])
         reasons.append(f"{podios} llegada(s) entre los tres primeros")
 
-    # Pista exigente: se premia el antecedente en ESE estado.
-    # El dato correcto esta en cada carrera de la campana (campo 'estado'),
-    # NO en la frase resumen, donde nunca figura el tipo de piso.
-    estado_dia = context.get("estado") or context.get("pista_dia") or ""
-    if estado_dia:
-        clave_estado = normalize_text(estado_dia)
-        PARECIDOS = {
-            "pesada": ["barrosa", "humeda"],
-            "barrosa": ["pesada", "humeda"],
-            "humeda": ["pesada", "barrosa"],
-            "liviana": ["normal"],
-            "normal": ["liviana"],
-        }
-
-        # Como le fue en ese estado de pista, y en los parecidos.
-        exactas, parecidas = [], []
-        for c in h.get("carreras", []):
-            est = normalize_text(c.get("estado_txt") or c.get("estado") or "")
-            if not est or not c.get("puesto"):
-                continue
-            if est == clave_estado:
-                exactas.append(c["puesto"])
-            elif est in PARECIDOS.get(clave_estado, []):
-                parecidas.append(c["puesto"])
-
-        def rinde_bien(puestos):
-            # Entro entre los tres primeros en al menos un tercio de esas salidas.
-            if not puestos:
-                return False
-            return sum(1 for p in puestos if p <= 3) >= max(1, len(puestos) / 3)
-
-        if exactas:
-            if rinde_bien(exactas):
-                score += P["pista_compatible"]
-                reasons.append(
-                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} y anduvo bien")
-            else:
-                score -= P["pista_compatible"] * 0.6
-                reasons.append(
-                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} sin buen resultado")
-        elif parecidas and rinde_bien(parecidas):
-            score += P["pista_compatible"] * 0.5
-            reasons.append(f"anduvo bien en pista parecida a {estado_dia.lower()}")
-
-        # Respaldo: si no hay campana cargada, se mira la frase resumen.
-        elif not h.get("carreras"):
-            if clave_estado in normalize_text(campaign + " " + detail):
-                score += P["pista_compatible"] * 0.5
-                reasons.append(f"antecedente en pista {estado_dia.lower()}")
-
-    # Viento en contra: castiga a los que llevan más peso que el promedio.
-    if context.get("viento") == "En contra" and peso_propio is not None:
-        if pesos_carrera and peso_propio > (sum(pesos_carrera)/len(pesos_carrera)):
-            score += P["peso_pesado"] * 0.6
-            reasons.append("viento en contra y lleva peso por encima del promedio")
-
-    # Césped: es una superficie muy distinta, el que nunca corrió ahí arranca en desventaja.
-    if normalize_text(context.get("pista", "")).startswith("cesped"):
-        en_cesped = [c for c in h.get("carreras", [])
-                     if "cesped" in normalize_text(c.get("pista_txt") or c.get("pista") or "")]
-        if h.get("carreras") and not en_cesped:
-            score -= P["pista_compatible"] * 0.5
-            reasons.append("nunca corrió en césped")
-        elif en_cesped:
-            score += P["pista_compatible"] * 0.4
-            reasons.append(f"tiene {len(en_cesped)} carrera(s) en césped")
-
-    # --- Datos del programa: forma reciente, descanso y efectividad ---
-    # Vienen de la tabla que publica el Stud Book antes de cada carrera.
-
-    # "8 últimas": los numeros son los puestos, del mas reciente al mas viejo.
-    forma = h.get("forma", "")
-    if forma:
-        puestos_recientes = [int(x) for x in re.findall(r"\d", forma)][:6]
-        if puestos_recientes:
-            buenos = sum(1 for p in puestos_recientes if p <= 3)
-            if buenos >= len(puestos_recientes) * 0.6:
-                score += P["podio_reciente"] * 2
-                reasons.append(
-                    f"viene fino: {buenos} de sus últimas {len(puestos_recientes)} entre los tres primeros")
-            elif buenos == 0:
-                score -= P["podio_reciente"] * 1.5
-                reasons.append("no entra entre los tres primeros hace varias salidas")
-            # La ultima carrera pesa mas que las anteriores.
-            if puestos_recientes[0] == 1:
-                score += P["victoria_reciente"] * 0.8
-                reasons.append("ganó su última carrera")
-
-    # Días sin correr: muy poco descanso o demasiado, los dos restan.
-    dias = h.get("dias_sin_correr")
-    if isinstance(dias, int):
-        if dias < 10:
-            score -= 2
-            reasons.append(f"corrió hace apenas {dias} días")
-        elif 15 <= dias <= 45:
-            score += 3
-            reasons.append(f"descanso justo: {dias} días")
-        elif dias > 120:
-            score -= 4
-            reasons.append(f"hace {dias} días que no corre")
-
-    # Efectividad: el porcentaje de carreras ganadas que publica el sitio.
-    efec = h.get("efectividad", "")
-    if efec:
-        try:
-            valor = float(efec.replace("%", "").replace(",", "."))
-            if valor >= 30:
-                score += 6
-                reasons.append(f"gana el {efec} de las carreras que corre")
-            elif valor >= 15:
-                score += 3
-                reasons.append(f"efectividad del {efec}")
-        except ValueError:
-            pass
-
-    # --- Jockey, entrenador y caballeriza ---
-    # El sitio publica cuántas corrió y cuántas ganó cada uno, en el año y
-    # en ESE hipódromo. Lo del hipódromo pesa distinto porque dice cómo le
-    # va en esa pista.
-    def sumar_rendimiento(clave, titulo, peso_gana, peso_pista=None):
-        nonlocal score
-        r = h.get("clave_no_existe") if False else h.get(clave)
-        if not r:
-            return
-        # Rendimiento del año
-        pct = r.get("pct_anio", 0)
-        corridas = r.get("corridas_anio", 0)
-        if corridas >= 10:
-            if pct >= 18:
-                score += peso_gana
-                reasons.append(f"{titulo} gana el {pct}% este año")
-            elif pct >= 10:
-                score += peso_gana * 0.5
-                reasons.append(f"{titulo} gana el {pct}% este año")
-            elif pct == 0:
-                # Arranca sin castigo: el peso vale 0 hasta que el
-                # aprendizaje diga otra cosa.
-                score -= P["jockey_sin_ganar"]
-                if P["jockey_sin_ganar"] > 0:
-                    reasons.append(f"{titulo} no ganó ninguna en {corridas} salidas")
-
-        # Rendimiento en ese hipódromo
-        if peso_pista and r.get("corridas_hip", 0) >= 8:
-            pct_h = r.get("pct_hip", 0)
-            if pct_h >= 18:
-                score += peso_pista
-                reasons.append(
-                    f"{titulo} gana el {pct_h}% en {r.get('hipodromo','esa pista')}")
-
-    sumar_rendimiento("rend_jockey", "el jockey",
-                      P["jockey_ganador"], P["jockey_en_esa_pista"])
-    sumar_rendimiento("rend_entrenador", "el entrenador",
-                      P["entrenador_ganador"])
-    sumar_rendimiento("rend_caballeriza", "la caballeriza",
-                      P["caballeriza_ganadora"])
-
-    # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
-    # Sin esto, los genericos tapan a los que de verdad explican el puesto.
-    PRIORIDAD = [
-        "viene fino", "no entra entre", "ganó su última",
-        "el jockey gana", "el jockey no ganó",
-        "gana el", "efectividad",
-        "corrió", "anduvo bien", "nunca corrió",
-        "el entrenador", "la caballeriza",
-        "descanso justo", "hace", "corrió hace",
-        "victoria", "llegada",
-        "lleva", "viento",
-        "carreras corridas", "experiencia", "debuta",
-    ]
-
-    def peso_motivo(m):
-        bajo = m.lower()
-        for i, clave in enumerate(PRIORIDAD):
-            if clave in bajo:
-                return i
-        return len(PRIORIDAD)
-
-    reasons.sort(key=peso_motivo)
-    return round(max(1, score), 1), reasons
+    if context.get("pista_dia") in ["Pesada","Barrosa","Húmeda"] and any(
+        x in (campaign+" "+detail) for x in ["pesada","barrosa","húmeda","humeda"]
+    ):
+        score += P["pista_compatible"]
+        reasons.append("antecedente compatible con la pista del día")
+    return round(max(1, min(99, score)), 1), reasons
 
 
 def _to_float(value):
@@ -1215,131 +721,6 @@ def _codigo_recaptcha(soup):
     return ""
 
 
-def _sesion_studbook():
-    """
-    Una sesion que conserva las cookies y se presenta como un navegador
-    real. Hace falta porque el sitio puede recordar el mes elegido en la
-    sesion, y porque puede rechazar pedidos que no parezcan de un navegador.
-    """
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36"),
-        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-                   "image/avif,image/webp,*/*;q=0.8"),
-        "Accept-Language": "es-AR,es;q=0.9",
-        "Referer": BASE + "/reuniones",
-        "Upgrade-Insecure-Requests": "1",
-    })
-    return s
-
-
-def _datos_del_formulario(soup):
-    """
-    Lee el formulario de la pagina de reuniones y devuelve como se llaman
-    sus campos y si se envia por GET o por POST. No se adivina: se lee.
-    """
-    for form in soup.find_all("form"):
-        campos = {}
-        nombres = []
-        for inp in form.find_all(["input", "select"]):
-            n = inp.get("name")
-            if not n:
-                continue
-            nombres.append(n)
-            if inp.name == "input":
-                campos[n] = inp.get("value", "")
-            else:
-                sel = inp.find("option", selected=True) or inp.find("option")
-                campos[n] = sel.get("value", "") if sel else ""
-        # El formulario del calendario tiene los campos de mes y año.
-        texto = " ".join(nombres).lower()
-        if any(x in texto for x in ["mes", "month", "anio", "año", "year"]):
-            return {
-                "accion": urljoin(BASE, form.get("action") or "/reuniones"),
-                "metodo": (form.get("method") or "get").lower(),
-                "campos": campos,
-                "nombres": nombres,
-            }
-    return None
-
-
-def _traer_mes(anio, mes):
-    """
-    Trae la pagina de un mes concreto. Prueba, en orden, las tres vias
-    posibles, cada una con la sesion abierta para conservar las cookies:
-      1) el formulario tal como lo declara la pagina
-      2) por direccion, con el codigo que traiga la pagina
-      3) por direccion pelada
-    Devuelve (reuniones, via_que_funciono).
-    """
-    prefijo = f"{anio}-{mes:02d}-"
-    s = _sesion_studbook()
-
-    # Primero se abre la pagina normal: asi se obtienen cookies y el formulario.
-    r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
-    r0.raise_for_status()
-    soup0 = BeautifulSoup(r0.text, "html.parser")
-
-    formulario = _datos_del_formulario(soup0)
-    codigo = _codigo_recaptcha(soup0)
-
-    intentos = []
-
-    # 1) El formulario, tal como lo declara la pagina.
-    if formulario:
-        campos = dict(formulario["campos"])
-        for n in formulario["nombres"]:
-            bajo = n.lower()
-            if "mes" in bajo or "month" in bajo:
-                campos[n] = f"{mes:02d}"
-            elif "anio" in bajo or "año" in bajo or "year" in bajo:
-                campos[n] = str(anio)
-        intentos.append(("formulario", formulario["metodo"],
-                         formulario["accion"], campos))
-
-    # 2) Con el campo recaptcha VACIO, tal como lo declara el formulario.
-    params_vacio = {"recaptcha": "", "mes": f"{mes:02d}", "anio": str(anio)}
-    intentos.append(("recaptcha vacio", "get", BASE + "/reuniones", params_vacio))
-
-    # 3) Por direccion, con el codigo si aparecio.
-    params = {"mes": f"{mes:02d}", "anio": str(anio)}
-    if codigo:
-        intentos.append(("direccion con codigo", "get", BASE + "/reuniones",
-                         {**params, "recaptcha": codigo}))
-    # 4) Por direccion pelada, ya con las cookies de la sesion.
-    intentos.append(("direccion con sesion", "get", BASE + "/reuniones", params))
-    # 5) Por direccion, como POST.
-    intentos.append(("direccion como POST", "post", BASE + "/reuniones", params))
-    # 6) Con el orden de campos tal cual el formulario los declara.
-    intentos.append(("orden del formulario", "get", BASE + "/reuniones",
-                     {"recaptcha": "", "mes": str(mes), "anio": str(anio)}))
-
-    detalle = []
-    for etiqueta, metodo, accion, datos in intentos:
-        try:
-            if metodo == "post":
-                r = s.post(accion, data=datos, timeout=(5, 15))
-            else:
-                r = s.get(accion, params=datos, timeout=(5, 15))
-            reuniones = calendar_from_meetings(BeautifulSoup(r.text, "html.parser"))
-            del_mes = [x for x in reuniones if x["fecha"].startswith(prefijo)]
-            meses = sorted({x["fecha"][:7] for x in reuniones})
-            detalle.append({
-                "via": etiqueta, "metodo": metodo.upper(),
-                "status": r.status_code, "url": r.url[:120],
-                "total": len(reuniones), "DEL_MES": len(del_mes),
-                "meses_que_trajo": meses,
-            })
-            if del_mes:
-                return del_mes, etiqueta, detalle
-        except Exception as e:
-            detalle.append({"via": etiqueta, "error": str(e)[:120]})
-
-    return [], "", detalle
-
-
 def calendario_del_mes(anio, mes):
     """
     Devuelve las reuniones de un mes concreto (anio=2024, mes=3).
@@ -1355,9 +736,23 @@ def calendario_del_mes(anio, mes):
         return cacheado
 
     try:
-        reuniones, via, _ = _traer_mes(anio, mes)
-        if reuniones:
-            cache_set(clave, reuniones)
+        # Primero la pagina normal, para sacar el codigo que exige el sitio.
+        base_soup = fetch(BASE + "/reuniones")
+        codigo = _codigo_recaptcha(base_soup)
+
+        url = f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"
+        if codigo:
+            url += f"&recaptcha={codigo}"
+
+        soup = fetch(url)
+        reuniones = calendar_from_meetings(soup)
+
+        # Quedarse solo con las del mes pedido: si el sitio ignoro el pedido,
+        # es preferible devolver vacio antes que datos de otro mes.
+        prefijo = f"{anio}-{mes:02d}-"
+        reuniones = [r for r in reuniones if r["fecha"].startswith(prefijo)]
+
+        cache_set(clave, reuniones)
         return reuniones
     except Exception:
         return cacheado or []
@@ -1411,38 +806,7 @@ def calendario():
             lambda: calendar_from_meetings(fetch(BASE + "/reuniones"))
         )
         if meetings:
-            hoy = hoy_argentina()
-            ahora = hora_argentina()
-            fechas = sorted({m["fecha"] for m in meetings})
-
-            # Cual es la fecha donde hay que entrar: hoy si todavia queda
-            # alguna carrera por correrse, si no la siguiente con reunion.
-            fecha_activa = hoy if hoy in fechas else ""
-            jornada_terminada = False
-            if fecha_activa:
-                try:
-                    de_hoy = [m for m in meetings if m["fecha"] == hoy]
-                    quedan = False
-                    for m in de_hoy:
-                        cs = extract_races_from_meeting(fetch(m["url"]))
-                        if any(c.get("hora") and c["hora"] >= ahora for c in cs):
-                            quedan = True
-                            break
-                    jornada_terminada = not quedan
-                except Exception:
-                    jornada_terminada = False
-            if not fecha_activa or jornada_terminada:
-                futuras = [f for f in fechas if f > hoy]
-                fecha_activa = futuras[0] if futuras else fecha_activa
-
-            resp = {
-                "ok": True, "reuniones": meetings, "fuente": "Stud Book",
-                "hoy": hoy,
-                "ahora": ahora,
-                # La unica fecha que se marca: donde hay que entrar.
-                "fecha_activa": fecha_activa,
-                "jornada_terminada": jornada_terminada,
-            }
+            resp = {"ok": True, "reuniones": meetings, "fuente": "Stud Book"}
             if origen == "cache_vencido":
                 resp["aviso"] = "La fuente oficial no respondió. Se muestra el último calendario guardado."
             return jsonify(**resp)
@@ -1519,14 +883,7 @@ def reuniones():
 
     try:
         output, origen = con_cache(clave, TTL_REUNION, forzar, traer)
-        resp = {
-            "ok": True,
-            "reuniones": output,
-            # La hora y la fecha de Argentina, para que la pantalla marque
-            # lo mismo que el servidor sin importar el reloj del usuario.
-            "hoy": hoy_argentina(),
-            "ahora": hora_argentina(),
-        }
+        resp = {"ok": True, "reuniones": output}
         if origen == "cache_vencido":
             resp["aviso"] = "La fuente oficial no respondió. Se muestra la última versión guardada."
         return jsonify(**resp)
@@ -1541,70 +898,6 @@ def reuniones():
         ), 404
 
 
-def _es_la_proxima(url, numero):
-    """
-    Dice si esa carrera es una de las que el visitante sin cuenta puede ver.
-    Vale la proxima de CADA hipodromo, sean uno o diez el mismo dia.
-    Si ya termino la jornada de hoy, valen las primeras de la fecha siguiente.
-    """
-    fecha_url = meeting_date_from_url(url)
-    hoy = hoy_argentina()
-    ahora = hora_argentina()
-
-    try:
-        carreras = extract_races_from_meeting(fetch(url))
-    except Exception:
-        return False
-    if not carreras:
-        return False
-
-    if fecha_url == hoy:
-        pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
-        if pendientes:
-            return int(numero) == pendientes[0]["numero"]
-        # Ya corrieron todas las de hoy: la jornada de hoy no habilita nada,
-        # se pasa a la fecha siguiente (se resuelve mas abajo).
-        return False
-
-    # Una reunion posterior: vale su PRIMERA carrera, pero solo si hoy ya
-    # termino o si esa reunion es la mas proxima que viene.
-    if fecha_url and fecha_url > hoy:
-        if int(numero) != carreras[0]["numero"]:
-            return False
-        return _hoy_ya_termino() and _es_la_fecha_mas_proxima(fecha_url)
-
-    return False
-
-
-def _hoy_ya_termino():
-    """True si no queda ninguna carrera por correrse hoy."""
-    hoy = hoy_argentina()
-    ahora = hora_argentina()
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return False
-    for r in [x for x in calendario if x["fecha"] == hoy]:
-        try:
-            carreras = extract_races_from_meeting(fetch(r["url"]))
-        except Exception:
-            continue
-        if any(c.get("hora") and c["hora"] >= ahora for c in carreras):
-            return False
-    return True
-
-
-def _es_la_fecha_mas_proxima(fecha):
-    """True si no hay ninguna reunion entre hoy y esa fecha."""
-    hoy = hoy_argentina()
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return False
-    futuras = sorted({r["fecha"] for r in calendario if r["fecha"] > hoy})
-    return bool(futuras) and fecha == futuras[0]
-
-
 @app.get("/api/carrera")
 def carrera():
     url = request.args.get("url","")
@@ -1612,16 +905,6 @@ def carrera():
     forzar = request.args.get("refresh") == "1"
     if not url.startswith(BASE) or not numero.isdigit():
         return jsonify(ok=False,error="Datos inválidos."),400
-
-    # Sin cuenta solo se ve la proxima carrera a correrse.
-    if not usuario_actual() and not es_admin():
-        if not _es_la_proxima(url, numero):
-            return jsonify(
-                ok=False,
-                necesita_cuenta=True,
-                error=("Sin cuenta solo podés ver la carrera que está por correrse. "
-                       "Creá una cuenta gratis para ver todas."),
-            ), 401
 
     clave = f"carrera:{url}:{numero}"
 
@@ -1798,12 +1081,6 @@ def buscar_ejemplares(termino):
 
 @app.get("/api/buscar-caballo")
 def api_buscar_caballo():
-    if not usuario_actual() and not es_admin():
-        return jsonify(
-            ok=False, necesita_cuenta=True,
-            error="Creá una cuenta gratis para buscar cualquier caballo.",
-            resultados=[],
-        ), 401
     termino = request.args.get("q", "").strip()
     if len(termino) < 3:
         return jsonify(ok=False, error="Escribí al menos 3 letras."), 400
@@ -1900,116 +1177,37 @@ def api_detalle_carrera():
 
 @app.post("/api/enriquecer")
 def enriquecer():
-    """
-    Trae la campaña de todos los participantes.
-    Se piden TODOS AL MISMO TIEMPO: antes se hacía uno por uno y con 14
-    caballos eso tardaba más de diez segundos.
-    """
     data = request.get_json(silent=True) or {}
     horses = data.get("participantes", [])
-    if not horses:
-        return jsonify(ok=True, participantes=[])
-
-    # Tope de pedidos simultáneos, para no castigar al Stud Book.
-    simultaneos = min(int(os.getenv("PEDIDOS_A_LA_VEZ", "8")), max(1, len(horses)))
-
-    with ThreadPoolExecutor(max_workers=simultaneos) as pool:
-        resultados = list(pool.map(lambda h: enrich_horse(dict(h)), horses))
-
-    return jsonify(ok=True, participantes=resultados)
+    return jsonify(ok=True,participantes=[enrich_horse(dict(h)) for h in horses])
 
 @app.post("/api/analizar")
 def analizar():
     data = request.get_json(silent=True) or {}
-    todos = data.get("participantes", [])
-
-    # El usuario puede marcar como retirado a un caballo que el Stud Book
-    # todavia no actualizo. Eso cambia SU pronostico, nunca el oficial.
-    retirados_usuario = {
-        normalize_text(n) for n in (data.get("retirados_usuario") or [])
-    }
-
-    # Para el pronostico OFICIAL solo cuentan los retiros del Stud Book.
-    horses = [h for h in todos if not h.get("retirado")]
+    horses = [h for h in data.get("participantes",[]) if not h.get("retirado")]
     if len(horses) < 2:
         return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
-
     pesos = cargar_pesos()
-    fecha = data.get("fecha", "")
-    hipodromo = data.get("hipodromo", "")
+    ranked, top = rankear(horses, data, pesos)
 
-    # --- CONDICIONES OFICIALES: las que cargo el admin para esa reunion ---
-    oficiales = condiciones_de(fecha, hipodromo)
-    contexto_oficial = {
-        "participantes": horses,
-        "pista_dia": data.get("pista_dia", ""),
-    }
-    for campo in OPCIONES_CONDICIONES:
-        contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
-
-    ranked_oficial, top_oficial = rankear(horses, contexto_oficial, pesos)
-
-    # SOLO el pronostico oficial se guarda y se compara con el resultado.
+    # Guardar el pronostico y, si la carrera ya se corrio, comparar en el acto.
     ya_corrida = any(h.get("puesto") for h in horses)
     try:
         registrar_pronostico(
-            url=data.get("url",""), numero=data.get("numero"),
-            fecha=fecha, hipodromo=hipodromo,
-            top=top_oficial, participantes=horses,
-            pesos=pesos, ya_corrida=ya_corrida,
+            url=data.get("url",""),
+            numero=data.get("numero"),
+            fecha=data.get("fecha",""),
+            hipodromo=data.get("hipodromo",""),
+            top=top,
+            participantes=horses,
+            pesos=pesos,
+            ya_corrida=ya_corrida,
         )
     except Exception:
         pass  # que un fallo al guardar nunca rompa el pronostico al usuario
 
-    # --- CONDICIONES DEL USUARIO: si cambio alguna, se recalcula para el ---
-    del_usuario = data.get("condiciones_usuario") or {}
-    cambiadas = {
-        c["clave"]: clean(del_usuario.get(c["clave"], ""))
-        for c in OPCIONES_CONDICIONES
-        if clean(del_usuario.get(c["clave"], ""))
-        and clean(del_usuario.get(c["clave"], "")) != contexto_oficial.get(c["clave"], "")
-    }
-
-    if cambiadas or retirados_usuario:
-        contexto_usuario = dict(contexto_oficial)
-        contexto_usuario.update(cambiadas)
-        # Se sacan los que el usuario marco como retirados.
-        suyos = [h for h in horses
-                 if normalize_text(h.get("nombre","")) not in retirados_usuario]
-        if len(suyos) < 2:
-            suyos = horses   # no dejar la carrera sin participantes
-        contexto_usuario["participantes"] = suyos
-        _, top_usuario = rankear(suyos, contexto_usuario, pesos)
-
-        avisos = []
-        if cambiadas:
-            avisos.append("tus condiciones")
-        if retirados_usuario:
-            n = len(horses) - len(suyos)
-            if n:
-                avisos.append(f"{n} retiro(s) que marcaste")
-
-        return jsonify(
-            ok=True,
-            ranking=top_usuario,
-            ranking_oficial=top_oficial,
-            confianza=round(top_usuario[0]["score"], 1),
-            ya_corrida=ya_corrida,
-            condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
-                                   for c in OPCIONES_CONDICIONES},
-            condiciones_usadas=cambiadas,
-            retirados_usuario=sorted(retirados_usuario),
-            es_personal=True,
-            aviso=("Este pronóstico usa " + " y ".join(avisos) +
-                   ". No cambia el oficial ni las estadísticas de la app."),
-        )
-
-    return jsonify(ok=True, ranking=top_oficial,
-                   confianza=round(top_oficial[0]["score"], 1),
-                   ya_corrida=ya_corrida,
-                   condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
-                                          for c in OPCIONES_CONDICIONES},
-                   es_personal=False)
+    return jsonify(ok=True,ranking=top,confianza=round(top[0]["score"],1),
+                   ya_corrida=ya_corrida)
 
 
 def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
@@ -2103,28 +1301,9 @@ def rankear(participantes, contexto, pesos):
     # Desempate por nombre, para que nunca dependa del orden de llegada.
     ranked.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
     top = ranked[:4]
-
-    # El porcentaje se calcula sobre la DIFERENCIA entre caballos, no sobre
-    # la suma de puntajes. Si se hiciera sobre la suma, cuatro caballos con
-    # puntajes 90, 85, 80 y 75 darian casi 25% cada uno y no se notaria
-    # quien es favorito.
-    if top:
-        puntajes = [x["score"] for x in ranked]
-        piso = min(puntajes)
-        # Cuanto se despega cada uno del peor de la carrera, mas una base
-        # para que el ultimo no quede en un numero irrisorio.
-        base_minima = 12
-        ventajas = [max(1.0, x["score"] - piso) + base_minima for x in top]
-        suma = sum(ventajas) or 1
-        for x, v in zip(top, ventajas):
-            x["probabilidad_relativa"] = round(v / suma * 100, 1)
-
-        # Ajuste: que la suma de al 100 exacto.
-        diferencia = round(100 - sum(x["probabilidad_relativa"] for x in top), 1)
-        if top and abs(diferencia) >= 0.1:
-            top[0]["probabilidad_relativa"] = round(
-                top[0]["probabilidad_relativa"] + diferencia, 1)
-
+    total = sum(x["score"] for x in top) or 1
+    for x in top:
+        x["probabilidad_relativa"] = round(x["score"] / total * 100, 1)
     return ranked, top
 
 
@@ -2321,8 +1500,8 @@ def admin_diagnostico():
 @app.get("/api/admin/diag-calendario")
 def admin_diag_calendario():
     """
-    Comprueba si se pueden traer meses anteriores. Ahora mira el formulario
-    real de la pagina y prueba cuatro vias distintas, con sesion abierta.
+    Comprueba si se pueden traer meses anteriores del calendario.
+    Prueba varias formas y dice cual funciona de verdad.
     """
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
@@ -2330,53 +1509,52 @@ def admin_diag_calendario():
     anio = int(request.args.get("anio", "2026"))
     mes = int(request.args.get("mes", "7"))
     prefijo = f"{anio}-{mes:02d}-"
-    informe = {"pedido": f"{anio}-{mes:02d}"}
+    informe = {"pedido": f"{anio}-{mes:02d}", "intentos": []}
 
+    # Sacar el codigo de la pagina normal.
+    codigo = ""
     try:
-        s = _sesion_studbook()
-        r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
-        soup0 = BeautifulSoup(r0.text, "html.parser")
-        informe["cookies"] = list(s.cookies.keys())
+        base_soup = fetch(BASE + "/reuniones")
+        codigo = _codigo_recaptcha(base_soup)
+        informe["codigo_encontrado"] = bool(codigo)
+        informe["codigo_largo"] = len(codigo)
     except Exception as e:
-        return jsonify(ok=False, error=f"No se pudo abrir la pagina: {e}"), 502
+        informe["codigo_encontrado"] = False
+        informe["error_pagina_base"] = str(e)
 
-    # 1) Como es el formulario, de verdad
-    formulario = _datos_del_formulario(soup0)
-    informe["FORMULARIO"] = formulario or "no se encontro un formulario con mes/año"
+    formas = [
+        ("sin codigo", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}"),
+        ("mes sin cero", f"{BASE}/reuniones?mes={mes}&anio={anio}"),
+    ]
+    if codigo:
+        formas += [
+            ("con codigo", f"{BASE}/reuniones?recaptcha={codigo}&mes={mes:02d}&anio={anio}"),
+            ("codigo al final", f"{BASE}/reuniones?mes={mes:02d}&anio={anio}&recaptcha={codigo}"),
+        ]
 
-    # Todos los formularios, por si el filtro fue muy estricto
-    todos = []
-    for f in soup0.find_all("form"):
-        todos.append({
-            "accion": f.get("action", ""),
-            "metodo": f.get("method", "get"),
-            "campos": [i.get("name") for i in f.find_all(["input","select"]) if i.get("name")],
-        })
-    informe["todos_los_formularios"] = todos[:6]
+    for etiqueta, url in formas:
+        intento = {"forma": etiqueta, "url": url[:110] + ("…" if len(url) > 110 else "")}
+        try:
+            soup = fetch(url)
+            reuniones = calendar_from_meetings(soup)
+            del_mes = [r for r in reuniones if r["fecha"].startswith(prefijo)]
+            intento["total_traido"] = len(reuniones)
+            intento["DEL_MES_PEDIDO"] = len(del_mes)
+            intento["FUNCIONA"] = len(del_mes) > 0
+            meses = sorted({r["fecha"][:7] for r in reuniones})
+            intento["meses_que_trajo"] = meses
+            intento["ejemplos"] = [
+                f"{r['fecha']} {r['hipodromo']}" for r in del_mes[:4]
+            ]
+        except Exception as e:
+            intento["error"] = str(e)
+        informe["intentos"].append(intento)
 
-    # Todos los <select> de la pagina, con sus opciones
-    selects = []
-    for sel in soup0.find_all("select"):
-        opciones = [o.get("value","") for o in sel.find_all("option")][:14]
-        selects.append({"nombre": sel.get("name",""), "id": sel.get("id",""),
-                        "opciones": opciones})
-    informe["selectores"] = selects[:6]
-
-    informe["codigo_recaptcha"] = bool(_codigo_recaptcha(soup0))
-
-    # 2) Probar las vias
-    try:
-        reuniones, via, detalle = _traer_mes(anio, mes)
-    except Exception as e:
-        reuniones, via, detalle = [], f"error: {e}", []
-
+    funcionan = [i["forma"] for i in informe["intentos"] if i.get("FUNCIONA")]
     informe["RESUMEN"] = {
-        "se_puede_traer_meses_viejos": bool(reuniones),
-        "VIA_QUE_FUNCIONA": via,
-        "reuniones_del_mes": len(reuniones),
-        "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:5]],
+        "FORMAS_QUE_FUNCIONAN": funcionan,
+        "se_puede_traer_meses_viejos": len(funcionan) > 0,
     }
-    informe["DETALLE_DE_CADA_INTENTO"] = detalle
     return jsonify(ok=True, **informe)
 
 
@@ -2409,7 +1587,7 @@ def calendario_meses():
     Calendario agrupado por mes, con los hipodromos de cada fecha.
     Parametros: desde y hasta (AAAA-MM-DD). Por defecto, desde 2024.
     """
-    hoy = hoy_argentina()
+    hoy = datetime.now().strftime("%Y-%m-%d")
     desde = request.args.get("desde", "2024-01-01")
     hasta = request.args.get("hasta", hoy)
 
@@ -2607,7 +1785,6 @@ def api_tabulada():
             "nombre": p.get("nombre"),
             "cuerpos": p.get("cuerpos", ""),
             "acumulado": p.get("acumulado", ""),
-            "pago": p.get("pago", ""),
             "peso": p.get("peso", ""),
             "jockey": p.get("jockey", ""),
             "entrenador": p.get("entrenador", ""),
@@ -2653,923 +1830,6 @@ def admin_reiniciar():
                    mensaje=(f"Se borraron {n} pronósticos. "
                             "El algoritmo volvió a sus valores iniciales."),
                    borrados=n)
-
-
-# ============================================================
-# CONDICIONES DE LA REUNION
-# Las carga el admin y valen para todas las carreras de ese dia.
-# El usuario las puede cambiar para si mismo: eso altera SU pronostico,
-# pero nunca el oficial ni las estadisticas de aciertos.
-# Para agregar un campo nuevo alcanza con sumarlo a esta lista.
-# ============================================================
-
-OPCIONES_CONDICIONES = [
-    {"clave": "pista", "titulo": "Pista",
-     "opciones": ["Arena", "Arena (Codo)", "Césped"]},
-    {"clave": "estado", "titulo": "Estado",
-     "opciones": ["Normal", "Liviana", "Húmeda", "Pesada", "Barrosa"]},
-    {"clave": "viento", "titulo": "Viento",
-     "opciones": ["Sin viento", "A favor", "En contra", "Cruzado"]},
-    {"clave": "clima", "titulo": "Clima",
-     "opciones": ["Despejado", "Nublado", "Llovizna", "Lluvia"]},
-]
-
-
-def condiciones_de(fecha, hipodromo):
-    """Devuelve las condiciones que cargo el admin para esa reunion."""
-    try:
-        con = db()
-        fila = con.execute(
-            "SELECT * FROM condiciones WHERE fecha=? AND hipodromo=?",
-            (fecha, normalize_text(hipodromo))
-        ).fetchone()
-        con.close()
-    except Exception:
-        return {}
-    return dict(fila) if fila else {}
-
-
-@app.get("/api/condiciones")
-def api_condiciones():
-    """Las condiciones oficiales de una reunion, y las opciones disponibles."""
-    fecha = request.args.get("fecha", "").strip()
-    hipodromo = request.args.get("hipodromo", "").strip()
-    guardadas = condiciones_de(fecha, hipodromo) if fecha and hipodromo else {}
-    return jsonify(
-        ok=True,
-        oficiales={c["clave"]: guardadas.get(c["clave"], "")
-                   for c in OPCIONES_CONDICIONES},
-        observaciones=guardadas.get("observaciones", ""),
-        cargado_en=guardadas.get("cargado_en", ""),
-        campos=OPCIONES_CONDICIONES,
-    )
-
-
-@app.post("/api/admin/condiciones")
-def admin_condiciones():
-    """El admin carga las condiciones de una reunion."""
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-
-    d = request.get_json(silent=True) or {}
-    fecha = clean(d.get("fecha", ""))
-    hipodromo = clean(d.get("hipodromo", ""))
-    if not fecha or not hipodromo:
-        return jsonify(ok=False, error="Faltan la fecha y el hipódromo."), 400
-
-    # Solo se aceptan valores de la lista, para que no entre cualquier cosa.
-    valores = {}
-    for campo in OPCIONES_CONDICIONES:
-        v = clean(d.get(campo["clave"], ""))
-        valores[campo["clave"]] = v if v in campo["opciones"] else ""
-
-    con = db()
-    con.execute("""
-        INSERT INTO condiciones(fecha,hipodromo,pista,estado,viento,clima,
-                                observaciones,cargado_en)
-        VALUES(?,?,?,?,?,?,?,?)
-        ON CONFLICT(fecha,hipodromo) DO UPDATE SET
-          pista=excluded.pista, estado=excluded.estado,
-          viento=excluded.viento, clima=excluded.clima,
-          observaciones=excluded.observaciones, cargado_en=excluded.cargado_en
-    """, (
-        fecha, normalize_text(hipodromo),
-        valores["pista"], valores["estado"], valores["viento"], valores["clima"],
-        clean(d.get("observaciones", ""))[:400],
-        datetime.now().isoformat(timespec="seconds"),
-    ))
-    con.commit()
-    con.close()
-
-    return jsonify(ok=True, mensaje="Condiciones guardadas para toda la reunión.",
-                   oficiales=valores)
-
-
-# ============================================================
-# USUARIOS
-# Usuario y contraseña, sin correo obligatorio.
-# La contraseña NUNCA se guarda tal cual: se guarda cifrada.
-# Recuperar la clave hoy es manual (el admin la resetea). El sistema
-# queda preparado para sumar SMS, WhatsApp o correo sin rehacer nada.
-# ============================================================
-
-DIAS_SESION = 90     # cuanto dura la sesion sin volver a entrar
-
-
-def _cifrar_clave(clave, sal=None):
-    """Cifra la contraseña. Nunca se guarda como la escribió el usuario."""
-    sal = sal or secrets.token_hex(16)
-    mezcla = hashlib.pbkdf2_hmac("sha256", clave.encode(), sal.encode(), 120_000)
-    return f"{sal}${mezcla.hex()}"
-
-
-def _clave_correcta(clave, guardada):
-    try:
-        sal, _ = guardada.split("$", 1)
-    except (ValueError, AttributeError):
-        return False
-    return secrets.compare_digest(_cifrar_clave(clave, sal), guardada)
-
-
-def usuario_actual():
-    """Devuelve el usuario de la sesión, o None si no ingresó."""
-    token = (request.headers.get("X-Sesion", "")
-             or request.cookies.get("lea_sesion", "")).strip()
-    if not token:
-        return None
-    try:
-        con = db()
-        fila = con.execute("""
-            SELECT u.id, u.usuario, u.usuario_visible, u.telefono, u.bloqueado,
-                   s.creada_en
-            FROM sesiones s JOIN usuarios u ON u.id = s.usuario_id
-            WHERE s.token = ?
-        """, (token,)).fetchone()
-        if not fila:
-            con.close()
-            return None
-        # Sesión vencida
-        edad = (datetime.now() - datetime.fromisoformat(fila["creada_en"])).days
-        if edad > DIAS_SESION or fila["bloqueado"]:
-            con.execute("DELETE FROM sesiones WHERE token=?", (token,))
-            con.commit()
-            con.close()
-            return None
-        con.execute("UPDATE sesiones SET ultima_vez=? WHERE token=?",
-                    (datetime.now().isoformat(timespec="seconds"), token))
-        con.commit()
-        con.close()
-        return dict(fila)
-    except Exception:
-        return None
-
-
-def _validar_registro(usuario, clave):
-    """Devuelve un mensaje de error, o None si está todo bien."""
-    if len(usuario) < 3:
-        return "El usuario tiene que tener al menos 3 letras."
-    if len(usuario) > 24:
-        return "El usuario no puede tener más de 24 letras."
-    if not re.fullmatch(r"[A-Za-z0-9_.\- ]+", usuario):
-        return "El usuario solo puede tener letras, números, guiones y puntos."
-    if len(clave) < 4:
-        return "La contraseña tiene que tener al menos 4 caracteres."
-    return None
-
-
-@app.post("/api/registro")
-def api_registro():
-    d = request.get_json(silent=True) or {}
-    usuario = clean(d.get("usuario", ""))
-    clave = d.get("clave", "")
-    telefono = clean(d.get("telefono", ""))[:30]
-
-    error = _validar_registro(usuario, clave)
-    if error:
-        return jsonify(ok=False, error=error), 400
-
-    clave_usuario = normalize_text(usuario)
-    con = db()
-    ya = con.execute("SELECT id FROM usuarios WHERE usuario=?",
-                     (clave_usuario,)).fetchone()
-    if ya:
-        con.close()
-        return jsonify(ok=False,
-                       error="Ese nombre de usuario ya está tomado."), 409
-
-    ahora = datetime.now().isoformat(timespec="seconds")
-    cur = con.execute("""
-        INSERT INTO usuarios(usuario, usuario_visible, clave_hash, telefono,
-                             creado_en, ultimo_ingreso)
-        VALUES(?,?,?,?,?,?)
-    """, (clave_usuario, usuario, _cifrar_clave(clave), telefono, ahora, ahora))
-    uid = cur.lastrowid
-    token = secrets.token_urlsafe(32)
-    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
-                (token, uid, ahora, ahora))
-    con.commit()
-    con.close()
-
-    resp = jsonify(ok=True, usuario=usuario, token=token,
-                   mensaje=f"Bienvenido, {usuario}.")
-    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
-                    samesite="Lax", secure=True, httponly=False)
-    return resp
-
-
-@app.post("/api/ingresar")
-def api_ingresar():
-    d = request.get_json(silent=True) or {}
-    usuario = clean(d.get("usuario", ""))
-    clave = d.get("clave", "")
-    if not usuario or not clave:
-        return jsonify(ok=False, error="Poné el usuario y la contraseña."), 400
-
-    con = db()
-    fila = con.execute("SELECT * FROM usuarios WHERE usuario=?",
-                       (normalize_text(usuario),)).fetchone()
-    if not fila:
-        con.close()
-        # Se avisa que no existe para poder ofrecerle crearlo con ese nombre.
-        return jsonify(ok=False, no_existe=True, usuario_probado=usuario,
-                       error=f"No existe el usuario «{usuario}»."), 401
-    if not _clave_correcta(clave, fila["clave_hash"]):
-        con.close()
-        return jsonify(ok=False, clave_mal=True,
-                       error="La contraseña no es correcta."), 401
-    if fila["bloqueado"]:
-        con.close()
-        return jsonify(ok=False, error="Esta cuenta está bloqueada."), 403
-
-    ahora = datetime.now().isoformat(timespec="seconds")
-    token = secrets.token_urlsafe(32)
-    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
-                (token, fila["id"], ahora, ahora))
-    con.execute("UPDATE usuarios SET ultimo_ingreso=? WHERE id=?", (ahora, fila["id"]))
-    con.commit()
-    con.close()
-
-    resp = jsonify(ok=True, usuario=fila["usuario_visible"], token=token)
-    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
-                    samesite="Lax", secure=True, httponly=False)
-    return resp
-
-
-@app.post("/api/salir")
-def api_salir():
-    token = (request.headers.get("X-Sesion", "")
-             or request.cookies.get("lea_sesion", "")).strip()
-    if token:
-        con = db()
-        con.execute("DELETE FROM sesiones WHERE token=?", (token,))
-        con.commit()
-        con.close()
-    resp = jsonify(ok=True, mensaje="Sesión cerrada.")
-    resp.set_cookie("lea_sesion", "", max_age=0)
-    return resp
-
-
-@app.get("/api/quien-soy")
-def api_quien_soy():
-    u = usuario_actual()
-    if not u:
-        return jsonify(ok=True, ingresado=False)
-    return jsonify(ok=True, ingresado=True, usuario=u["usuario_visible"])
-
-
-@app.get("/api/proxima-carrera")
-def api_proxima_carrera():
-    """
-    La proxima carrera segun el horario oficial, para el visitante
-    que todavia no tiene cuenta.
-    """
-    hipodromo = clean(request.args.get("hipodromo", ""))
-    hoy = hoy_argentina()
-    ahora = hora_argentina()
-
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return jsonify(ok=False, error="No se pudo consultar el calendario."), 503
-
-    del_dia = [r for r in calendario if r["fecha"] == hoy]
-    if hipodromo:
-        del_dia = [r for r in del_dia
-                   if normalize_text(r["hipodromo"]) == normalize_text(hipodromo)]
-    if not del_dia:
-        return jsonify(ok=True, hay=False,
-                       mensaje="No hay carreras hoy en ese hipódromo.",
-                       hipodromos=[r["hipodromo"] for r in calendario
-                                   if r["fecha"] == hoy])
-
-    reunion = del_dia[0]
-    try:
-        carreras = extract_races_from_meeting(fetch(reunion["url"]))
-    except Exception:
-        return jsonify(ok=False, error="No se pudo abrir la reunión."), 503
-
-    # La primera cuya hora todavia no paso.
-    pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
-    proxima = pendientes[0] if pendientes else (carreras[-1] if carreras else None)
-    if not proxima:
-        return jsonify(ok=True, hay=False,
-                       mensaje="Todavía no hay carreras publicadas.")
-
-    return jsonify(
-        ok=True, hay=True,
-        fecha=hoy, hipodromo=reunion["hipodromo"], url=reunion["url"],
-        carrera=proxima,
-        ya_corrieron=len([c for c in carreras
-                          if c.get("hora") and c["hora"] < ahora]),
-        total=len(carreras),
-        hipodromos=[r["hipodromo"] for r in calendario if r["fecha"] == hoy],
-    )
-
-
-@app.get("/api/admin/usuarios")
-def admin_usuarios():
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-    con = db()
-    filas = con.execute("""
-        SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso, bloqueado
-        FROM usuarios ORDER BY id DESC LIMIT 200
-    """).fetchall()
-    total = con.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
-    con.close()
-    return jsonify(ok=True, total=total, usuarios=[dict(f) for f in filas])
-
-
-@app.post("/api/admin/resetear-clave")
-def admin_resetear_clave():
-    """
-    El admin le pone una clave nueva a un usuario que la olvidó.
-    Hoy es manual; mañana esto mismo puede dispararse por SMS o WhatsApp.
-    """
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-
-    d = request.get_json(silent=True) or {}
-    usuario = clean(d.get("usuario", ""))
-    nueva = d.get("clave", "")
-    if not usuario or len(nueva) < 4:
-        return jsonify(ok=False,
-                       error="Falta el usuario o la clave es muy corta."), 400
-
-    con = db()
-    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
-                       (normalize_text(usuario),)).fetchone()
-    if not fila:
-        con.close()
-        return jsonify(ok=False, error="No existe ese usuario."), 404
-    con.execute("UPDATE usuarios SET clave_hash=? WHERE id=?",
-                (_cifrar_clave(nueva), fila["id"]))
-    # Se cierran sus sesiones abiertas, por seguridad.
-    con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
-    con.commit()
-    con.close()
-    return jsonify(ok=True,
-                   mensaje=f"Clave nueva para {usuario}. Avisale cuál es.")
-
-
-@app.post("/api/admin/bloquear")
-def admin_bloquear():
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-    d = request.get_json(silent=True) or {}
-    usuario = clean(d.get("usuario", ""))
-    bloquear = 1 if d.get("bloquear") else 0
-    con = db()
-    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
-                       (normalize_text(usuario),)).fetchone()
-    if not fila:
-        con.close()
-        return jsonify(ok=False, error="No existe ese usuario."), 404
-    con.execute("UPDATE usuarios SET bloqueado=? WHERE id=?", (bloquear, fila["id"]))
-    if bloquear:
-        con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
-    con.commit()
-    con.close()
-    return jsonify(ok=True,
-                   mensaje=("Usuario bloqueado." if bloquear else "Usuario habilitado."))
-
-
-@app.get("/api/admin/diag-viejos")
-def admin_diag_viejos():
-    """
-    Prueba tres vias NUEVAS para llegar a carreras de meses anteriores.
-    Las que ya fallaron (direccion, formulario, sesion, POST) no se repiten.
-    """
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-
-    anio = int(request.args.get("anio", "2026"))
-    mes = int(request.args.get("mes", "3"))
-    informe = {"pedido": f"{anio}-{mes:02d}"}
-    s = _sesion_studbook()
-
-    # ---------- VIA A: entrar directo a una reunion vieja ----------
-    # Las direcciones tienen la forma /reuniones/detalle/ID/AAAAMMDD-hipodromo-N
-    # Si se puede abrir una vieja directamente, se pueden recorrer todas.
-    via_a = {"nombre": "A) entrar directo a una reunion vieja", "intentos": []}
-    try:
-        actuales = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception as e:
-        actuales = []
-        via_a["error_calendario"] = str(e)
-
-    if actuales:
-        # Se toma una direccion de ejemplo para ver como esta armada.
-        ejemplo = actuales[0]["url"]
-        via_a["ejemplo_de_direccion"] = ejemplo
-        m = re.search(r"/reuniones/detalle/(\d+)/(\d{8})-(.+)$", ejemplo)
-        if m:
-            id_actual, fecha_actual, resto = m.groups()
-            via_a["id_actual"] = int(id_actual)
-            # Las reuniones viejas tienen un ID mas chico. Se prueban algunos
-            # hacia atras para ver si responden.
-            for resta in (30, 100, 300, 600):
-                idv = int(id_actual) - resta
-                if idv < 1:
-                    continue
-                url = f"{BASE}/reuniones/detalle/{idv}/x"
-                try:
-                    r = s.get(url, timeout=(5, 15))
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    texto = clean(soup.get_text(" "))
-                    mf = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
-                    carreras = extract_races_from_meeting(soup)
-                    via_a["intentos"].append({
-                        "id": idv, "status": r.status_code,
-                        "fecha_que_trajo": mf.group(1) if mf else "",
-                        "carreras": len(carreras),
-                        "SIRVE": r.status_code == 200 and len(carreras) > 0,
-                    })
-                except Exception as e:
-                    via_a["intentos"].append({"id": idv, "error": str(e)[:90]})
-    informe["VIA_A"] = via_a
-
-    # ---------- VIA B: otra seccion del sitio con el historico ----------
-    via_b = {"nombre": "B) otra seccion con el historico", "intentos": []}
-    for ruta in ["/reuniones/historico", "/reuniones/listado", "/reuniones/todas",
-                 "/estadisticas/reuniones", "/consultas/reuniones",
-                 f"/reuniones/{anio}", f"/reuniones/{anio}/{mes:02d}"]:
-        try:
-            r = s.get(BASE + ruta, timeout=(5, 12))
-            enlaces = 0
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "html.parser")
-                enlaces = len(soup.select('a[href*="/reuniones/detalle/"]'))
-            via_b["intentos"].append({
-                "ruta": ruta, "status": r.status_code,
-                "enlaces_a_reuniones": enlaces,
-                "SIRVE": r.status_code == 200 and enlaces > 0,
-            })
-        except Exception as e:
-            via_b["intentos"].append({"ruta": ruta, "error": str(e)[:90]})
-    informe["VIA_B"] = via_b
-
-    # ---------- VIA C: desde la ficha de un caballo ----------
-    # En la campaña de cualquier ejemplar aparecen carreras de años anteriores,
-    # con su enlace. Si esos enlaces abren, se puede recorrer el historico.
-    via_c = {"nombre": "C) desde la campaña de un caballo", "intentos": []}
-    try:
-        muestra = buscar_ejemplares("candy")
-        if muestra:
-            perfil = muestra[0]["perfil"]
-            via_c["caballo_probado"] = muestra[0]["nombre"]
-            soup = fetch(perfil)
-            carreras = _tabla_carreras_del_perfil(soup)
-            viejas = [c for c in carreras
-                      if c.get("fecha", "").endswith(("2024", "2025"))
-                      and c.get("enlace")]
-            via_c["carreras_en_su_campana"] = len(carreras)
-            via_c["de_2024_o_2025"] = len(viejas)
-            for c in viejas[:3]:
-                try:
-                    r = s.get(c["enlace"], timeout=(5, 12))
-                    sp = BeautifulSoup(r.text, "html.parser")
-                    n = len(sp.select('a[href*="/ejemplares/perfil/"]'))
-                    via_c["intentos"].append({
-                        "fecha": c["fecha"], "status": r.status_code,
-                        "ejemplares_en_la_pagina": n,
-                        "SIRVE": r.status_code == 200 and n > 0,
-                    })
-                except Exception as e:
-                    via_c["intentos"].append({"fecha": c["fecha"], "error": str(e)[:90]})
-        else:
-            via_c["nota"] = "No se encontro ningun caballo para probar."
-    except Exception as e:
-        via_c["error"] = str(e)[:150]
-    informe["VIA_C"] = via_c
-
-    # ---------- RESUMEN ----------
-    def sirve(via):
-        return any(i.get("SIRVE") for i in via.get("intentos", []))
-    funcionan = [n for n, v in [("A", via_a), ("B", via_b), ("C", via_c)] if sirve(v)]
-    informe["RESUMEN"] = {
-        "VIAS_QUE_FUNCIONAN": funcionan,
-        "se_puede": bool(funcionan),
-    }
-    return jsonify(ok=True, **informe)
-
-
-# ============================================================
-# NOTIFICACIONES AL CELULAR
-# Llegan aunque la app este cerrada. Hacen falta dos claves que se
-# cargan en Render: VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY.
-# En iPhone solo funcionan si el usuario agrega la app a la pantalla
-# de inicio; en Android funcionan siempre.
-# ============================================================
-
-VAPID_PUBLIC = os.getenv("VAPID_PUBLIC_KEY", "")
-VAPID_PRIVATE = os.getenv("VAPID_PRIVATE_KEY", "")
-VAPID_CONTACTO = os.getenv("VAPID_CONTACTO", "mailto:admin@win-ia.onrender.com")
-
-
-def hay_notificaciones():
-    return bool(VAPID_PUBLIC and VAPID_PRIVATE)
-
-
-@app.get("/api/push/clave")
-def push_clave():
-    """La clave publica, que el navegador necesita para suscribirse."""
-    return jsonify(ok=True, disponible=hay_notificaciones(),
-                   clave=VAPID_PUBLIC)
-
-
-@app.post("/api/push/suscribir")
-def push_suscribir():
-    """Guarda la direccion del celular para poder avisarle."""
-    d = request.get_json(silent=True) or {}
-    endpoint = clean(d.get("endpoint", ""))
-    claves = d.get("keys") or {}
-    p256dh = clean(claves.get("p256dh", ""))
-    auth = clean(claves.get("auth", ""))
-
-    if not endpoint or not p256dh or not auth:
-        return jsonify(ok=False, error="Faltan datos de la suscripción."), 400
-
-    u = usuario_actual()
-    con = db()
-    con.execute("""
-        INSERT INTO suscripciones(endpoint, usuario_id, p256dh, auth, creada_en)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(endpoint) DO UPDATE SET
-          usuario_id=COALESCE(excluded.usuario_id, suscripciones.usuario_id),
-          p256dh=excluded.p256dh, auth=excluded.auth, fallos=0
-    """, (endpoint, u["id"] if u else None, p256dh, auth,
-          datetime.now().isoformat(timespec="seconds")))
-    con.commit()
-    con.close()
-    return jsonify(ok=True, mensaje="Vas a recibir los avisos en este celular.")
-
-
-@app.post("/api/push/borrar")
-def push_borrar():
-    d = request.get_json(silent=True) or {}
-    endpoint = clean(d.get("endpoint", ""))
-    if endpoint:
-        con = db()
-        con.execute("DELETE FROM suscripciones WHERE endpoint=?", (endpoint,))
-        con.commit()
-        con.close()
-    return jsonify(ok=True, mensaje="No vas a recibir más avisos en este celular.")
-
-
-def enviar_aviso(suscripcion, titulo, cuerpo, url="/", etiqueta="lea"):
-    """
-    Manda un aviso a un celular. Devuelve True si salio bien.
-    Si el celular ya no existe, se borra la suscripcion.
-    """
-    if not hay_notificaciones():
-        return False
-    try:
-        from pywebpush import webpush, WebPushException
-    except ImportError:
-        return False
-
-    datos = json.dumps({
-        "titulo": titulo, "cuerpo": cuerpo, "url": url, "etiqueta": etiqueta,
-    }, ensure_ascii=False)
-
-    try:
-        webpush(
-            subscription_info={
-                "endpoint": suscripcion["endpoint"],
-                "keys": {"p256dh": suscripcion["p256dh"],
-                         "auth": suscripcion["auth"]},
-            },
-            data=datos,
-            vapid_private_key=VAPID_PRIVATE,
-            vapid_claims={"sub": VAPID_CONTACTO},
-            ttl=3600,
-        )
-        con = db()
-        con.execute("UPDATE suscripciones SET ultimo_aviso=?, fallos=0 WHERE endpoint=?",
-                    (datetime.now().isoformat(timespec="seconds"),
-                     suscripcion["endpoint"]))
-        con.commit()
-        con.close()
-        return True
-    except Exception as e:
-        # 404 o 410 significan que ese celular ya no acepta avisos.
-        texto = str(e)
-        con = db()
-        if "404" in texto or "410" in texto:
-            con.execute("DELETE FROM suscripciones WHERE endpoint=?",
-                        (suscripcion["endpoint"],))
-        else:
-            con.execute("UPDATE suscripciones SET fallos=fallos+1 WHERE endpoint=?",
-                        (suscripcion["endpoint"],))
-            con.execute("DELETE FROM suscripciones WHERE fallos > 8")
-        con.commit()
-        con.close()
-        return False
-
-
-def avisar_a_usuario(usuario_id, titulo, cuerpo, url="/", etiqueta="lea"):
-    """Manda el aviso a todos los celulares de ese usuario."""
-    con = db()
-    subs = con.execute("SELECT * FROM suscripciones WHERE usuario_id=?",
-                       (usuario_id,)).fetchall()
-    con.close()
-    enviados = 0
-    for s in subs:
-        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
-            enviados += 1
-    return enviados
-
-
-def avisar_a_todos(titulo, cuerpo, url="/", etiqueta="general"):
-    """Aviso general: remates, torneos, novedades."""
-    con = db()
-    subs = con.execute("SELECT * FROM suscripciones").fetchall()
-    con.close()
-    enviados = 0
-    for s in subs:
-        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
-            enviados += 1
-    return enviados
-
-
-# ---------- CABALLOS SEGUIDOS ----------
-
-@app.get("/api/seguidos")
-def api_seguidos():
-    u = usuario_actual()
-    if not u:
-        return jsonify(ok=True, ingresado=False, seguidos=[])
-    con = db()
-    filas = con.execute("""
-        SELECT caballo_visible, perfil, creado_en FROM seguidos
-        WHERE usuario_id=? ORDER BY creado_en DESC
-    """, (u["id"],)).fetchall()
-    con.close()
-    return jsonify(ok=True, ingresado=True,
-                   seguidos=[dict(f) for f in filas])
-
-
-@app.post("/api/seguir")
-def api_seguir():
-    u = usuario_actual()
-    if not u:
-        return jsonify(ok=False, necesita_cuenta=True,
-                       error="Creá una cuenta gratis para seguir caballos."), 401
-
-    d = request.get_json(silent=True) or {}
-    nombre = clean(d.get("caballo", ""))
-    if not nombre:
-        return jsonify(ok=False, error="Falta el nombre del caballo."), 400
-
-    clave = normalize_text(nombre)
-    con = db()
-    ya = con.execute("SELECT 1 FROM seguidos WHERE usuario_id=? AND caballo=?",
-                     (u["id"], clave)).fetchone()
-    if ya:
-        con.execute("DELETE FROM seguidos WHERE usuario_id=? AND caballo=?",
-                    (u["id"], clave))
-        con.commit()
-        con.close()
-        return jsonify(ok=True, siguiendo=False,
-                       mensaje=f"Dejaste de seguir a {nombre}.")
-
-    con.execute("""
-        INSERT INTO seguidos(usuario_id, caballo, caballo_visible, perfil, creado_en)
-        VALUES(?,?,?,?,?)
-    """, (u["id"], clave, nombre, clean(d.get("perfil", "")),
-          datetime.now().isoformat(timespec="seconds")))
-    con.commit()
-    con.close()
-    return jsonify(ok=True, siguiendo=True,
-                   mensaje=f"Vas a recibir un aviso cuando {nombre} vuelva a correr.")
-
-
-def _ya_se_aviso(usuario_id, caballo, tipo, fecha, hipodromo):
-    con = db()
-    fila = con.execute("""
-        SELECT 1 FROM avisos_enviados
-        WHERE usuario_id=? AND caballo=? AND tipo=? AND fecha=? AND hipodromo=?
-    """, (usuario_id, caballo, tipo, fecha, hipodromo)).fetchone()
-    con.close()
-    return bool(fila)
-
-
-def _marcar_avisado(usuario_id, caballo, tipo, fecha, hipodromo):
-    con = db()
-    con.execute("""
-        INSERT OR IGNORE INTO avisos_enviados
-        (usuario_id, caballo, tipo, fecha, hipodromo, enviado_en)
-        VALUES(?,?,?,?,?,?)
-    """, (usuario_id, caballo, tipo, fecha, hipodromo,
-          datetime.now().isoformat(timespec="seconds")))
-    con.commit()
-    con.close()
-
-
-def revisar_caballos_seguidos():
-    """
-    Recorre las reuniones de hoy y de manana buscando caballos que alguien
-    sigue. Manda dos avisos distintos:
-      - cuando aparece inscripto en el boletin
-      - una hora antes de su carrera
-    Cada aviso se manda UNA sola vez por carrera.
-    """
-    if not hay_notificaciones():
-        return {"enviados": 0, "motivo": "faltan las claves"}
-
-    con = db()
-    seguidos = con.execute("""
-        SELECT s.usuario_id, s.caballo, s.caballo_visible
-        FROM seguidos s
-        JOIN suscripciones u ON u.usuario_id = s.usuario_id
-        GROUP BY s.usuario_id, s.caballo
-    """).fetchall()
-    con.close()
-    if not seguidos:
-        return {"enviados": 0, "motivo": "nadie sigue caballos todavia"}
-
-    buscados = {s["caballo"]: s for s in seguidos}
-    hoy = hoy_argentina()
-    ahora = ahora_argentina()
-    manana = (ahora + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return {"enviados": 0, "motivo": "no se pudo abrir el calendario"}
-
-    reuniones = [r for r in calendario if r["fecha"] in (hoy, manana)]
-    enviados = 0
-
-    for reunion in reuniones:
-        try:
-            soup = fetch(reunion["url"])
-            carreras = extract_races_from_meeting(soup)
-        except Exception:
-            continue
-
-        for c in carreras:
-            try:
-                data = parse_race(soup, c["numero"])
-            except Exception:
-                continue
-            if not data:
-                continue
-
-            for p in data.get("participantes", []):
-                clave = normalize_text(p.get("nombre", ""))
-                if clave not in buscados or p.get("retirado"):
-                    continue
-
-                seg = buscados[clave]
-                uid = seg["usuario_id"]
-                visible = seg["caballo_visible"]
-                hip = reunion["hipodromo"]
-                hora = c.get("hora", "")
-                enlace = f"/?fecha={reunion['fecha']}&hipodromo={quote_plus(hip)}"
-
-                # 1) Aviso de inscripcion
-                if not _ya_se_aviso(uid, clave, "inscripto", reunion["fecha"], hip):
-                    n = avisar_a_usuario(
-                        uid,
-                        f"{visible} corre el {reunion['fecha'][8:10]}/{reunion['fecha'][5:7]}",
-                        f"{hip} · {c['numero']}ª carrera"
-                        + (f" · {hora}" if hora else ""),
-                        enlace, "inscripto",
-                    )
-                    if n:
-                        _marcar_avisado(uid, clave, "inscripto", reunion["fecha"], hip)
-                        enviados += n
-
-                # 2) Aviso una hora antes
-                if reunion["fecha"] == hoy and hora:
-                    try:
-                        h, m = [int(x) for x in hora.split(":")]
-                        largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-                        faltan = (largada - ahora).total_seconds() / 60
-                    except Exception:
-                        faltan = None
-
-                    if faltan is not None and 0 < faltan <= 75:
-                        if not _ya_se_aviso(uid, clave, "una_hora", reunion["fecha"], hip):
-                            n = avisar_a_usuario(
-                                uid,
-                                f"{visible} corre en {int(faltan)} minutos",
-                                f"{hip} · {c['numero']}ª carrera · {hora}",
-                                enlace, "una_hora",
-                            )
-                            if n:
-                                _marcar_avisado(uid, clave, "una_hora",
-                                                reunion["fecha"], hip)
-                                enviados += n
-
-    return {"enviados": enviados, "reuniones_revisadas": len(reuniones)}
-
-
-def revision_de_avisos():
-    """
-    Tarea de fondo: revisa cada 15 minutos si hay que avisarle a alguien.
-    Cada 15 minutos porque el aviso de 'una hora antes' necesita precision.
-    """
-    time.sleep(90)
-    while True:
-        try:
-            revisar_caballos_seguidos()
-        except Exception:
-            pass
-        time.sleep(15 * 60)
-
-
-@app.post("/api/admin/avisar-a-todos")
-def admin_avisar_a_todos():
-    """Aviso general: remates, torneos, novedades."""
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-    d = request.get_json(silent=True) or {}
-    titulo = clean(d.get("titulo", ""))
-    cuerpo = clean(d.get("cuerpo", ""))
-    if not titulo:
-        return jsonify(ok=False, error="Falta el título del aviso."), 400
-    n = avisar_a_todos(titulo, cuerpo, clean(d.get("url", "/")) or "/")
-    return jsonify(ok=True, enviados=n,
-                   mensaje=f"Aviso enviado a {n} celular(es).")
-
-
-@app.post("/api/admin/probar-aviso")
-def admin_probar_aviso():
-    """Manda un aviso de prueba a los celulares del admin."""
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-    con = db()
-    subs = con.execute("SELECT * FROM suscripciones ORDER BY creada_en DESC LIMIT 3").fetchall()
-    con.close()
-    if not subs:
-        return jsonify(ok=False,
-                       error="Todavía no hay ningún celular suscripto."), 404
-    n = sum(1 for s in subs
-            if enviar_aviso(dict(s), "Prueba de LEA WIN IA",
-                            "Si ves esto, los avisos funcionan.", "/", "prueba"))
-    return jsonify(ok=True, enviados=n,
-                   mensaje=f"Prueba enviada a {n} de {len(subs)} celular(es).")
-
-
-@app.get("/api/admin/estado-avisos")
-def admin_estado_avisos():
-    if not es_admin():
-        return jsonify(ok=False, error="Acceso restringido."), 403
-    con = db()
-    subs = con.execute("SELECT COUNT(*) c FROM suscripciones").fetchone()["c"]
-    seg = con.execute("SELECT COUNT(*) c FROM seguidos").fetchone()["c"]
-    env = con.execute("SELECT COUNT(*) c FROM avisos_enviados").fetchone()["c"]
-    ultimos = con.execute("""
-        SELECT caballo, tipo, fecha, hipodromo, enviado_en
-        FROM avisos_enviados ORDER BY id DESC LIMIT 20
-    """).fetchall()
-    con.close()
-    return jsonify(
-        ok=True,
-        claves_cargadas=hay_notificaciones(),
-        celulares_suscriptos=subs,
-        caballos_seguidos=seg,
-        avisos_enviados=env,
-        ultimos=[dict(u) for u in ultimos],
-    )
-
-
-@app.get("/sw.js")
-def service_worker():
-    """
-    El archivo que recibe los avisos. Tiene que servirse desde la raiz,
-    si no el navegador no le permite trabajar en toda la app.
-    """
-    from flask import send_from_directory
-    resp = send_from_directory("static", "sw.js", mimetype="application/javascript")
-    resp.headers["Service-Worker-Allowed"] = "/"
-    resp.headers["Cache-Control"] = "no-cache"
-    return resp
-
-
-@app.get("/manifest.json")
-def manifiesto():
-    """
-    Permite instalar la app en la pantalla de inicio del celular.
-    En iPhone esto es OBLIGATORIO para que lleguen los avisos.
-    """
-    return jsonify({
-        "name": "LEA WIN IA",
-        "short_name": "LEA WIN",
-        "description": "Pronóstico de carreras del Stud Book Argentino",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#153832",
-        "theme_color": "#153832",
-        "orientation": "portrait",
-        "icons": [
-            {"src": "/static/icono-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "/static/icono-512.png", "sizes": "512x512", "type": "image/png"},
-        ],
-    })
 
 
 @app.get("/api/videos")
@@ -3751,7 +2011,7 @@ def admin_recolectar():
         return jsonify(ok=False, error="Ya hay una recolección en curso."), 409
 
     body = request.get_json(silent=True) or {}
-    hoy = hoy_argentina()
+    hoy = datetime.now().strftime("%Y-%m-%d")
     desde = body.get("desde") or request.args.get("desde") or "2026-01-01"
     hasta = body.get("hasta") or request.args.get("hasta") or hoy
 
@@ -3798,10 +2058,6 @@ init_db()
 
 if os.getenv("REVISION_AUTOMATICA", "1") == "1":
     threading.Thread(target=revision_diaria, daemon=True).start()
-
-# Revision de avisos: cada 15 minutos, para que el "una hora antes" llegue a tiempo.
-if os.getenv("AVISOS_AUTOMATICOS", "1") == "1":
-    threading.Thread(target=revision_de_avisos, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
