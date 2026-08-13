@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LEA WIN IA — Contraseña nueva</title>
+<link rel="icon" href="/static/icono-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Archivo:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --verde-turf:#153832; --verde-turf-2:#1f4a42;
+    --pergamino:#f2ebda; --pergamino-2:#e7dcc2;
+    --bronce:#b6904f; --bronce-claro:#d9b877;
+    --carmin:#8c2a2a; --tinta:#241b14; --hueso:#faf6ee;
+    --verde-vivo:#2b8c6b;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; min-height:100vh;
+    background:radial-gradient(120% 140% at 15% 0%, var(--verde-turf-2) 0%, var(--verde-turf) 55%, #0f2621 100%);
+    color:var(--tinta); font-family:'Archivo',sans-serif; font-size:16px;
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .caja{
+    background:var(--hueso); border-radius:12px; width:100%; max-width:420px;
+    padding:32px 26px 28px;
+  }
+  .marca{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    letter-spacing:.06em; margin-bottom:18px;
+  }
+  .marca span{
+    font-family:'Space Mono',monospace; font-size:10px; color:var(--tinta);
+    background:var(--bronce-claro); padding:2px 6px; border-radius:3px;
+  }
+  h1{ font-family:'Fraunces',serif; font-size:25px; font-weight:600; margin:0 0 8px; }
+  .sub{ font-size:14px; opacity:.72; line-height:1.55; margin-bottom:22px; }
+  .sub b{ font-family:'Fraunces',serif; color:var(--verde-turf); }
+  .campo{ margin-bottom:15px; }
+  .campo label{
+    display:block; font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6; margin-bottom:7px;
+  }
+  .campo input{
+    width:100%; font-family:'Archivo',sans-serif; font-size:16px;
+    padding:14px 15px; border:1.5px solid var(--pergamino-2);
+    border-radius:8px; background:var(--pergamino); color:var(--tinta);
+  }
+  .campo input:focus{ outline:2px solid var(--bronce); outline-offset:-1px; }
+  .aviso{ font-size:13.5px; line-height:1.5; min-height:20px; margin-bottom:12px; }
+  .aviso.mal{ color:var(--carmin); }
+  .aviso.bien{ color:var(--verde-vivo); }
+  .btn{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--verde-turf); color:var(--hueso); border:none;
+    padding:16px; border-radius:8px; cursor:pointer; min-height:54px;
+  }
+  .btn:hover{ background:var(--verde-turf-2); }
+  .btn:disabled{ opacity:.5; cursor:not-allowed; }
+  .btn-ir{
+    width:100%; font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--bronce); color:var(--tinta); border:none;
+    padding:16px; border-radius:8px; cursor:pointer; min-height:54px;
+    margin-top:14px; display:block; text-align:center; text-decoration:none;
+  }
+  .vencido{
+    background:var(--pergamino); border-left:3px solid var(--carmin);
+    padding:14px 15px; border-radius:0 6px 6px 0; font-size:14.5px; line-height:1.55;
+  }
+  .listo-icono{
+    width:66px; height:66px; border-radius:50%; margin:0 auto 18px;
+    background:#e8f4ef; border:2.5px solid var(--verde-vivo);
+    display:flex; align-items:center; justify-content:center; font-size:32px;
+  }
+  .centrado{ text-align:center; }
+</style>
+</head>
+<body>
+<div class="caja">
+  <div class="marca">LEA WIN <span>IA</span></div>
+
+  {% if valido %}
+  <div id="formulario">
+    <h1>Elegí tu contraseña nueva</h1>
+    <div class="sub">
+      Estás cambiando la contraseña de <b>{{ usuario }}</b>.
+      Al guardarla vas a tener que entrar de nuevo en todos tus dispositivos.
+    </div>
+
+    <div class="campo">
+      <label>Contraseña nueva</label>
+      <input type="password" id="clave1" autocomplete="new-password"
+             placeholder="Al menos 4 caracteres">
+    </div>
+
+    <div class="campo">
+      <label>Repetila</label>
+      <input type="password" id="clave2" autocomplete="new-password"
+             placeholder="La misma otra vez"
+             onkeydown="if(event.key==='Enter') guardar()">
+    </div>
+
+    <div class="aviso" id="aviso"></div>
+    <button class="btn" id="btn" onclick="guardar()">Guardar la contraseña</button>
+  </div>
+
+  <div id="listo" style="display:none;" class="centrado">
+    <div class="listo-icono">✓</div>
+    <h1>Contraseña cambiada</h1>
+    <div class="sub">Ya podés entrar a la app con tu contraseña nueva.</div>
+    <a class="btn-ir" href="/">Ir a la app</a>
+  </div>
+
+  {% else %}
+  <h1>Este enlace ya no sirve</h1>
+  <div class="vencido">
+    Los enlaces valen 30 minutos y se pueden usar una sola vez.
+    Volvé a la app y tocá «Olvidé mi contraseña» para pedir uno nuevo.
+  </div>
+  <a class="btn-ir" href="/">Ir a la app</a>
+  {% endif %}
+</div>
+
+<script>
+const CODIGO = "{{ codigo }}";
+
+async function guardar(){
+  const c1 = document.getElementById('clave1').value;
+  const c2 = document.getElementById('clave2').value;
+  const aviso = document.getElementById('aviso');
+  const btn = document.getElementById('btn');
+
+  aviso.className = 'aviso mal';
+  if (c1.length < 4){
+    aviso.textContent = 'La contraseña tiene que tener al menos 4 caracteres.';
+    return;
+  }
+  if (c1 !== c2){
+    aviso.textContent = 'Las dos contraseñas tienen que ser iguales.';
+    return;
+  }
+
+  btn.disabled = true;
+  aviso.className = 'aviso';
+  aviso.textContent = 'Guardando…';
+  try{
+    const r = await fetch('/api/clave-nueva', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({codigo: CODIGO, clave: c1})
+    });
+    const d = await r.json();
+    if (d.ok === false) throw new Error(d.error);
+    document.getElementById('formulario').style.display = 'none';
+    document.getElementById('listo').style.display = 'block';
+  }catch(e){
+    aviso.className = 'aviso mal';
+    aviso.textContent = e.message;
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
