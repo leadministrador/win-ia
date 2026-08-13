@@ -938,6 +938,12 @@
     background:var(--bronce); color:var(--tinta); border:none;
     padding:14px; border-radius:8px; cursor:pointer; min-height:50px;
   }
+  .link-olvide{
+    background:none; border:none; cursor:pointer;
+    font-family:'Archivo',sans-serif; font-size:14px; font-weight:600;
+    color:var(--verde-turf); text-decoration:underline; padding:8px;
+  }
+  .link-olvide:hover{ color:var(--carmin); }
   .login-olvide{
     text-align:center; margin-top:16px; padding-top:14px;
     border-top:1px solid var(--pergamino-2);
@@ -1522,7 +1528,9 @@
     </button>
 
     <div class="login-olvide" id="login-olvide">
-      ¿Olvidaste la contraseña? Escribinos y te la cambiamos.
+      <button class="link-olvide" onclick="pedirEnlaceClave()">
+        ¿Olvidaste tu contraseña?
+      </button>
     </div>
   </div>
 </div>
@@ -1605,6 +1613,7 @@ async function apiGet(url){
     const err = new Error(data.error || 'Error de conexión con el servidor.');
     err.necesitaCuenta = !!data.necesita_cuenta;
     err.noExiste = !!data.no_existe;
+    err.sinCelular = !!data.sin_celular;
     throw err;
   }
   return data;
@@ -2025,9 +2034,25 @@ function renderPronostico(ranking, respuesta){
 function alternarMotivos(id){
   const el = document.getElementById(id);
   if (!el) return;
-  const abierto = el.classList.toggle('abierto');
-  const btn = el.previousElementSibling;
-  if (btn) btn.innerHTML = abierto ? '¿Por qué? ⌃' : '¿Por qué? ⌄';
+  const abriendo = !el.classList.contains('abierto');
+
+  // Se cierra cualquier otro abierto: si se abren todos, el último
+  // caballo queda tapado y hay que desplazarse para verlo.
+  document.querySelectorAll('.motivos.abierto').forEach(otro => {
+    otro.classList.remove('abierto');
+    const b = otro.previousElementSibling;
+    if (b) b.innerHTML = '¿Por qué? ⌄';
+  });
+
+  if (abriendo){
+    el.classList.add('abierto');
+    const btn = el.previousElementSibling;
+    if (btn) btn.innerHTML = '¿Por qué? ⌃';
+    // Que quede a la vista, aunque esté al final de la lista.
+    setTimeout(() => {
+      el.scrollIntoView({behavior:'smooth', block:'nearest'});
+    }, 60);
+  }
 }
 
 // ---------- Buscador de caballo con autocompletado ----------
@@ -2748,6 +2773,31 @@ async function enviarLogin(){
     }
   }finally{
     btn.disabled = false;
+  }
+}
+
+async function pedirEnlaceClave(){
+  const usuario = document.getElementById('login-usuario').value.trim();
+  const err = document.getElementById('login-error');
+  if (!usuario){
+    err.innerHTML = 'Escribí tu nombre de usuario arriba y volvé a tocar acá.';
+    document.getElementById('login-usuario').focus();
+    return;
+  }
+  err.innerHTML = 'Buscando…';
+  try{
+    const d = await apiPost('/api/olvide-clave', {usuario});
+    err.innerHTML = '<span style="color:var(--verde-vivo)">' + d.mensaje + '</span>';
+  }catch(e){
+    if (e.noExiste){
+      err.innerHTML = e.message +
+        '<button class="btn-crear-aqui" onclick="pasarACrear()">' +
+        'Crear la cuenta «' + usuario + '»</button>';
+    } else if (e.sinCelular){
+      err.innerHTML = e.message;
+    } else {
+      err.innerHTML = e.message;
+    }
   }
 }
 
