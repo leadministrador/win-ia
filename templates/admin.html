@@ -119,6 +119,34 @@
   .op-cond.sel{
     background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf);
   }
+  textarea.txt{
+    font-family:'Archivo',sans-serif; resize:vertical; line-height:1.5;
+  }
+  .previa-rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6;
+    margin-bottom:9px;
+  }
+  .previa-marco{
+    width:100%; height:520px; border:1.5px solid var(--pergamino-2);
+    border-radius:8px; background:#dfd6c2;
+  }
+  .anuncio-fila{
+    display:flex; align-items:center; gap:11px;
+    padding:12px 13px; border:1px solid var(--pergamino-2);
+    border-radius:6px; margin-bottom:8px; background:var(--hueso);
+  }
+  .anuncio-fila.vigente{ border-color:var(--verde-vivo, #2b8c6b); border-width:2px; }
+  .af-titulo{ font-family:'Fraunces',serif; font-weight:600; font-size:15px; }
+  .af-fechas{
+    font-family:'Space Mono',monospace; font-size:11px; opacity:.6; margin-top:3px;
+  }
+  .anuncio-fila.vigente .af-fechas{ color:#2b8c6b; opacity:1; }
+  .af-borrar{
+    background:none; border:1px solid var(--pergamino-2); color:var(--carmin);
+    width:34px; height:34px; border-radius:6px; cursor:pointer;
+    font-size:15px; flex-shrink:0;
+  }
   .btn-borrar{
     background:transparent; color:var(--carmin);
     border:1.5px solid var(--carmin);
@@ -261,6 +289,63 @@
     <button class="btn btn-borrar" style="width:100%; margin-top:14px;"
             onclick="avisarATodos()">Mandar a todos</button>
     <div class="progreso-txt" id="aviso-estado" style="margin-top:11px;"></div>
+  </div>
+
+  <h2>Anuncios</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Lo que cargues acá se muestra arriba de cualquier aviso que toque el usuario,
+    entre las fechas que elijas. Sirve para promocionar, informar o explicar.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="campo">
+      <label>Rótulo <span style="opacity:.55; text-transform:none;">(arriba del título)</span></label>
+      <input type="text" id="an-rotulo" class="txt" placeholder="Novedades, Torneo, Remate…">
+    </div>
+    <div class="campo" style="margin-top:12px;">
+      <label>Título</label>
+      <input type="text" id="an-titulo" class="txt" placeholder="Torneo de pronósticos este sábado">
+    </div>
+    <div class="campo" style="margin-top:12px;">
+      <label>Texto</label>
+      <textarea id="an-texto" class="txt" rows="4"
+        placeholder="Lo que quieras contarles"></textarea>
+    </div>
+
+    <div class="fila-form" style="margin-top:12px;">
+      <div class="campo" style="flex:1; min-width:150px;">
+        <label>Texto del botón <span style="opacity:.55; text-transform:none;">(opcional)</span></label>
+        <input type="text" id="an-btn-txt" class="txt" placeholder="Quiero participar">
+      </div>
+      <div class="campo" style="flex:1; min-width:150px;">
+        <label>A dónde lleva</label>
+        <input type="text" id="an-btn-url" class="txt" placeholder="https://…">
+      </div>
+    </div>
+
+    <div class="fila-form" style="margin-top:12px;">
+      <div class="campo">
+        <label>Desde</label>
+        <input type="date" id="an-desde">
+      </div>
+      <div class="campo">
+        <label>Hasta</label>
+        <input type="date" id="an-hasta">
+      </div>
+    </div>
+
+    <button class="btn btn-run" style="width:100%; margin-top:16px;"
+            onclick="verPrevia()">Ver cómo queda</button>
+
+    <div id="previa-caja" style="display:none; margin-top:16px;">
+      <div class="previa-rot">Así lo va a ver el usuario</div>
+      <iframe id="previa" class="previa-marco"></iframe>
+      <button class="btn btn-run" style="width:100%; margin-top:12px;"
+              onclick="guardarAnuncio()">Guardar el anuncio</button>
+    </div>
+
+    <div class="progreso-txt" id="an-estado" style="margin-top:11px;"></div>
+    <div id="lista-anuncios" style="margin-top:20px;"></div>
   </div>
   <h2>Últimas carreras comparadas</h2>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
@@ -491,6 +576,87 @@ async function guardarCondiciones(){
   }
 }
 
+// ---------- Anuncios ----------
+const hoyStr = new Date().toISOString().slice(0,10);
+document.getElementById('an-desde').value = hoyStr;
+document.getElementById('an-hasta').value = hoyStr;
+
+function datosAnuncio(){
+  return {
+    rotulo: document.getElementById('an-rotulo').value.trim(),
+    titulo: document.getElementById('an-titulo').value.trim(),
+    texto: document.getElementById('an-texto').value.trim(),
+    boton_texto: document.getElementById('an-btn-txt').value.trim(),
+    boton_url: document.getElementById('an-btn-url').value.trim(),
+    desde: document.getElementById('an-desde').value,
+    hasta: document.getElementById('an-hasta').value,
+  };
+}
+
+function verPrevia(){
+  const d = datosAnuncio();
+  const est = document.getElementById('an-estado');
+  if (!d.titulo){ est.textContent = 'Poné al menos un título.'; return; }
+  est.textContent = '';
+  // La vista previa arma la pantalla real, con datos de ejemplo abajo.
+  const url = '/aviso-previa?' + new URLSearchParams({
+    rotulo: d.rotulo, titulo: d.titulo, texto: d.texto,
+    boton_texto: d.boton_texto, boton_url: d.boton_url,
+    t: 'GULIETA corre hoy', d: 'Palermo · 3ª carrera · 15:30',
+    r: 'Tu caballo sale a la pista',
+  }).toString();
+  document.getElementById('previa').src = url;
+  document.getElementById('previa-caja').style.display = 'block';
+}
+
+async function guardarAnuncio(){
+  const d = datosAnuncio();
+  const est = document.getElementById('an-estado');
+  est.textContent = 'Guardando…';
+  try{
+    const r = await fetch('/api/admin/anuncio?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(d)
+    });
+    const j = await r.json();
+    est.textContent = j.mensaje || j.error;
+    if (j.ok){
+      document.getElementById('previa-caja').style.display = 'none';
+      verAnuncios();
+    }
+  }catch(e){ est.textContent = 'No se pudo guardar: ' + e.message; }
+}
+
+async function verAnuncios(){
+  try{
+    const r = await fetch('/api/admin/anuncios?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+    const cont = document.getElementById('lista-anuncios');
+    if (!d.anuncios.length){ cont.innerHTML = ''; return; }
+    cont.innerHTML = '<div class="previa-rot">Anuncios cargados</div>' +
+      d.anuncios.map(a => `
+        <div class="anuncio-fila ${a.vigente ? 'vigente' : ''}">
+          <div style="flex:1; min-width:0;">
+            <div class="af-titulo">${a.titulo}</div>
+            <div class="af-fechas">${a.desde} al ${a.hasta}${a.vigente ? ' · SE ESTÁ MOSTRANDO' : ''}</div>
+          </div>
+          <button class="af-borrar" onclick="borrarAnuncio(${a.id})">✕</button>
+        </div>`).join('');
+  }catch(e){}
+}
+
+async function borrarAnuncio(id){
+  if (!confirm('¿Borrar este anuncio?')) return;
+  try{
+    await fetch('/api/admin/borrar-anuncio?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id})
+    });
+    verAnuncios();
+  }catch(e){}
+}
+
 // ---------- Avisos al celular ----------
 async function verEstadoAvisos(){
   try{
@@ -591,6 +757,7 @@ verEstado();
 cargar();
 cargarHipodromosDelDia();
 verEstadoAvisos();
+verAnuncios();
 </script>
 </body>
 </html>
