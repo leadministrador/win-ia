@@ -1126,6 +1126,106 @@
     cursor:pointer; min-height:50px;
   }
   .btn-activar:hover{ background:#25795c; }
+  /* ===== DATOS PROPIOS DEL CABALLO ===== */
+  .comp-bloque{ margin-bottom:9px; }
+  .comp-bloque .comp-item{ border-radius:7px; margin-bottom:0; cursor:pointer; }
+  .comp-bloque.abierto .comp-item{
+    border-color:var(--bronce); border-radius:7px 7px 0 0;
+  }
+  .comp-bloque.retirado-por-mi{ opacity:.45; }
+  .comp-bloque.retirado-por-mi .comp-nombre{ text-decoration:line-through; }
+  .btn-datos-cab{
+    width:34px; height:34px; border-radius:50%; flex-shrink:0;
+    border:1.5px solid var(--pergamino-2); background:var(--pergamino);
+    color:#888; cursor:pointer; font-size:16px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .btn-datos-cab:hover{ border-color:var(--bronce); color:var(--bronce); }
+  .btn-datos-cab.cargado{
+    background:var(--bronce); border-color:var(--bronce); color:#fff;
+  }
+  .panel-datos{
+    display:none; background:var(--hueso);
+    border:1.5px solid var(--bronce); border-top:none;
+    border-radius:0 0 7px 7px; padding:16px 15px 18px;
+  }
+  .comp-bloque.abierto .panel-datos{ display:block; }
+  .pd-rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.55;
+    margin-bottom:13px; line-height:1.6;
+  }
+  .grupo-cab{ margin-bottom:15px; }
+  .grupo-cab > label{
+    display:block; font-family:'Space Mono',monospace; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.08em; opacity:.6; margin-bottom:7px;
+  }
+  .ops-cab{ display:flex; gap:7px; flex-wrap:wrap; }
+  .op-cab{
+    font-family:'Archivo',sans-serif; font-size:14px; padding:10px 14px;
+    border-radius:7px; border:1.5px solid var(--pergamino-2);
+    background:var(--pergamino); cursor:pointer; min-height:44px;
+    display:flex; align-items:center; color:var(--tinta);
+  }
+  .op-cab:hover{ border-color:var(--bronce); }
+  .op-cab.sel{ border-width:2px; font-weight:600; }
+  .op-cab.sel.bien{ background:#e8f4ef; border-color:var(--verde-vivo); color:var(--verde-vivo); }
+  .op-cab.sel.mal{ background:#fbeeee; border-color:var(--carmin); color:var(--carmin); }
+  .op-cab.sel.neutro{ background:var(--verde-turf); border-color:var(--verde-turf); color:var(--hueso); }
+  .txt-cab{
+    width:100%; font-family:'Archivo',sans-serif; font-size:15px;
+    padding:12px 13px; border:1.5px solid var(--pergamino-2);
+    border-radius:7px; background:var(--pergamino); color:var(--tinta);
+  }
+  .juicio-cab{
+    display:flex; gap:8px; align-items:center; margin-top:9px;
+    padding-top:11px; border-top:1px dashed var(--pergamino-2);
+  }
+  .juicio-rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    opacity:.55; margin-right:auto;
+  }
+  .pulgar{
+    border:1.5px solid var(--pergamino-2); background:var(--pergamino);
+    border-radius:7px; padding:9px 15px; cursor:pointer; font-size:17px;
+    min-height:42px; min-width:52px;
+  }
+  .pulgar.sel-bien{ background:#e8f4ef; border-color:var(--verde-vivo); border-width:2px; }
+  .pulgar.sel-mal{ background:#fbeeee; border-color:var(--carmin); border-width:2px; }
+  .btn-guardar-cab{
+    width:100%; margin-top:14px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:15px; background:var(--verde-turf);
+    color:var(--hueso); border:none; padding:14px; border-radius:8px;
+    cursor:pointer; min-height:50px;
+  }
+  .btn-limpiar-cab{
+    width:100%; margin-top:9px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:14px; background:transparent;
+    color:var(--carmin); border:1.5px solid var(--pergamino-2);
+    padding:12px; border-radius:8px; cursor:pointer; min-height:46px;
+  }
+  .marcas{ display:flex; gap:5px; flex-wrap:wrap; margin-top:6px; }
+  .marca{
+    font-family:'Space Mono',monospace; font-size:9.5px;
+    padding:2px 7px; border-radius:4px; white-space:nowrap;
+  }
+  .marca.bien{ background:#e8f4ef; color:var(--verde-vivo); }
+  .marca.mal{ background:#fbeeee; color:var(--carmin); }
+  .marca.neutro{ background:var(--pergamino-2); color:var(--tinta); }
+  .hist-cab{
+    margin-top:16px; padding-top:14px; border-top:1px solid var(--pergamino-2);
+  }
+  .hist-fila-cab{
+    display:flex; align-items:center; gap:10px; padding:7px 0; font-size:13px;
+  }
+  .hist-fecha-cab{
+    font-family:'Space Mono',monospace; font-size:11px; opacity:.6;
+    width:48px; flex-shrink:0;
+  }
+  .hist-puesto-cab{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    width:28px; flex-shrink:0;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1884,6 +1984,8 @@ async function elegirCarrera(c, itemEl){
     ultimosParticipantes = participantesActuales;
     ultimaCarreraData = carreraData;
     retiradosPorMi = [];
+    misDatos = {};
+    historialCaballo = {};
     await traerCondiciones(contexto.fecha, contexto.hipodromo);
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
     renderPronostico(analisis.ranking || [], analisis);
@@ -1929,14 +2031,14 @@ function renderCompetidores(participantes){
   const list = document.getElementById('comp-list');
   list.innerHTML = '';
   participantes.forEach((cp,idx)=>{
-    const row = document.createElement('div');
-    row.className = 'comp-item';
+    const bloque = document.createElement('div');
+    bloque.className = 'comp-bloque';
+    bloque.id = 'comp-bloque-' + idx;
+
     const numDisplay = cp.numero != null ? cp.numero : (idx+1);
     const subtitulo = cp.retirado
       ? 'RETIRADO — no corre'
       : [cp.jockey, cp.entrenador].filter(Boolean).join(' · ') || 'Sin datos de jockey';
-    row.style.opacity = cp.retirado ? '0.45' : '1';
-    if (marcadoRetirado(cp.nombre)) row.classList.add('retirado-por-mi');
 
     // Si la carrera ya se corrió, se muestra el puesto y lo que pagó.
     const yaCorrio = cp.puesto != null;
@@ -1944,26 +2046,236 @@ function renderCompetidores(participantes){
                       : cp.puesto === 2 ? 'p2'
                       : cp.puesto === 3 ? 'p3' : '';
 
-    row.innerHTML = `
-      <div class="silk" style="background:${cp.retirado ? '#999' : silks[idx % silks.length]}">${numDisplay}</div>
-      <div>
-        <div class="comp-nombre">${cp.nombre}</div>
-        <div class="comp-jinete">${subtitulo}</div>
+    // Lo que el usuario ya cargó de este caballo.
+    const mio = misDatos[normalizarTexto(cp.nombre)] || {};
+    const tieneDatos = Object.keys(mio).length > 0;
+    const marcas = Object.values(mio)
+      .map(m => `<span class="marca ${m.juicio}">${m.valor}</span>`).join('');
+
+    const seguro = (cp.nombre||'').replace(/'/g, "\\'");
+
+    bloque.innerHTML = `
+      <div class="comp-item" style="opacity:${cp.retirado ? '0.45' : '1'}"
+           onclick="abrirFicha(participantesActuales[${idx}], ${idx})">
+        <div class="silk" style="background:${cp.retirado ? '#999' : silks[idx % silks.length]}">${numDisplay}</div>
+        <div style="min-width:0;">
+          <div class="comp-nombre">${cp.nombre}</div>
+          <div class="comp-jinete">${subtitulo}</div>
+          ${marcas ? '<div class="marcas">'+marcas+'</div>' : ''}
+        </div>
+        <div class="comp-derecha">
+          ${yaCorrio ? `<span class="llego ${clasePuesto}">${cp.puesto}º</span>` : ''}
+          ${yaCorrio && cp.pago ? `<span class="pago">$${cp.pago}</span>` : ''}
+          <span class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</span>
+          ${(!cp.retirado && !yaCorrio)
+            ? `<button class="btn-datos-cab ${tieneDatos?'cargado':''}"
+                  title="Cargar lo que ves en el paddock"
+                  onclick="event.stopPropagation(); abrirDatosCaballo(${idx})"
+               >${tieneDatos ? '✓' : '+'}</button>
+               <button class="btn-retirar ${marcadoRetirado(cp.nombre)?'activo':''}"
+                  title="Marcar como retirado"
+                  onclick="event.stopPropagation(); alternarRetirado('${seguro}')"
+               >${marcadoRetirado(cp.nombre) ? '✕' : '−'}</button>`
+            : ''}
+        </div>
       </div>
-      <div class="comp-derecha">
-        ${yaCorrio ? `<span class="llego ${clasePuesto}">${cp.puesto}º</span>` : ''}
-        ${yaCorrio && cp.pago ? `<span class="pago">$${cp.pago}</span>` : ''}
-        <span class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</span>
-        ${(!cp.retirado && !yaCorrio)
-          ? `<button class="btn-retirar ${marcadoRetirado(cp.nombre)?'activo':''}"
-                title="Marcar como retirado"
-                onclick="event.stopPropagation(); alternarRetirado('${(cp.nombre||'').replace(/'/g,"\\'")}')"
-             >${marcadoRetirado(cp.nombre) ? '✕' : '−'}</button>`
-          : ''}
-      </div>`;
-    row.onclick = ()=> abrirFicha(cp, idx);
-    list.appendChild(row);
+      <div class="panel-datos" id="panel-datos-${idx}"></div>`;
+
+    if (marcadoRetirado(cp.nombre)) bloque.classList.add('retirado-por-mi');
+    list.appendChild(bloque);
   });
+}
+
+
+// ============================================================
+// DATOS PROPIOS DEL CABALLO
+// Lo que el usuario ve en el paddock. Cambia SU pronóstico,
+// queda en su historial, y no toca el oficial.
+// ============================================================
+
+let camposCaballo = [];
+let misDatos = {};          // {nombre en minúsculas: {campo: {valor, juicio}}}
+let historialCaballo = {};
+
+async function traerCamposCaballo(){
+  if (camposCaballo.length) return;
+  try{
+    const d = await apiGet('/api/campos-caballo');
+    camposCaballo = d.campos || [];
+  }catch(e){}
+}
+
+async function abrirDatosCaballo(idx){
+  const cp = participantesActuales[idx];
+  if (!cp) return;
+
+  if (!miUsuario){
+    abrirAvisoCuenta();
+    return;
+  }
+
+  const bloque = document.getElementById('comp-bloque-' + idx);
+  const estaba = bloque.classList.contains('abierto');
+  // Se cierra cualquier otro: con 14 caballos, si se abren todos no se ve nada.
+  document.querySelectorAll('.comp-bloque').forEach(b => b.classList.remove('abierto'));
+  if (estaba) return;
+  bloque.classList.add('abierto');
+
+  const panel = document.getElementById('panel-datos-' + idx);
+  panel.innerHTML = '<div class="pd-rot">Buscando…</div>';
+
+  await traerCamposCaballo();
+  const clave = normalizarTexto(cp.nombre);
+
+  // Traer lo cargado y el historial
+  try{
+    const d = await apiGet('/api/datos-caballo?caballo=' + encodeURIComponent(cp.nombre)
+      + '&fecha=' + encodeURIComponent(ultimoContexto.fecha || '')
+      + '&hipodromo=' + encodeURIComponent(ultimoContexto.hipodromo || ''));
+    misDatos[clave] = d.datos || {};
+    historialCaballo[clave] = d.historial || [];
+  }catch(e){
+    misDatos[clave] = misDatos[clave] || {};
+  }
+
+  pintarPanelDatos(idx);
+}
+
+function pintarPanelDatos(idx){
+  const cp = participantesActuales[idx];
+  const clave = normalizarTexto(cp.nombre);
+  const mio = misDatos[clave] || {};
+  const hist = historialCaballo[clave] || [];
+  const panel = document.getElementById('panel-datos-' + idx);
+  if (!panel) return;
+
+  let h = `<div class="pd-rot">Lo que ves en el paddock. Tocá 👍 o 💀 para
+    decir si lo ves a favor o en contra.</div>`;
+
+  camposCaballo.forEach(campo => {
+    const puesto = mio[campo.clave];
+    h += `<div class="grupo-cab"><label>${campo.titulo}</label>`;
+
+    if (campo.tipo === 'opciones'){
+      h += '<div class="ops-cab">' + campo.opciones.map(o => {
+        const sel = puesto && puesto.valor === o.v;
+        return `<div class="op-cab ${sel ? 'sel ' + puesto.juicio : ''}"
+          onclick="elegirDato(${idx},'${campo.clave}','${o.v}','${o.j}')">${o.v}</div>`;
+      }).join('') + '</div>';
+    } else if (campo.tipo === 'letras'){
+      h += `<input type="text" class="txt-cab" maxlength="${campo.largo}"
+        placeholder="${campo.ayuda || ''}" value="${puesto ? puesto.valor : ''}"
+        style="text-transform:uppercase; letter-spacing:.14em; font-family:'Space Mono',monospace;"
+        oninput="escribirDato(${idx},'${campo.clave}', this.value)">`;
+    } else if (campo.tipo === 'numero'){
+      h += `<input type="number" class="txt-cab" inputmode="numeric"
+        min="${campo.min}" max="${campo.max}" placeholder="${campo.ayuda || ''}"
+        value="${puesto ? puesto.valor : ''}"
+        oninput="escribirDato(${idx},'${campo.clave}', this.value)">`;
+    } else {
+      h += `<input type="text" class="txt-cab" maxlength="${campo.largo}"
+        placeholder="${campo.ayuda || ''}" value="${puesto ? puesto.valor : ''}"
+        oninput="escribirDato(${idx},'${campo.clave}', this.value)">`;
+    }
+
+    // Los pulgares, solo si hay algo cargado
+    if (puesto && puesto.valor){
+      h += `<div class="juicio-cab">
+        <span class="juicio-rot">¿A favor o en contra?</span>
+        <button class="pulgar ${puesto.juicio==='bien'?'sel-bien':''}"
+          onclick="juzgarDato(${idx},'${campo.clave}','bien')">👍</button>
+        <button class="pulgar ${puesto.juicio==='mal'?'sel-mal':''}"
+          onclick="juzgarDato(${idx},'${campo.clave}','mal')">💀</button>
+      </div>`;
+    }
+    h += '</div>';
+  });
+
+  const tiene = Object.keys(mio).length > 0;
+  h += `<button class="btn-guardar-cab" onclick="guardarDatosCaballo(${idx})">
+    Guardar y recalcular mi pronóstico</button>`;
+  if (tiene){
+    h += `<button class="btn-limpiar-cab" onclick="borrarDatosCaballo(${idx})">
+      Borrar lo cargado</button>`;
+  }
+
+  if (hist.length){
+    h += `<div class="hist-cab"><div class="pd-rot">Lo que cargaste antes</div>` +
+      hist.map(x => {
+        const vals = Object.values(x.datos || {})
+          .map(v => `<span class="marca ${v.juicio}">${v.valor}</span>`).join('');
+        const f = (x.fecha || '').split('-').reverse().slice(0,2).join('/');
+        return `<div class="hist-fila-cab">
+          <span class="hist-fecha-cab">${f}</span>
+          <span class="hist-puesto-cab">${x.puesto ? x.puesto + 'º' : '—'}</span>
+          <span class="marcas" style="margin:0;">${vals}</span>
+        </div>`;
+      }).join('') + '</div>';
+  }
+
+  panel.innerHTML = h;
+}
+
+function elegirDato(idx, campo, valor, juicio){
+  const clave = normalizarTexto(participantesActuales[idx].nombre);
+  misDatos[clave] = misDatos[clave] || {};
+  // Volver a tocar la misma opción la borra.
+  if (misDatos[clave][campo] && misDatos[clave][campo].valor === valor){
+    delete misDatos[clave][campo];
+  } else {
+    misDatos[clave][campo] = {valor, juicio};
+  }
+  pintarPanelDatos(idx);
+}
+
+function escribirDato(idx, campo, valor){
+  const clave = normalizarTexto(participantesActuales[idx].nombre);
+  misDatos[clave] = misDatos[clave] || {};
+  const limpio = (valor || '').trim();
+  if (!limpio){
+    delete misDatos[clave][campo];
+  } else {
+    const antes = misDatos[clave][campo];
+    misDatos[clave][campo] = {valor: limpio, juicio: antes ? antes.juicio : 'neutro'};
+  }
+  // No se repinta al escribir: se perdería el cursor.
+}
+
+function juzgarDato(idx, campo, juicio){
+  const clave = normalizarTexto(participantesActuales[idx].nombre);
+  if (!misDatos[clave] || !misDatos[clave][campo]) return;
+  // Volver a tocar el mismo pulgar lo deja neutro.
+  misDatos[clave][campo].juicio =
+    misDatos[clave][campo].juicio === juicio ? 'neutro' : juicio;
+  pintarPanelDatos(idx);
+}
+
+async function guardarDatosCaballo(idx){
+  const cp = participantesActuales[idx];
+  const clave = normalizarTexto(cp.nombre);
+  try{
+    const d = await apiPost('/api/datos-caballo', {
+      caballo: cp.nombre,
+      fecha: ultimoContexto.fecha || '',
+      hipodromo: ultimoContexto.hipodromo || '',
+      numero_carrera: ultimoContexto.numero,
+      datos: misDatos[clave] || {},
+    });
+    misDatos[clave] = d.datos || {};
+    mostrarToast(d.mensaje);
+    document.getElementById('comp-bloque-' + idx).classList.remove('abierto');
+    renderCompetidores(participantesActuales);
+    await recalcularPronostico();
+  }catch(e){
+    if (e.necesitaCuenta) abrirAvisoCuenta();
+    else mostrarToast('No se pudo guardar. ' + e.message);
+  }
+}
+
+async function borrarDatosCaballo(idx){
+  const clave = normalizarTexto(participantesActuales[idx].nombre);
+  misDatos[clave] = {};
+  await guardarDatosCaballo(idx);
 }
 
 function renderPronostico(ranking, respuesta){
