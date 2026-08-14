@@ -1567,6 +1567,11 @@ def calendario():
             lambda: calendar_from_meetings(fetch(BASE + "/reuniones"))
         )
         if meetings:
+            # El cache puede tener nombres viejos, con la sigla y los numeros
+            # pegados. Se limpian aca tambien, para no depender de vaciarlo.
+            for m in meetings:
+                m["hipodromo"] = _limpiar_nombre_hipodromo(m.get("hipodromo", ""))
+
             hoy = hoy_argentina()
             ahora = hora_argentina()
             fechas = sorted({m["fecha"] for m in meetings})
@@ -1677,6 +1682,9 @@ def reuniones():
 
     try:
         output, origen = con_cache(clave, TTL_REUNION, forzar, traer)
+        # Por si el cache guardo el nombre sucio.
+        for r in output:
+            r["hipodromo"] = _limpiar_nombre_hipodromo(r.get("hipodromo", ""))
         resp = {
             "ok": True,
             "reuniones": output,
@@ -4498,12 +4506,13 @@ def admin_datos_oficiales():
                    datos={"peso_corporal": peso, "herraje": herraje})
 
 
-@app.post("/api/admin/vaciar-cache")
+@app.route("/api/admin/vaciar-cache", methods=["GET", "POST"])
 def admin_vaciar_cache():
     """
     Borra lo guardado del Stud Book. Sirve cuando se corrige algo de la
     lectura y no se quiere esperar a que el cache venza solo.
     NO borra usuarios, pronosticos ni nada cargado a mano.
+    Se puede abrir directo desde la barra de direccion.
     """
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
