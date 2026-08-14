@@ -2688,6 +2688,26 @@ async function recalcularPronostico(){
 let miUsuario = null;
 let modoRegistro = false;
 
+let registroAbierto = true;
+
+async function verEstadoRegistro(){
+  try{
+    const d = await apiGet('/api/estado-registro');
+    registroAbierto = d.abierto !== false;
+  }catch(e){ registroAbierto = true; }
+  aplicarEstadoRegistro();
+}
+
+function aplicarEstadoRegistro(){
+  const btn = document.getElementById('btn-cambiar-modo');
+  const o = document.getElementById('login-o');
+  if (!btn) return;
+  // Si está cerrado, no se muestra la opción de crear cuenta.
+  const mostrar = registroAbierto || modoRegistro;
+  btn.style.display = mostrar ? 'block' : 'none';
+  if (o) o.style.display = mostrar ? 'block' : 'none';
+}
+
 async function verQuienSoy(){
   try{
     const d = await apiGet('/api/quien-soy');
@@ -2710,9 +2730,11 @@ function pintarUsuario(){
 }
 
 function abrirLogin(registro){
-  modoRegistro = !!registro;
+  // Si el registro está cerrado, siempre se abre en modo entrar.
+  modoRegistro = !!registro && registroAbierto;
   actualizarModo();
   document.getElementById('login-error').textContent = '';
+  aplicarEstadoRegistro();
   document.getElementById('login-overlay').classList.add('visible');
   sumarAlHistorial();
   setTimeout(()=> document.getElementById('login-usuario').focus(), 250);
@@ -3206,6 +3228,7 @@ async function pedirPermisoAvisos(){
 cargarCalendario();
 iniciarBuscador();
 verQuienSoy();
+verEstadoRegistro();
 iniciarBotonAtras();
 iniciarAvisos();
 </script>
