@@ -2821,7 +2821,33 @@ def usuario_actual():
         return None
 
 
-def _validar_registro(usuario, clave):
+def _limpiar_telefono(bruto):
+    """
+    Deja solo los digitos. Sirve para comparar y para guardar prolijo,
+    aunque el usuario escriba con guiones, espacios o parentesis.
+    """
+    return re.sub(r"\D", "", bruto or "")
+
+
+def _validar_telefono(bruto):
+    """
+    Un celular argentino tiene 10 digitos sin el 0 ni el 15
+    (por ejemplo 3585123456). Se aceptan de 8 a 13 para no dejar
+    afuera a nadie del interior ni a los que ponen el 54 adelante.
+    """
+    solo = _limpiar_telefono(bruto)
+    if not solo:
+        return "Poné tu número de celular."
+    if len(solo) < 8:
+        return "Ese número parece muy corto. Escribilo con la característica."
+    if len(solo) > 13:
+        return "Ese número parece muy largo. Revisalo."
+    if len(set(solo)) <= 1:
+        return "Ese número no parece real."
+    return None
+
+
+def _validar_registro(usuario, clave, telefono=""):
     """Devuelve un mensaje de error, o None si está todo bien."""
     if len(usuario) < 3:
         return "El usuario tiene que tener al menos 3 letras."
@@ -2831,6 +2857,9 @@ def _validar_registro(usuario, clave):
         return "El usuario solo puede tener letras, números, guiones y puntos."
     if len(clave) < 4:
         return "La contraseña tiene que tener al menos 4 caracteres."
+    error_tel = _validar_telefono(telefono)
+    if error_tel:
+        return error_tel
     return None
 
 
@@ -2841,9 +2870,10 @@ def api_registro():
     clave = d.get("clave", "")
     telefono = clean(d.get("telefono", ""))[:30]
 
-    error = _validar_registro(usuario, clave)
+    error = _validar_registro(usuario, clave, telefono)
     if error:
         return jsonify(ok=False, error=error), 400
+    telefono = _limpiar_telefono(telefono)
 
     clave_usuario = normalize_text(usuario)
     con = db()
@@ -3858,6 +3888,40 @@ def pantalla_aviso_previa():
         rotulo=clean(request.args.get("r", "")),
         ir="/",
     )
+
+
+@app.get("/api/mis-datos")
+def api_mis_datos():
+    """Lo que el usuario tiene cargado, para poder revisarlo."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False)
+    con = db()
+    fila = con.execute("SELECT usuario_visible, telefono, creado_en FROM usuarios WHERE id=?",
+                       (u["id"],)).fetchone()
+    con.close()
+    return jsonify(ok=True, ingresado=True, **dict(fila))
+
+
+@app.post("/api/cambiar-telefono")
+def api_cambiar_telefono():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Tenés que entrar a tu cuenta."), 401
+
+    d = request.get_json(silent=True) or {}
+    tel = clean(d.get("telefono", ""))[:30]
+    error = _validar_telefono(tel)
+    if error:
+        return jsonify(ok=False, error=error), 400
+
+    con = db()
+    con.execute("UPDATE usuarios SET telefono=? WHERE id=?",
+                (_limpiar_telefono(tel), u["id"]))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Número guardado.")
 
 
 @app.get("/api/videos")
