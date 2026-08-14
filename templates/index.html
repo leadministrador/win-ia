@@ -1226,6 +1226,23 @@
     font-family:'Fraunces',serif; font-weight:700; font-size:14px;
     width:28px; flex-shrink:0;
   }
+  .btn-oficial{
+    width:34px; height:34px; border-radius:50%; flex-shrink:0;
+    border:1.5px solid var(--carmin); background:var(--hueso);
+    color:var(--carmin); cursor:pointer; font-size:15px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .btn-oficial:hover{ background:var(--carmin); color:#fff; }
+  .btn-oficial.cargado{ background:var(--carmin); color:#fff; }
+  .marca.oficial{
+    background:var(--carmin); color:#fff; font-weight:700;
+  }
+  .btn-guardar-of{
+    width:100%; margin-top:14px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:15px; background:var(--carmin);
+    color:#fff; border:none; padding:14px; border-radius:8px;
+    cursor:pointer; min-height:50px;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1986,7 +2003,9 @@ async function elegirCarrera(c, itemEl){
     retiradosPorMi = [];
     misDatos = {};
     historialCaballo = {};
+    await traerDatosOficiales(contexto.fecha, contexto.hipodromo);
     await traerCondiciones(contexto.fecha, contexto.hipodromo);
+    renderCompetidores(participantesActuales);
     const analisis = await apiPost('/api/analizar', {...contexto, participantes: participantesActuales});
     renderPronostico(analisis.ranking || [], analisis);
   }catch(e){
@@ -2046,6 +2065,14 @@ function renderCompetidores(participantes){
                       : cp.puesto === 2 ? 'p2'
                       : cp.puesto === 3 ? 'p3' : '';
 
+    // Lo que cargó el admin: peso corporal y herraje, para todos.
+    const oficial = datosOficiales[normalizarTexto(cp.nombre)] || null;
+    const marcaOficial = oficial
+      ? `<span class="marca oficial">${
+          [oficial.peso_corporal ? oficial.peso_corporal + ' kg' : '',
+           oficial.herraje || ''].filter(Boolean).join(' · ')}</span>`
+      : '';
+
     // Lo que el usuario ya cargó de este caballo.
     const mio = misDatos[normalizarTexto(cp.nombre)] || {};
     const tieneDatos = Object.keys(mio).length > 0;
@@ -2061,12 +2088,19 @@ function renderCompetidores(participantes){
         <div style="min-width:0;">
           <div class="comp-nombre">${cp.nombre}</div>
           <div class="comp-jinete">${subtitulo}</div>
-          ${marcas ? '<div class="marcas">'+marcas+'</div>' : ''}
+          ${(marcaOficial || marcas)
+            ? '<div class="marcas">'+marcaOficial+marcas+'</div>' : ''}
         </div>
         <div class="comp-derecha">
           ${yaCorrio ? `<span class="llego ${clasePuesto}">${cp.puesto}º</span>` : ''}
           ${yaCorrio && cp.pago ? `<span class="pago">$${cp.pago}</span>` : ''}
           <span class="comp-peso">${cp.peso ? cp.peso + ' kg' : ''}</span>
+          ${(soyAdmin && !cp.retirado && !yaCorrio)
+            ? `<button class="btn-oficial ${oficial ? 'cargado' : ''}"
+                  title="Cargar peso y herraje (oficial)"
+                  onclick="event.stopPropagation(); abrirOficial(${idx})"
+               >⚙</button>`
+            : ''}
           ${(!cp.retirado && !yaCorrio)
             ? `<button class="btn-datos-cab ${tieneDatos?'cargado':''}"
                   title="Cargar lo que ves en el paddock"
@@ -2276,6 +2310,103 @@ async function borrarDatosCaballo(idx){
   const clave = normalizarTexto(participantesActuales[idx].nombre);
   misDatos[clave] = {};
   await guardarDatosCaballo(idx);
+}
+
+
+// ============================================================
+// DATOS OFICIALES QUE CARGA EL ADMIN
+// Peso corporal y herraje. El Stud Book solo los publica DESPUÉS
+// de la carrera, así que los carga el admin el mismo día.
+// Entran al pronóstico OFICIAL, el que se compara con el resultado.
+// ============================================================
+
+let soyAdmin = false;
+let datosOficiales = {};
+
+function claveAdminDeLaDireccion(){
+  // El admin entra con ?clave=... y así la app sabe que es él.
+  const p = new URLSearchParams(location.search);
+  return p.get('clave') || '';
+}
+
+async function traerDatosOficiales(fecha, hipodromo){
+  try{
+    const d = await apiGet('/api/datos-oficiales?fecha=' + encodeURIComponent(fecha)
+      + '&hipodromo=' + encodeURIComponent(hipodromo)
+      + (claveAdminDeLaDireccion() ? '&clave=' + encodeURIComponent(claveAdminDeLaDireccion()) : ''));
+    datosOficiales = d.datos || {};
+    soyAdmin = !!d.es_admin;
+  }catch(e){
+    datosOficiales = {};
+  }
+}
+
+function abrirOficial(idx){
+  const cp = participantesActuales[idx];
+  if (!cp) return;
+  const bloque = document.getElementById('comp-bloque-' + idx);
+  const estaba = bloque.classList.contains('abierto');
+  document.querySelectorAll('.comp-bloque').forEach(b => b.classList.remove('abierto'));
+  if (estaba) return;
+  bloque.classList.add('abierto');
+
+  const of = datosOficiales[normalizarTexto(cp.nombre)] || {};
+  const panel = document.getElementById('panel-datos-' + idx);
+  panel.innerHTML = `
+    <div class="pd-rot" style="color:var(--carmin)">Datos oficiales — los ven todos
+      y entran al pronóstico oficial</div>
+
+    <div class="grupo-cab">
+      <label>Kilos del caballo</label>
+      <input type="number" class="txt-cab" id="of-peso-${idx}" inputmode="numeric"
+             min="300" max="650" placeholder="Entre 300 y 650"
+             value="${of.peso_corporal || ''}">
+    </div>
+
+    <div class="grupo-cab">
+      <label>Herraje</label>
+      <input type="text" class="txt-cab" id="of-herraje-${idx}" maxlength="4"
+             placeholder="Las cuatro letras"
+             style="text-transform:uppercase; letter-spacing:.2em; font-family:'Space Mono',monospace;"
+             value="${of.herraje || ''}">
+    </div>
+
+    <button class="btn-guardar-of" onclick="guardarOficial(${idx})">
+      Guardar para todos</button>
+    <button class="btn-limpiar-cab" onclick="cerrarOficial(${idx})">Cerrar</button>`;
+}
+
+function cerrarOficial(idx){
+  document.getElementById('comp-bloque-' + idx).classList.remove('abierto');
+}
+
+async function guardarOficial(idx){
+  const cp = participantesActuales[idx];
+  const peso = document.getElementById('of-peso-' + idx).value.trim();
+  const herraje = document.getElementById('of-herraje-' + idx).value.trim();
+  try{
+    const d = await apiPost('/api/admin/datos-oficiales?clave='
+      + encodeURIComponent(claveAdminDeLaDireccion()), {
+      caballo: cp.nombre,
+      fecha: ultimoContexto.fecha || '',
+      hipodromo: ultimoContexto.hipodromo || '',
+      numero_carrera: ultimoContexto.numero,
+      peso_corporal: peso,
+      herraje: herraje,
+    });
+    const clave = normalizarTexto(cp.nombre);
+    if (d.datos && (d.datos.peso_corporal || d.datos.herraje)){
+      datosOficiales[clave] = d.datos;
+    } else {
+      delete datosOficiales[clave];
+    }
+    mostrarToast(d.mensaje);
+    cerrarOficial(idx);
+    renderCompetidores(participantesActuales);
+    await recalcularPronostico();
+  }catch(e){
+    mostrarToast('No se pudo guardar. ' + e.message);
+  }
 }
 
 function renderPronostico(ranking, respuesta){
