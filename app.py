@@ -150,6 +150,18 @@ def init_db():
       valor TEXT NOT NULL,
       cambiado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS datos_caballo(
+      usuario_id INTEGER NOT NULL,
+      caballo TEXT NOT NULL,          -- en minusculas
+      caballo_visible TEXT NOT NULL,
+      fecha TEXT NOT NULL,            -- fecha de la carrera
+      hipodromo TEXT,
+      numero_carrera INTEGER,
+      datos TEXT NOT NULL,            -- lo que cargo, en formato JSON
+      puesto INTEGER,                 -- se completa cuando corre
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(usuario_id, caballo, fecha, hipodromo)
+    );
     """)
     con.commit()
     con.close()
@@ -1983,7 +1995,7 @@ def analizar():
     except Exception:
         pass  # que un fallo al guardar nunca rompa el pronostico al usuario
 
-    # --- CONDICIONES DEL USUARIO: si cambio alguna, se recalcula para el ---
+    # --- CONDICIONES Y DATOS DEL USUARIO: recalculan SU pronostico ---
     del_usuario = data.get("condiciones_usuario") or {}
     cambiadas = {
         c["clave"]: clean(del_usuario.get(c["clave"], ""))
@@ -1992,7 +2004,23 @@ def analizar():
         and clean(del_usuario.get(c["clave"], "")) != contexto_oficial.get(c["clave"], "")
     }
 
-    if cambiadas or retirados_usuario:
+    # Lo que cargo de cada caballo: {nombre: {campo: {valor, juicio}}}
+    datos_caballos = {}
+    u = usuario_actual()
+    if u:
+        con = db()
+        filas = con.execute("""
+            SELECT caballo, datos FROM datos_caballo
+            WHERE usuario_id=? AND fecha=? AND hipodromo=?
+        """, (u["id"], fecha, normalize_text(hipodromo))).fetchall()
+        con.close()
+        for f in filas:
+            try:
+                datos_caballos[f["caballo"]] = json.loads(f["datos"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    if cambiadas or retirados_usuario or datos_caballos:
         contexto_usuario = dict(contexto_oficial)
         contexto_usuario.update(cambiadas)
         # Se sacan los que el usuario marco como retirados.
@@ -2003,6 +2031,30 @@ def analizar():
         contexto_usuario["participantes"] = suyos
         _, top_usuario = rankear(suyos, contexto_usuario, pesos)
 
+        # Lo que cargo el usuario suma o resta sobre el puntaje ya calculado.
+        if datos_caballos:
+            todos_u, _ = rankear(suyos, contexto_usuario, pesos)
+            for h in todos_u:
+                d_c = datos_caballos.get(normalize_text(h.get("nombre", "")))
+                if not d_c:
+                    continue
+                extra, motivos_u = puntos_del_usuario(d_c)
+                h["score"] = round(h["score"] + extra, 1)
+                h["motivos"] = motivos_u + (h.get("motivos") or [])
+            todos_u.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
+            top_usuario = todos_u[:4]
+            # Se recalcula el porcentaje con los puntajes nuevos.
+            if top_usuario:
+                piso = min(x["score"] for x in todos_u)
+                ventajas = [max(1.0, x["score"] - piso) + 12 for x in top_usuario]
+                suma = sum(ventajas) or 1
+                for x, v in zip(top_usuario, ventajas):
+                    x["probabilidad_relativa"] = round(v / suma * 100, 1)
+                dif = round(100 - sum(x["probabilidad_relativa"] for x in top_usuario), 1)
+                if abs(dif) >= 0.1:
+                    top_usuario[0]["probabilidad_relativa"] = round(
+                        top_usuario[0]["probabilidad_relativa"] + dif, 1)
+
         avisos = []
         if cambiadas:
             avisos.append("tus condiciones")
@@ -2010,6 +2062,8 @@ def analizar():
             n = len(horses) - len(suyos)
             if n:
                 avisos.append(f"{n} retiro(s) que marcaste")
+        if datos_caballos:
+            avisos.append(f"lo que cargaste de {len(datos_caballos)} caballo(s)")
 
         return jsonify(
             ok=True,
@@ -4005,6 +4059,214 @@ def admin_cambiar_ajuste():
 def api_estado_registro():
     """La pantalla pregunta esto para saber si mostrar el botón de crear."""
     return jsonify(ok=True, abierto=ajuste("registro_abierto"))
+
+
+# ============================================================
+# DATOS PROPIOS DEL CABALLO
+# Lo que el usuario ve en el paddock. Cambia SU pronostico, queda
+# en su historial, y no toca el oficial ni el aprendizaje.
+# Cada dato lleva su valoracion: a favor, en contra o neutra.
+# ============================================================
+
+CAMPOS_CABALLO = [
+    {"clave": "vendaje", "titulo": "Vendaje", "tipo": "opciones",
+     "opciones": [
+        {"v": "Sin vendaje", "j": "neutro"},
+        {"v": "En las manos", "j": "neutro"},
+        {"v": "En las patas", "j": "neutro"},
+        {"v": "En las cuatro", "j": "mal"},
+     ]},
+    {"clave": "herraje", "titulo": "Herraje", "tipo": "letras",
+     "ayuda": "Las cuatro letras tal como las publican.",
+     "largo": 4},
+    {"clave": "kilos", "titulo": "Kilos del caballo", "tipo": "numero",
+     "ayuda": "El peso corporal, si lo sabés.",
+     "min": 300, "max": 650},
+    {"clave": "animo", "titulo": "Cómo lo ves", "tipo": "opciones",
+     "opciones": [
+        {"v": "Tranquilo", "j": "bien"},
+        {"v": "Nervioso", "j": "mal"},
+        {"v": "Se planta", "j": "mal"},
+        {"v": "Tira", "j": "mal"},
+     ]},
+    {"clave": "estado", "titulo": "Estado", "tipo": "opciones",
+     "opciones": [
+        {"v": "Brilloso", "j": "bien"},
+        {"v": "Opaco", "j": "mal"},
+        {"v": "Sudado", "j": "mal"},
+        {"v": "Flaco", "j": "mal"},
+     ]},
+    {"clave": "monta", "titulo": "Cambio de monta", "tipo": "opciones",
+     "opciones": [
+        {"v": "Sigue igual", "j": "neutro"},
+        {"v": "Mejoró", "j": "bien"},
+        {"v": "Desmejoró", "j": "mal"},
+     ]},
+    {"clave": "observaciones", "titulo": "Observaciones", "tipo": "texto",
+     "ayuda": "Lo que no entre en las opciones.", "largo": 200},
+]
+
+# Cuanto mueve cada valoracion del usuario. Pesa bastante: si el que esta
+# en la cancha ve al favorito nervioso y sudado, eso tiene que notarse.
+# Empiezan parejo entre si; con el tiempo se vera cuales sirven de verdad.
+PESO_A_FAVOR = 14.0
+PESO_EN_CONTRA = -14.0
+
+
+def _limpiar_datos_caballo(bruto):
+    """Solo deja pasar lo que corresponde a cada campo."""
+    limpio = {}
+    for campo in CAMPOS_CABALLO:
+        entrada = (bruto or {}).get(campo["clave"])
+        if not isinstance(entrada, dict):
+            continue
+        valor = clean(str(entrada.get("valor", "")))
+        if not valor:
+            continue
+        juicio = entrada.get("juicio", "neutro")
+        if juicio not in ("bien", "mal", "neutro"):
+            juicio = "neutro"
+
+        if campo["tipo"] == "opciones":
+            if valor not in [o["v"] for o in campo["opciones"]]:
+                continue
+        elif campo["tipo"] == "letras":
+            valor = re.sub(r"[^A-Za-z]", "", valor).upper()[:campo["largo"]]
+            if not valor:
+                continue
+        elif campo["tipo"] == "numero":
+            n = _to_float(valor)
+            if n is None or not (campo["min"] <= n <= campo["max"]):
+                continue
+            valor = str(int(n))
+        elif campo["tipo"] == "texto":
+            valor = valor[:campo["largo"]]
+
+        limpio[campo["clave"]] = {"valor": valor, "juicio": juicio}
+    return limpio
+
+
+def puntos_del_usuario(datos):
+    """
+    Cuanto suma o resta lo que cargo el usuario. Cada dato cuenta segun
+    la valoracion que EL le puso, no una que inventemos nosotros.
+    """
+    if not datos:
+        return 0.0, []
+    puntos, motivos = 0.0, []
+    for campo in CAMPOS_CABALLO:
+        d = datos.get(campo["clave"])
+        if not d:
+            continue
+        if d["juicio"] == "bien":
+            puntos += PESO_A_FAVOR
+            motivos.append(f"vos lo ves a favor: {campo['titulo'].lower()} {d['valor'].lower()}")
+        elif d["juicio"] == "mal":
+            puntos += PESO_EN_CONTRA
+            motivos.append(f"vos lo ves en contra: {campo['titulo'].lower()} {d['valor'].lower()}")
+    return puntos, motivos
+
+
+@app.get("/api/campos-caballo")
+def api_campos_caballo():
+    """Las opciones que puede cargar el usuario."""
+    return jsonify(ok=True, campos=CAMPOS_CABALLO)
+
+
+@app.get("/api/datos-caballo")
+def api_datos_caballo():
+    """
+    Lo que el usuario cargo de un caballo: para esta carrera y el
+    historial de las anteriores.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, datos={}, historial=[])
+
+    caballo = normalize_text(request.args.get("caballo", ""))
+    fecha = clean(request.args.get("fecha", ""))
+    hip = normalize_text(request.args.get("hipodromo", ""))
+    if not caballo:
+        return jsonify(ok=False, error="Falta el caballo."), 400
+
+    con = db()
+    actual = con.execute("""
+        SELECT datos FROM datos_caballo
+        WHERE usuario_id=? AND caballo=? AND fecha=? AND hipodromo=?
+    """, (u["id"], caballo, fecha, hip)).fetchone()
+
+    historial = con.execute("""
+        SELECT fecha, hipodromo, numero_carrera, datos, puesto
+        FROM datos_caballo
+        WHERE usuario_id=? AND caballo=? AND NOT (fecha=? AND hipodromo=?)
+        ORDER BY fecha DESC LIMIT 12
+    """, (u["id"], caballo, fecha, hip)).fetchall()
+    con.close()
+
+    def leer(t):
+        try:
+            return json.loads(t)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    return jsonify(
+        ok=True, ingresado=True,
+        datos=leer(actual["datos"]) if actual else {},
+        historial=[{
+            "fecha": h["fecha"],
+            "hipodromo": h["hipodromo"],
+            "numero": h["numero_carrera"],
+            "puesto": h["puesto"],
+            "datos": leer(h["datos"]),
+        } for h in historial],
+    )
+
+
+@app.post("/api/datos-caballo")
+def api_guardar_datos_caballo():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá una cuenta gratis para cargar tus datos."), 401
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    fecha = clean(d.get("fecha", ""))
+    hip = clean(d.get("hipodromo", ""))
+    if not nombre or not fecha:
+        return jsonify(ok=False, error="Faltan el caballo y la fecha."), 400
+
+    datos = _limpiar_datos_caballo(d.get("datos"))
+    con = db()
+    if not datos:
+        # Si borro todo, se saca el registro.
+        con.execute("""
+            DELETE FROM datos_caballo
+            WHERE usuario_id=? AND caballo=? AND fecha=? AND hipodromo=?
+        """, (u["id"], normalize_text(nombre), fecha, normalize_text(hip)))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, datos={}, mensaje="Se borró lo que habías cargado.")
+
+    numero = d.get("numero_carrera")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        numero = None
+
+    con.execute("""
+        INSERT INTO datos_caballo(usuario_id, caballo, caballo_visible, fecha,
+                                  hipodromo, numero_carrera, datos, cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id, caballo, fecha, hipodromo) DO UPDATE SET
+          datos=excluded.datos, numero_carrera=excluded.numero_carrera,
+          cargado_en=excluded.cargado_en
+    """, (u["id"], normalize_text(nombre), nombre, fecha, normalize_text(hip),
+          numero, json.dumps(datos, ensure_ascii=False),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, datos=datos, mensaje="Guardado.")
 
 
 @app.get("/api/videos")
