@@ -145,6 +145,11 @@ def init_db():
       hasta TEXT NOT NULL,
       creado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ajustes(
+      clave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL,
+      cambiado_en TEXT NOT NULL
+    );
     """)
     con.commit()
     con.close()
@@ -2865,6 +2870,13 @@ def _validar_registro(usuario, clave, telefono=""):
 
 @app.post("/api/registro")
 def api_registro():
+    if not ajuste("registro_abierto"):
+        return jsonify(
+            ok=False, registro_cerrado=True,
+            error=("Por ahora no estamos aceptando cuentas nuevas. "
+                   "Volvé a probar más tarde."),
+        ), 403
+
     d = request.get_json(silent=True) or {}
     usuario = clean(d.get("usuario", ""))
     clave = d.get("clave", "")
@@ -3424,6 +3436,8 @@ def revisar_caballos_seguidos():
     """
     if not hay_notificaciones():
         return {"enviados": 0, "motivo": "faltan las claves"}
+    if not ajuste("avisos_encendidos"):
+        return {"enviados": 0, "motivo": "los avisos estan apagados en el panel"}
 
     con = db()
     seguidos = con.execute("""
@@ -3922,6 +3936,75 @@ def api_cambiar_telefono():
     con.commit()
     con.close()
     return jsonify(ok=True, mensaje="Número guardado.")
+
+
+# ============================================================
+# AJUSTES
+# Interruptores que el admin prende y apaga desde el panel,
+# sin tener que tocar el codigo ni volver a publicar.
+# ============================================================
+
+AJUSTES_POSIBLES = [
+    {"clave": "registro_abierto", "titulo": "Dejar crear cuentas nuevas",
+     "ayuda": "Si lo apagás, nadie puede registrarse. Los que ya tienen cuenta entran igual.",
+     "por_defecto": "1"},
+    {"clave": "avisos_encendidos", "titulo": "Mandar avisos automáticos",
+     "ayuda": "Los de caballo inscripto y una hora antes de la carrera.",
+     "por_defecto": "1"},
+]
+
+
+def ajuste(clave):
+    """Devuelve True o False. Si nunca se tocó, usa el valor por defecto."""
+    por_defecto = "1"
+    for a in AJUSTES_POSIBLES:
+        if a["clave"] == clave:
+            por_defecto = a["por_defecto"]
+            break
+    try:
+        con = db()
+        fila = con.execute("SELECT valor FROM ajustes WHERE clave=?",
+                           (clave,)).fetchone()
+        con.close()
+        return (fila["valor"] if fila else por_defecto) == "1"
+    except Exception:
+        return por_defecto == "1"
+
+
+@app.get("/api/admin/ajustes")
+def admin_ver_ajustes():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    return jsonify(ok=True, ajustes=[
+        {**a, "encendido": ajuste(a["clave"])} for a in AJUSTES_POSIBLES
+    ])
+
+
+@app.post("/api/admin/ajuste")
+def admin_cambiar_ajuste():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [a["clave"] for a in AJUSTES_POSIBLES]:
+        return jsonify(ok=False, error="Ese ajuste no existe."), 400
+    valor = "1" if d.get("encendido") else "0"
+    con = db()
+    con.execute("""
+        INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)
+        ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                         cambiado_en=excluded.cambiado_en
+    """, (clave, valor, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, encendido=(valor == "1"),
+                   mensaje="Ajuste guardado.")
+
+
+@app.get("/api/estado-registro")
+def api_estado_registro():
+    """La pantalla pregunta esto para saber si mostrar el botón de crear."""
+    return jsonify(ok=True, abierto=ajuste("registro_abierto"))
 
 
 @app.get("/api/videos")
