@@ -1300,6 +1300,24 @@ def meeting_date_from_url(url):
         return ""
 
 
+def _limpiar_nombre_hipodromo(bruto):
+    """
+    El sitio devuelve el nombre con basura pegada, por ejemplo:
+        "SIS San Isidro 13 131"  ->  "San Isidro"
+        "ARG Palermo 16 128"     ->  "Palermo"
+    Los numeros son la cantidad de carreras y los ejemplares, no van
+    en el nombre. La sigla del principio tampoco.
+    """
+    n = clean(bruto)
+    if not n:
+        return "Hipódromo"
+    # Sacar la sigla del principio: dos a cuatro mayusculas sueltas.
+    n = re.sub(r"^[A-Z]{2,4}\s+", "", n)
+    # Sacar los numeros del final.
+    n = re.sub(r"(\s+\d+)+\s*$", "", n)
+    return clean(n) or clean(bruto)
+
+
 def calendar_from_meetings(soup):
     meetings = []
     seen = set()
@@ -1307,7 +1325,7 @@ def calendar_from_meetings(soup):
     for link in soup.select('a[href*="/reuniones/detalle/"]'):
         href = urljoin(BASE, link.get("href", ""))
         date = meeting_date_from_url(href)
-        racecourse = clean(link.get_text(" ")) or "Hipódromo"
+        racecourse = _limpiar_nombre_hipodromo(link.get_text(" "))
 
         if not date:
             continue
@@ -1634,12 +1652,14 @@ def reuniones():
 
     def traer():
         calendar = calendar_from_meetings(fetch(BASE + "/reuniones"))
+        # El nombre puede venir sucio del cache viejo ("SIS San Isidro 13 131"),
+        # asi que se compara con los dos limpios.
+        buscado = normalize_text(_limpiar_nombre_hipodromo(hipodromo))
         selected = [
             meeting
             for meeting in calendar
             if meeting["fecha"] == fecha
-            and normalize_text(meeting["hipodromo"])
-            == normalize_text(hipodromo)
+            and normalize_text(_limpiar_nombre_hipodromo(meeting["hipodromo"])) == buscado
         ]
         output = []
         for meeting in selected:
@@ -4476,6 +4496,25 @@ def admin_datos_oficiales():
     con.close()
     return jsonify(ok=True, mensaje=f"Guardado para {nombre}.",
                    datos={"peso_corporal": peso, "herraje": herraje})
+
+
+@app.post("/api/admin/vaciar-cache")
+def admin_vaciar_cache():
+    """
+    Borra lo guardado del Stud Book. Sirve cuando se corrige algo de la
+    lectura y no se quiere esperar a que el cache venza solo.
+    NO borra usuarios, pronosticos ni nada cargado a mano.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM cache").fetchone()["c"]
+    con.execute("DELETE FROM cache")
+    con.commit()
+    con.close()
+    return jsonify(ok=True, borrados=n,
+                   mensaje=f"Se vaciaron {n} datos guardados. "
+                           "La próxima consulta los trae de nuevo del sitio.")
 
 
 @app.get("/api/videos")
