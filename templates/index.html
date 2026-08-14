@@ -896,6 +896,10 @@
     border-radius:8px; background:var(--pergamino); color:var(--tinta);
   }
   .login-campo input:focus{ outline:2px solid var(--bronce); outline-offset:-1px; }
+  .ayuda-campo{
+    font-family:'Space Mono',monospace; font-size:10.5px;
+    opacity:.55; margin-top:6px; line-height:1.5;
+  }
   .login-error{
     color:var(--carmin); font-size:13px; line-height:1.5;
     min-height:18px; margin-bottom:10px;
@@ -1511,8 +1515,12 @@
     </div>
 
     <div class="login-campo" id="campo-telefono" style="display:none;">
-      <label>Teléfono <span style="opacity:.55; text-transform:none;">(opcional)</span></label>
-      <input type="tel" id="login-telefono" placeholder="Por si olvidás la contraseña">
+      <label>Tu celular</label>
+      <input type="tel" id="login-telefono" inputmode="numeric"
+             placeholder="Ej: 3585123456">
+      <div class="ayuda-campo">
+        Con la característica, sin el 0 ni el 15.
+      </div>
     </div>
 
     <div class="login-error" id="login-error"></div>
@@ -2747,6 +2755,11 @@ async function enviarLogin(){
 
   if (!usuario || !clave){
     err.textContent = 'Poné el usuario y la contraseña.';
+    return;
+  }
+  if (modoRegistro && !telefono){
+    err.textContent = 'Poné tu celular. Lo usamos para poder contactarte.';
+    document.getElementById('login-telefono').focus();
     return;
   }
   btn.disabled = true;
