@@ -803,6 +803,8 @@ def detalle_de_carrera(url_carrera):
             "categoria_txt": sacar(
                 r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+de\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)\b"
             ),
+            # La hora sirve para saber si corrio de dia o de noche.
+            "hora": sacar(r"Carrera\s*-?\s*(\d{1,2}:\d{2})"),
         }
         cache_set(clave, detalle)
         return detalle
@@ -902,6 +904,10 @@ PESOS_INICIALES = {
     "caballeriza_ganadora": 3.0,
     # Peso corporal del animal, que carga el admin el dia de la carrera.
     "peso_corporal": 4.0,
+    # Posicion de largada: como le fue a ESE caballo saliendo desde ahi.
+    "largada_favorable": 5.0,
+    # De dia o de noche: hay caballos que rinden distinto con luz artificial.
+    "horario_favorable": 4.0,
 }
 
 def cargar_pesos():
@@ -1174,6 +1180,71 @@ def score_horse(h, context, pesos=None):
                 score -= P["peso_corporal"]
                 reasons.append(f"pesa {int(abs(dif))} kg menos que el promedio de la carrera")
 
+    # --- Posicion de largada ---
+    # Se compara el numero que lleva HOY con como le fue las veces que
+    # largo desde cerca de ahi. No es lo mismo salir por adentro que por
+    # afuera, y cada caballo tiene su historia.
+    numero_hoy = h.get("numero")
+    if numero_hoy and h.get("carreras"):
+        cercanas, lejanas = [], []
+        for c in h.get("carreras", []):
+            n = c.get("numero")
+            try:
+                n = int(str(n).strip())
+            except (TypeError, ValueError):
+                continue
+            if not c.get("puesto"):
+                continue
+            # "Cerca" es hasta dos numeros de diferencia.
+            if abs(n - int(numero_hoy)) <= 2:
+                cercanas.append(c["puesto"])
+            else:
+                lejanas.append(c["puesto"])
+
+        if len(cercanas) >= 2:
+            prom_cerca = sum(cercanas) / len(cercanas)
+            entro = sum(1 for p in cercanas if p <= 3)
+            if entro >= len(cercanas) * 0.5:
+                score += P["largada_favorable"]
+                reasons.append(
+                    f"largando cerca del {numero_hoy} entró {entro} de {len(cercanas)} veces")
+            elif lejanas:
+                prom_lejos = sum(lejanas) / len(lejanas)
+                if prom_cerca > prom_lejos + 1.5:
+                    score -= P["largada_favorable"] * 0.7
+                    reasons.append(
+                        f"largando cerca del {numero_hoy} le fue peor que desde otros lugares")
+
+    # --- De dia o de noche ---
+    # Se deduce de la hora de la carrera. Hay caballos que rinden distinto
+    # con luz artificial.
+    hora_carrera = context.get("hora", "")
+    if hora_carrera and h.get("carreras"):
+        def es_de_noche(hhmm):
+            try:
+                return int(str(hhmm).split(":")[0]) >= 19
+            except (ValueError, IndexError):
+                return None
+
+        noche_hoy = es_de_noche(hora_carrera)
+        if noche_hoy is not None:
+            iguales = []
+            for c in h.get("carreras", []):
+                n = es_de_noche(c.get("hora", ""))
+                if n is None or not c.get("puesto"):
+                    continue
+                if n == noche_hoy:
+                    iguales.append(c["puesto"])
+            if len(iguales) >= 3:
+                entro = sum(1 for p in iguales if p <= 3)
+                cuando = "de noche" if noche_hoy else "de día"
+                if entro >= len(iguales) * 0.5:
+                    score += P["horario_favorable"]
+                    reasons.append(f"corriendo {cuando} entró {entro} de {len(iguales)} veces")
+                elif entro == 0:
+                    score -= P["horario_favorable"] * 0.7
+                    reasons.append(f"corriendo {cuando} no entró entre los tres primeros")
+
     # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
     # Sin esto, los genericos tapan a los que de verdad explican el puesto.
     PRIORIDAD = [
@@ -1184,7 +1255,7 @@ def score_horse(h, context, pesos=None):
         "el entrenador", "la caballeriza",
         "descanso justo", "hace", "corrió hace",
         "victoria", "llegada",
-        "lleva", "pesa", "viento",
+        "largando", "corriendo de", "lleva", "pesa", "viento",
         "carreras corridas", "experiencia", "debuta",
     ]
 
@@ -2022,6 +2093,7 @@ def analizar():
     contexto_oficial = {
         "participantes": horses,
         "pista_dia": data.get("pista_dia", ""),
+        "hora": data.get("hora", ""),
     }
     for campo in OPCIONES_CONDICIONES:
         contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
