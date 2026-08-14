@@ -196,12 +196,21 @@
     transition:transform .2s ease;
   }
   .step.open .chev{ transform:rotate(180deg); }
+  /* Cerrado: no se ve nada. Abierto: se ve TODO, sin tope de alto.
+     Antes habia un tope de 2000px y en el celular, con 14 caballos mas
+     el pronostico, el contenido quedaba cortado. */
   .step-body{
-    max-height:0;
-    overflow:hidden;
-    transition:max-height .28s ease;
+    display:none;
   }
-  .step.open .step-body{ max-height:2000px; margin-top:18px; }
+  .step.open .step-body{
+    display:block;
+    margin-top:18px;
+    animation:abrir-paso .28s ease;
+  }
+  @keyframes abrir-paso{
+    from{ opacity:0; transform:translateY(-6px); }
+    to{ opacity:1; transform:none; }
+  }
 
   /* fecha */
   .fecha-grid{
