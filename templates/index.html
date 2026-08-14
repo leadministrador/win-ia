@@ -1996,6 +1996,7 @@ async function elegirCarrera(c, itemEl){
       numero: c.numero,
       fecha: fechaElegida,
       hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
+      hora: c.hora || '',
     };
     ultimoContexto = contexto;
     ultimosParticipantes = participantesActuales;
