@@ -162,6 +162,17 @@ def init_db():
       cargado_en TEXT NOT NULL,
       PRIMARY KEY(usuario_id, caballo, fecha, hipodromo)
     );
+    CREATE TABLE IF NOT EXISTS datos_oficiales(
+      caballo TEXT NOT NULL,          -- en minusculas
+      caballo_visible TEXT NOT NULL,
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      numero_carrera INTEGER,
+      peso_corporal INTEGER,          -- los kilos del animal
+      herraje TEXT,                   -- las cuatro letras
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(caballo, fecha, hipodromo)
+    );
     """)
     con.commit()
     con.close()
@@ -889,6 +900,8 @@ PESOS_INICIALES = {
     "jockey_sin_ganar": 0.0,
     "entrenador_ganador": 5.0,
     "caballeriza_ganadora": 3.0,
+    # Peso corporal del animal, que carga el admin el dia de la carrera.
+    "peso_corporal": 4.0,
 }
 
 def cargar_pesos():
@@ -1141,6 +1154,26 @@ def score_horse(h, context, pesos=None):
     sumar_rendimiento("rend_caballeriza", "la caballeriza",
                       P["caballeriza_ganadora"])
 
+    # --- Peso corporal del animal ---
+    # Lo carga el admin el dia de la carrera. Un caballo muy por debajo o
+    # muy por encima del promedio de SU carrera suele rendir distinto.
+    mio = _to_float(h.get("peso_corporal_oficial"))
+    if mio:
+        cuerpos = [
+            _to_float(x.get("peso_corporal_oficial"))
+            for x in context.get("participantes", [])
+            if _to_float(x.get("peso_corporal_oficial"))
+        ]
+        if len(cuerpos) >= 3:
+            promedio = sum(cuerpos) / len(cuerpos)
+            dif = mio - promedio
+            if dif >= 25:
+                score += P["peso_corporal"]
+                reasons.append(f"pesa {int(dif)} kg más que el promedio de la carrera")
+            elif dif <= -25:
+                score -= P["peso_corporal"]
+                reasons.append(f"pesa {int(abs(dif))} kg menos que el promedio de la carrera")
+
     # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
     # Sin esto, los genericos tapan a los que de verdad explican el puesto.
     PRIORIDAD = [
@@ -1151,7 +1184,7 @@ def score_horse(h, context, pesos=None):
         "el entrenador", "la caballeriza",
         "descanso justo", "hace", "corrió hace",
         "victoria", "llegada",
-        "lleva", "viento",
+        "lleva", "pesa", "viento",
         "carreras corridas", "experiencia", "debuta",
     ]
 
@@ -1971,6 +2004,18 @@ def analizar():
     pesos = cargar_pesos()
     fecha = data.get("fecha", "")
     hipodromo = data.get("hipodromo", "")
+
+    # El peso corporal y el herraje que cargo el admin se suman a cada
+    # caballo antes de puntuar: entran al pronostico OFICIAL.
+    oficiales_cab = datos_oficiales_de(fecha, hipodromo)
+    if oficiales_cab:
+        for h in horses:
+            d_o = oficiales_cab.get(normalize_text(h.get("nombre", "")))
+            if d_o:
+                if d_o.get("peso_corporal"):
+                    h["peso_corporal_oficial"] = d_o["peso_corporal"]
+                if d_o.get("herraje"):
+                    h["herraje_oficial"] = d_o["herraje"]
 
     # --- CONDICIONES OFICIALES: las que cargo el admin para esa reunion ---
     oficiales = condiciones_de(fecha, hipodromo)
@@ -4267,6 +4312,98 @@ def api_guardar_datos_caballo():
     con.commit()
     con.close()
     return jsonify(ok=True, datos=datos, mensaje="Guardado.")
+
+
+# ============================================================
+# DATOS OFICIALES POR CABALLO
+# El peso corporal y el herraje los carga el ADMIN el dia de la carrera,
+# porque el Stud Book solo los publica DESPUES de que se corrio.
+# Entran al pronostico OFICIAL, el que se compara con el resultado.
+# El usuario los puede cambiar para si mismo, como las condiciones.
+# ============================================================
+
+def datos_oficiales_de(fecha, hipodromo):
+    """Lo que cargo el admin para esa reunion: {caballo: {peso, herraje}}"""
+    if not fecha:
+        return {}
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT caballo, peso_corporal, herraje FROM datos_oficiales
+            WHERE fecha=? AND hipodromo=?
+        """, (fecha, normalize_text(hipodromo))).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    return {f["caballo"]: {"peso_corporal": f["peso_corporal"],
+                           "herraje": f["herraje"]} for f in filas}
+
+
+@app.get("/api/datos-oficiales")
+def api_datos_oficiales():
+    """Lo que cargo el admin, para mostrarlo en la lista de competidores."""
+    fecha = clean(request.args.get("fecha", ""))
+    hip = clean(request.args.get("hipodromo", ""))
+    return jsonify(ok=True, datos=datos_oficiales_de(fecha, hip),
+                   es_admin=es_admin())
+
+
+@app.post("/api/admin/datos-oficiales")
+def admin_datos_oficiales():
+    """El admin carga el peso corporal y el herraje de un caballo."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    fecha = clean(d.get("fecha", ""))
+    hip = clean(d.get("hipodromo", ""))
+    if not nombre or not fecha:
+        return jsonify(ok=False, error="Faltan el caballo y la fecha."), 400
+
+    # Peso: los kilos del animal, entre 300 y 650.
+    peso = None
+    bruto = clean(str(d.get("peso_corporal", "")))
+    if bruto:
+        n = _to_float(bruto)
+        if n is None or not (300 <= n <= 650):
+            return jsonify(ok=False,
+                           error="El peso tiene que estar entre 300 y 650 kilos."), 400
+        peso = int(n)
+
+    # Herraje: cuatro letras, tal como las publican.
+    herraje = re.sub(r"[^A-Za-z]", "", clean(str(d.get("herraje", "")))).upper()[:4]
+
+    numero = d.get("numero_carrera")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        numero = None
+
+    con = db()
+    if peso is None and not herraje:
+        con.execute("""
+            DELETE FROM datos_oficiales
+            WHERE caballo=? AND fecha=? AND hipodromo=?
+        """, (normalize_text(nombre), fecha, normalize_text(hip)))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, mensaje="Se borró lo cargado.", datos={})
+
+    con.execute("""
+        INSERT INTO datos_oficiales(caballo, caballo_visible, fecha, hipodromo,
+                                    numero_carrera, peso_corporal, herraje, cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(caballo, fecha, hipodromo) DO UPDATE SET
+          peso_corporal=excluded.peso_corporal, herraje=excluded.herraje,
+          numero_carrera=excluded.numero_carrera, cargado_en=excluded.cargado_en
+    """, (normalize_text(nombre), nombre, fecha, normalize_text(hip),
+          numero, peso, herraje,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Guardado para {nombre}.",
+                   datos={"peso_corporal": peso, "herraje": herraje})
 
 
 @app.get("/api/videos")
