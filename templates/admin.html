@@ -119,6 +119,25 @@
   .op-cond.sel{
     background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf);
   }
+  .ajuste-fila{
+    display:flex; align-items:center; gap:16px;
+    padding:15px 0; border-bottom:1px solid var(--pergamino-2);
+  }
+  .ajuste-fila:last-child{ border-bottom:none; }
+  .aj-titulo{ font-family:'Fraunces',serif; font-weight:600; font-size:16px; }
+  .aj-ayuda{ font-size:12.5px; opacity:.65; margin-top:4px; line-height:1.5; }
+  .llave{
+    width:56px; height:32px; border-radius:16px; flex-shrink:0;
+    border:none; background:#bdb5a4; cursor:pointer; position:relative;
+    transition:background .18s;
+  }
+  .llave.on{ background:#2b8c6b; }
+  .bolita{
+    position:absolute; top:3px; left:3px; width:26px; height:26px;
+    border-radius:50%; background:#fff; transition:left .18s;
+    box-shadow:0 1px 4px rgba(0,0,0,.25);
+  }
+  .llave.on .bolita{ left:27px; }
   textarea.txt{
     font-family:'Archivo',sans-serif; resize:vertical; line-height:1.5;
   }
@@ -291,6 +310,17 @@
     <div class="progreso-txt" id="aviso-estado" style="margin-top:11px;"></div>
   </div>
 
+
+  <h2>Interruptores</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Se prenden y apagan al instante, sin tener que publicar nada.
+  </p>
+
+  <div class="caja-recolector">
+    <div id="lista-ajustes">
+      <div class="progreso-txt">Buscando…</div>
+    </div>
+  </div>
   <h2>Anuncios</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Lo que cargues acá se muestra arriba de cualquier aviso que toque el usuario,
@@ -576,6 +606,36 @@ async function guardarCondiciones(){
   }
 }
 
+// ---------- Interruptores ----------
+async function verAjustes(){
+  try{
+    const r = await fetch('/api/admin/ajustes?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+    document.getElementById('lista-ajustes').innerHTML = d.ajustes.map(a => `
+      <div class="ajuste-fila">
+        <div style="flex:1; min-width:0;">
+          <div class="aj-titulo">${a.titulo}</div>
+          <div class="aj-ayuda">${a.ayuda}</div>
+        </div>
+        <button class="llave ${a.encendido ? 'on' : ''}"
+          onclick="cambiarAjuste('${a.clave}', ${!a.encendido})">
+          <span class="bolita"></span>
+        </button>
+      </div>`).join('');
+  }catch(e){}
+}
+
+async function cambiarAjuste(claveAjuste, encendido){
+  try{
+    await fetch('/api/admin/ajuste?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({clave: claveAjuste, encendido})
+    });
+    verAjustes();
+  }catch(e){}
+}
+
 // ---------- Anuncios ----------
 const hoyStr = new Date().toISOString().slice(0,10);
 document.getElementById('an-desde').value = hoyStr;
@@ -758,6 +818,7 @@ cargar();
 cargarHipodromosDelDia();
 verEstadoAvisos();
 verAnuncios();
+verAjustes();
 </script>
 </body>
 </html>
