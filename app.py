@@ -93,7 +93,8 @@ def init_db():
       email TEXT,                         -- opcional
       creado_en TEXT NOT NULL,
       ultimo_ingreso TEXT,
-      bloqueado INTEGER DEFAULT 0
+      bloqueado INTEGER DEFAULT 0,
+      es_admin INTEGER DEFAULT 0     -- 1 = puede cargar datos oficiales
     );
     CREATE TABLE IF NOT EXISTS sesiones(
       token TEXT PRIMARY KEY,
@@ -174,6 +175,24 @@ def init_db():
       PRIMARY KEY(caballo, fecha, hipodromo)
     );
     """)
+    # Agregar columnas nuevas a bases que ya existian, sin perder datos.
+    try:
+        columnas = [f[1] for f in con.execute("PRAGMA table_info(usuarios)").fetchall()]
+        if "es_admin" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN es_admin INTEGER DEFAULT 0")
+    except Exception:
+        pass
+
+    # Si en Render se puso ADMIN_USUARIO, ese usuario queda como admin.
+    # Asi no hay que marcarlo a mano la primera vez.
+    admin_inicial = os.getenv("ADMIN_USUARIO", "").strip()
+    if admin_inicial:
+        try:
+            con.execute("UPDATE usuarios SET es_admin=1 WHERE usuario=?",
+                        (normalize_text(admin_inicial),))
+        except Exception:
+            pass
+
     con.commit()
     con.close()
 
@@ -2418,6 +2437,22 @@ def ajustar_algoritmo():
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 def es_admin():
+    """
+    Es admin de dos formas:
+      1) Su USUARIO esta marcado como admin. Es la forma normal: entra con
+         su contraseña y listo, sin poner nada en la direccion.
+      2) Con la clave en la direccion. Queda como respaldo, sobre todo
+         para el panel, al que se entra sin estar logueado.
+    """
+    # Por el usuario
+    try:
+        u = usuario_actual()
+        if u and u.get("es_admin"):
+            return True
+    except Exception:
+        pass
+
+    # Por la clave, como respaldo
     if not ADMIN_KEY:
         return False
     enviada = request.args.get("clave", "") or request.headers.get("X-Admin-Key", "")
@@ -3022,7 +3057,7 @@ def usuario_actual():
         con = db()
         fila = con.execute("""
             SELECT u.id, u.usuario, u.usuario_visible, u.telefono, u.bloqueado,
-                   s.creada_en
+                   u.es_admin, s.creada_en
             FROM sesiones s JOIN usuarios u ON u.id = s.usuario_id
             WHERE s.token = ?
         """, (token,)).fetchone()
@@ -3250,7 +3285,8 @@ def admin_usuarios():
         return jsonify(ok=False, error="Acceso restringido."), 403
     con = db()
     filas = con.execute("""
-        SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso, bloqueado
+        SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso,
+               bloqueado, es_admin
         FROM usuarios ORDER BY id DESC LIMIT 200
     """).fetchall()
     total = con.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
@@ -4546,6 +4582,42 @@ def admin_vaciar_cache():
                            "La próxima consulta los trae de nuevo del sitio.")
 
 
+@app.post("/api/admin/marcar-admin")
+def admin_marcar_admin():
+    """
+    Marca (o desmarca) a un usuario como admin. Asi puede cargar los datos
+    oficiales entrando normal, sin poner la clave en la direccion.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    marcar = 1 if d.get("admin") else 0
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    fila = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET es_admin=? WHERE id=?", (marcar, fila["id"]))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, es_admin=bool(marcar),
+                   mensaje=(f"{fila['usuario_visible']} ahora es admin."
+                            if marcar else
+                            f"{fila['usuario_visible']} ya no es admin."))
+
+
+@app.get("/api/soy-admin")
+def api_soy_admin():
+    """La pantalla pregunta esto para saber si mostrar el botón ⚙."""
+    return jsonify(ok=True, es_admin=es_admin())
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
@@ -4779,3 +4851,4 @@ if os.getenv("AVISOS_AUTOMATICOS", "1") == "1":
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
+    
