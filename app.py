@@ -2195,10 +2195,7 @@ def analizar():
                 suma = sum(ventajas) or 1
                 for x, v in zip(top_usuario, ventajas):
                     x["probabilidad_relativa"] = round(v / suma * 100, 1)
-                dif = round(100 - sum(x["probabilidad_relativa"] for x in top_usuario), 1)
-                if abs(dif) >= 0.1:
-                    top_usuario[0]["probabilidad_relativa"] = round(
-                        top_usuario[0]["probabilidad_relativa"] + dif, 1)
+                _cuadrar_porcentajes(top_usuario)
 
         avisos = []
         if cambiadas:
@@ -2314,6 +2311,33 @@ def ordenar_para_pronosticar(participantes):
     )
 
 
+def _cuadrar_porcentajes(top):
+    """
+    Deja los porcentajes sumando 100 exacto y SIEMPRE en orden: el primero
+    nunca puede tener menos que el segundo. El sobrante se reparte de
+    arriba hacia abajo, respetando el orden.
+    """
+    if not top:
+        return
+    diferencia = round(100 - sum(x["probabilidad_relativa"] for x in top), 1)
+    if abs(diferencia) < 0.05:
+        return
+
+    if diferencia > 0:
+        # Sobra: se lo lleva el primero, que es el favorito.
+        top[0]["probabilidad_relativa"] = round(
+            top[0]["probabilidad_relativa"] + diferencia, 1)
+    else:
+        # Falta: se le saca al ultimo, para no bajar al favorito.
+        top[-1]["probabilidad_relativa"] = round(
+            top[-1]["probabilidad_relativa"] + diferencia, 1)
+
+    # Que nunca uno de mas abajo tenga mas porcentaje que el de arriba.
+    for i in range(1, len(top)):
+        if top[i]["probabilidad_relativa"] > top[i-1]["probabilidad_relativa"]:
+            top[i]["probabilidad_relativa"] = top[i-1]["probabilidad_relativa"]
+
+
 def rankear(participantes, contexto, pesos):
     """Puntua y ordena a los participantes. Devuelve los cuatro primeros."""
     base = ordenar_para_pronosticar(participantes)
@@ -2340,11 +2364,7 @@ def rankear(participantes, contexto, pesos):
         for x, v in zip(top, ventajas):
             x["probabilidad_relativa"] = round(v / suma * 100, 1)
 
-        # Ajuste: que la suma de al 100 exacto.
-        diferencia = round(100 - sum(x["probabilidad_relativa"] for x in top), 1)
-        if top and abs(diferencia) >= 0.1:
-            top[0]["probabilidad_relativa"] = round(
-                top[0]["probabilidad_relativa"] + diferencia, 1)
+        _cuadrar_porcentajes(top)
 
     return ranked, top
 
