@@ -2339,6 +2339,14 @@ function claveAdminDeLaDireccion(){
   return p.get('clave') || '';
 }
 
+async function verSiSoyAdmin(){
+  try{
+    const d = await apiGet('/api/soy-admin'
+      + (claveAdminDeLaDireccion() ? '?clave=' + encodeURIComponent(claveAdminDeLaDireccion()) : ''));
+    soyAdmin = !!d.es_admin;
+  }catch(e){ soyAdmin = false; }
+}
+
 async function traerDatosOficiales(fecha, hipodromo){
   try{
     const d = await apiGet('/api/datos-oficiales?fecha=' + encodeURIComponent(fecha)
@@ -3245,6 +3253,7 @@ async function enviarLogin(){
     miUsuario = d.usuario;
     // Se guarda por las dudas, si el navegador bloquea la cookie.
     try{ window._sesion = d.token; }catch(e){}
+    await verSiSoyAdmin();
     pintarUsuario();
     cerrarLogin();
     mostrarToast(modoRegistro
@@ -3300,6 +3309,7 @@ async function salir(){
   try{ await apiPost('/api/salir', {}); }catch(e){}
   miUsuario = null;
   window._sesion = null;
+  soyAdmin = false;
   pintarUsuario();
   mostrarToast('Cerraste la sesión.');
 }
@@ -3680,7 +3690,7 @@ async function pedirPermisoAvisos(){
 // ---------- Arranque ----------
 cargarCalendario();
 iniciarBuscador();
-verQuienSoy();
+verQuienSoy().then(verSiSoyAdmin);
 verEstadoRegistro();
 iniciarBotonAtras();
 iniciarAvisos();
