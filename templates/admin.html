@@ -119,6 +119,23 @@
   .op-cond.sel{
     background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf);
   }
+  .anio-fila{
+    display:flex; align-items:center; gap:11px; padding:7px 0;
+  }
+  .anio-n{
+    font-family:'Space Mono',monospace; font-size:12px; width:42px; flex-shrink:0;
+  }
+  .anio-barra{
+    flex:1; height:9px; background:var(--pergamino-2); border-radius:5px;
+    overflow:hidden;
+  }
+  .anio-barra div{
+    height:100%; background:var(--bronce); border-radius:5px;
+  }
+  .anio-c{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    width:52px; text-align:right; flex-shrink:0;
+  }
   .ajuste-fila{
     display:flex; align-items:center; gap:16px;
     padding:15px 0; border-bottom:1px solid var(--pergamino-2);
@@ -216,6 +233,21 @@
 <div class="tarjetas" id="tarjetas"></div>
 
 <div class="wrap">
+
+  <h2>Histórico de años anteriores</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    El Stud Book no deja listar meses viejos, pero sí abrir una carrera si se
+    conoce su dirección. Esas direcciones están en la campaña de cada caballo.
+    De un caballo salen sus carreras, de cada carrera salen más caballos, y así
+    se va tejiendo hacia atrás. Trabaja de madrugada, despacio, para no molestar
+    al sitio.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-historico"></div>
+    <div class="progreso-txt" id="hist-estado" style="margin-top:12px;"></div>
+    <div id="hist-anios" style="margin-top:14px;"></div>
+  </div>
   <h2>Recolección automática</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Recorre las carreras del Stud Book sola y las compara contra el resultado.
@@ -606,6 +638,49 @@ async function guardarCondiciones(){
   }
 }
 
+// ---------- Historico de años anteriores ----------
+async function verHistorico(){
+  try{
+    const r = await fetch('/api/admin/historico?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    const e = d.estado || {};
+    document.getElementById('chips-historico').innerHTML = `
+      <div class="chip-dato"><b>${d.carreras_guardadas}</b>carreras del histórico</div>
+      <div class="chip-dato"><b>${d.por_visitar}</b>por visitar</div>
+      <div class="chip-dato"><b>${d.ya_visitados}</b>ya visitados</div>
+      <div class="chip-dato"><b>${d.horario}</b>horario</div>`;
+
+    let estado = '';
+    if (!d.encendido){
+      estado = 'Apagado desde los interruptores.';
+    } else if (e.frenado_por_el_sitio){
+      estado = 'Se frenó porque el sitio dejó de responder. Sigue mañana.';
+    } else if (d.en_horario && e.corriendo){
+      estado = 'Trabajando ahora · ' + (e.ultimo || '');
+    } else if (d.en_horario){
+      estado = 'En horario, arrancando…';
+    } else {
+      estado = 'Fuera de horario. Vuelve a las ' + d.horario.split(' a ')[0] + '.';
+    }
+    document.getElementById('hist-estado').textContent = estado;
+
+    const anios = d.por_anio || [];
+    document.getElementById('hist-anios').innerHTML = anios.length
+      ? '<div class="previa-rot">Carreras por año</div>' +
+        anios.map(a => `
+          <div class="anio-fila">
+            <span class="anio-n">${a.anio}</span>
+            <div class="anio-barra">
+              <div style="width:${Math.min(100, a.c / Math.max(...anios.map(x=>x.c)) * 100)}%"></div>
+            </div>
+            <span class="anio-c">${a.c}</span>
+          </div>`).join('')
+      : '<div class="progreso-txt">Todavía no juntó ninguna carrera vieja.</div>';
+  }catch(e){}
+}
+
 // ---------- Interruptores ----------
 async function verAjustes(){
   try{
@@ -633,6 +708,8 @@ async function cambiarAjuste(claveAjuste, encendido){
       body: JSON.stringify({clave: claveAjuste, encendido})
     });
     verAjustes();
+verHistorico();
+setInterval(verHistorico, 60000);
   }catch(e){}
 }
 
@@ -819,6 +896,8 @@ cargarHipodromosDelDia();
 verEstadoAvisos();
 verAnuncios();
 verAjustes();
+verHistorico();
+setInterval(verHistorico, 60000);
 </script>
 </body>
 </html>
