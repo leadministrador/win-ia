@@ -174,6 +174,24 @@ def init_db():
       cargado_en TEXT NOT NULL,
       PRIMARY KEY(caballo, fecha, hipodromo)
     );
+    CREATE TABLE IF NOT EXISTS historico(
+      url TEXT PRIMARY KEY,           -- la direccion de la carrera
+      fecha TEXT,                     -- AAAA-MM-DD
+      hipodromo TEXT,
+      numero INTEGER,
+      distancia TEXT,
+      pista TEXT,
+      estado TEXT,
+      participantes TEXT,             -- todos los que corrieron, en JSON
+      guardado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS por_explorar(
+      url TEXT PRIMARY KEY,           -- ficha de caballo o carrera
+      tipo TEXT NOT NULL,             -- caballo | carrera
+      hecho INTEGER DEFAULT 0,
+      intentos INTEGER DEFAULT 0,
+      agregado_en TEXT NOT NULL
+    );
     """)
     # Agregar columnas nuevas a bases que ya existian, sin perder datos.
     try:
@@ -4214,6 +4232,10 @@ AJUSTES_POSIBLES = [
     {"clave": "avisos_encendidos", "titulo": "Mandar avisos automáticos",
      "ayuda": "Los de caballo inscripto y una hora antes de la carrera.",
      "por_defecto": "1"},
+    {"clave": "recoleccion_historico", "titulo": "Juntar el histórico de madrugada",
+     "ayuda": ("De 3 a 7 de la mañana busca carreras viejas, despacio, "
+               "para no molestar al Stud Book. Apagalo si algo anda mal."),
+     "por_defecto": "1"},
 ]
 
 
@@ -4626,6 +4648,344 @@ def api_soy_admin():
     return jsonify(ok=True, es_admin=es_admin())
 
 
+# ============================================================
+# RECOLECTOR DEL HISTORICO
+# El Stud Book no deja listar meses anteriores, pero SI deja abrir una
+# carrera vieja si se conoce su direccion. Esas direcciones estan en la
+# campaña de cada caballo.
+# Entonces: de un caballo se sacan sus carreras, de cada carrera se sacan
+# los demas caballos, y asi se va tejiendo el historico.
+# Corre de madrugada, despacio, para no molestar al sitio.
+# ============================================================
+
+HORA_INICIO_RECOLECCION = int(os.getenv("RECOLECCION_DESDE", "3"))   # 3 de la mañana
+HORA_FIN_RECOLECCION = int(os.getenv("RECOLECCION_HASTA", "7"))      # 7 de la mañana
+PAUSA_HISTORICO = float(os.getenv("PAUSA_HISTORICO", "3.0"))         # segundos
+
+HISTORICO = {
+    "corriendo": False,
+    "carreras_guardadas": 0,
+    "caballos_vistos": 0,
+    "pendientes": 0,
+    "ultimo": "",
+    "frenado_por_el_sitio": False,
+}
+
+
+def _es_horario_de_recoleccion():
+    h = ahora_argentina().hour
+    if HORA_INICIO_RECOLECCION < HORA_FIN_RECOLECCION:
+        return HORA_INICIO_RECOLECCION <= h < HORA_FIN_RECOLECCION
+    # Por si alguna vez cruza la medianoche (ej: 23 a 5)
+    return h >= HORA_INICIO_RECOLECCION or h < HORA_FIN_RECOLECCION
+
+
+def _pausa_prudente():
+    """
+    Espera un rato al azar entre pedido y pedido. Al azar, para no
+    parecer una maquina golpeando siempre al mismo ritmo.
+    """
+    import random
+    time.sleep(PAUSA_HISTORICO + random.uniform(0, 2.0))
+
+
+def _sumar_a_la_cola(url, tipo):
+    """Anota una direccion para visitarla mas adelante."""
+    if not url:
+        return
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR IGNORE INTO por_explorar(url, tipo, agregado_en)
+            VALUES(?,?,?)
+        """, (url, tipo, datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _marcar_hecho(url):
+    try:
+        con = db()
+        con.execute("UPDATE por_explorar SET hecho=1 WHERE url=?", (url,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _siguiente_de_la_cola():
+    """
+    Lo proximo a visitar. Se priorizan las CARRERAS sobre los caballos:
+    una carrera guarda datos utiles enseguida, un caballo solo abre camino.
+    """
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT url, tipo FROM por_explorar
+            WHERE hecho=0 AND intentos < 3
+            ORDER BY (tipo='carrera') DESC, rowid ASC LIMIT 1
+        """).fetchone()
+        con.close()
+        return dict(fila) if fila else None
+    except Exception:
+        return None
+
+
+def _ya_guardada(url):
+    try:
+        con = db()
+        f = con.execute("SELECT 1 FROM historico WHERE url=?", (url,)).fetchone()
+        con.close()
+        return bool(f)
+    except Exception:
+        return False
+
+
+def guardar_carrera_historica(url):
+    """
+    Abre una carrera vieja, guarda quienes corrieron y anota a cada
+    caballo para visitarlo despues. Devuelve cuantos caballos nuevos sumo.
+    """
+    if _ya_guardada(url):
+        _marcar_hecho(url)
+        return 0
+
+    try:
+        soup = fetch(url)
+    except Exception:
+        return -1   # el sitio no respondio
+
+    # La pagina de una carrera trae una sola; se busca cual es.
+    data = None
+    for n in range(1, 21):
+        data = parse_race(soup, n)
+        if data and data.get("participantes"):
+            break
+    if not data or not data.get("participantes"):
+        _marcar_hecho(url)
+        return 0
+
+    # La fecha esta en la direccion o en el texto.
+    fecha = meeting_date_from_url(url)
+    if not fecha:
+        m = re.search(r"(\d{2})/(\d{2})/(\d{4})", clean(soup.get_text(" ")))
+        if m:
+            fecha = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
+    hip = ""
+    m = re.search(r"/reuniones/\w+/\d+/\d{8}-([a-z\-]+?)-\d+", url)
+    if m:
+        hip = m.group(1).replace("-", " ").title()
+
+    participantes = [{
+        "nombre": p.get("nombre"),
+        "numero": p.get("numero"),
+        "puesto": p.get("puesto"),
+        "peso": p.get("peso"),
+        "peso_corporal": p.get("peso_corporal"),
+        "jockey": p.get("jockey"),
+        "entrenador": p.get("entrenador"),
+        "caballeriza": p.get("caballeriza"),
+        "cuerpos": p.get("cuerpos"),
+        "pago": p.get("pago"),
+    } for p in data["participantes"] if not p.get("retirado")]
+
+    detalle = {}
+    try:
+        detalle = detalle_de_carrera(url)
+    except Exception:
+        pass
+
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO historico(url, fecha, hipodromo, numero,
+                distancia, pista, estado, participantes, guardado_en)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (url, fecha, hip, data.get("carrera"),
+              data.get("distancia", ""),
+              detalle.get("pista_txt") or data.get("superficie", ""),
+              detalle.get("estado_txt") or data.get("estado", ""),
+              json.dumps(participantes, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+    # Cada caballo de esta carrera abre camino a otras carreras.
+    nuevos = 0
+    for p in data["participantes"]:
+        if p.get("perfil"):
+            _sumar_a_la_cola(p["perfil"], "caballo")
+            nuevos += 1
+
+    _marcar_hecho(url)
+    return nuevos
+
+
+def explorar_caballo(url_perfil):
+    """
+    Abre la ficha de un caballo y anota TODAS sus carreras para visitarlas.
+    Devuelve cuantas carreras nuevas encontro.
+    """
+    try:
+        soup = fetch(url_perfil)
+    except Exception:
+        return -1
+
+    carreras = _tabla_carreras_del_perfil(soup)
+    nuevas = 0
+    for c in carreras:
+        if c.get("enlace"):
+            _sumar_a_la_cola(c["enlace"], "carrera")
+            nuevas += 1
+
+    _marcar_hecho(url_perfil)
+    return nuevas
+
+
+def _contar_pendientes():
+    try:
+        con = db()
+        n = con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=0"
+        ).fetchone()["c"]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _sembrar_si_hace_falta():
+    """
+    Si la cola esta vacia, se arranca con los caballos que corren hoy.
+    Cada uno tiene su campaña, y de ahi sale todo lo demas.
+    """
+    if _contar_pendientes() > 0:
+        return
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return
+    for reunion in calendario[:4]:
+        try:
+            soup = fetch(reunion["url"])
+            for c in extract_races_from_meeting(soup)[:3]:
+                data = parse_race(soup, c["numero"])
+                if not data:
+                    continue
+                for p in data.get("participantes", [])[:6]:
+                    if p.get("perfil"):
+                        _sumar_a_la_cola(p["perfil"], "caballo")
+        except Exception:
+            continue
+
+
+def recolectar_historico():
+    """
+    Tarea de fondo. Solo trabaja en el horario permitido y a paso lento.
+    Si el sitio deja de responder, frena y espera al dia siguiente.
+    """
+    time.sleep(120)   # dejar que el servidor arranque tranquilo
+
+    while True:
+        if not _es_horario_de_recoleccion() or not ajuste("recoleccion_historico"):
+            HISTORICO["corriendo"] = False
+            time.sleep(15 * 60)
+            continue
+
+        HISTORICO["corriendo"] = True
+        HISTORICO["frenado_por_el_sitio"] = False
+        fallos_seguidos = 0
+
+        try:
+            _sembrar_si_hace_falta()
+        except Exception:
+            pass
+
+        # Trabajar mientras siga siendo el horario permitido.
+        while _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
+            siguiente = _siguiente_de_la_cola()
+            if not siguiente:
+                HISTORICO["ultimo"] = "No queda nada por explorar."
+                break
+
+            url, tipo = siguiente["url"], siguiente["tipo"]
+            try:
+                con = db()
+                con.execute("UPDATE por_explorar SET intentos=intentos+1 WHERE url=?",
+                            (url,))
+                con.commit()
+                con.close()
+            except Exception:
+                pass
+
+            if tipo == "carrera":
+                r = guardar_carrera_historica(url)
+                if r >= 0:
+                    HISTORICO["carreras_guardadas"] += 1
+                    HISTORICO["ultimo"] = f"carrera guardada · {url[-40:]}"
+            else:
+                r = explorar_caballo(url)
+                if r >= 0:
+                    HISTORICO["caballos_vistos"] += 1
+                    HISTORICO["ultimo"] = f"caballo explorado · {url[-40:]}"
+
+            # Si el sitio no responde varias veces seguidas, se frena.
+            if r < 0:
+                fallos_seguidos += 1
+                if fallos_seguidos >= 5:
+                    HISTORICO["frenado_por_el_sitio"] = True
+                    HISTORICO["ultimo"] = ("El sitio dejó de responder. "
+                                           "Se frena hasta mañana.")
+                    break
+                time.sleep(30)   # darle aire al sitio
+            else:
+                fallos_seguidos = 0
+
+            HISTORICO["pendientes"] = _contar_pendientes()
+            _pausa_prudente()
+
+        HISTORICO["corriendo"] = False
+        time.sleep(10 * 60)
+
+
+@app.get("/api/admin/historico")
+def admin_historico():
+    """Cuanto se lleva juntado del historico."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    total = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    pend = con.execute("SELECT COUNT(*) c FROM por_explorar WHERE hecho=0").fetchone()["c"]
+    hechos = con.execute("SELECT COUNT(*) c FROM por_explorar WHERE hecho=1").fetchone()["c"]
+    por_anio = con.execute("""
+        SELECT substr(fecha,1,4) anio, COUNT(*) c FROM historico
+        WHERE fecha IS NOT NULL AND fecha != ''
+        GROUP BY anio ORDER BY anio DESC
+    """).fetchall()
+    ultimas = con.execute("""
+        SELECT fecha, hipodromo, numero FROM historico
+        ORDER BY guardado_en DESC LIMIT 10
+    """).fetchall()
+    con.close()
+    return jsonify(
+        ok=True,
+        carreras_guardadas=total,
+        por_visitar=pend,
+        ya_visitados=hechos,
+        por_anio=[dict(p) for p in por_anio],
+        ultimas=[dict(u) for u in ultimas],
+        horario=f"{HORA_INICIO_RECOLECCION}:00 a {HORA_FIN_RECOLECCION}:00",
+        en_horario=_es_horario_de_recoleccion(),
+        encendido=ajuste("recoleccion_historico"),
+        estado=HISTORICO,
+    )
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
@@ -4856,6 +5216,10 @@ if os.getenv("REVISION_AUTOMATICA", "1") == "1":
 # Revision de avisos: cada 15 minutos, para que el "una hora antes" llegue a tiempo.
 if os.getenv("AVISOS_AUTOMATICOS", "1") == "1":
     threading.Thread(target=revision_de_avisos, daemon=True).start()
+
+# El historico se junta de madrugada, despacio. Se puede apagar desde el panel.
+if os.getenv("RECOLECCION_HISTORICO", "1") == "1":
+    threading.Thread(target=recolectar_historico, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
