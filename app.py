@@ -3428,7 +3428,9 @@ def admin_diag_viejos():
     # con su enlace. Si esos enlaces abren, se puede recorrer el historico.
     via_c = {"nombre": "C) desde la campaña de un caballo", "intentos": []}
     try:
-        muestra = buscar_ejemplares("candy")
+        nombre_prueba = clean(request.args.get("caballo", "")) or "candy"
+        via_c["nombre_pedido"] = nombre_prueba
+        muestra = buscar_ejemplares(nombre_prueba)
         if muestra:
             perfil = muestra[0]["perfil"]
             via_c["caballo_probado"] = muestra[0]["nombre"]
@@ -3439,6 +3441,12 @@ def admin_diag_viejos():
                       and c.get("enlace")]
             via_c["carreras_en_su_campana"] = len(carreras)
             via_c["de_2024_o_2025"] = len(viejas)
+            via_c["con_enlace"] = len([x for x in carreras if x.get("enlace")])
+            via_c["ejemplos"] = [
+                {"fecha": x.get("fecha"), "hipodromo": x.get("hipodromo"),
+                 "tiene_enlace": bool(x.get("enlace"))}
+                for x in carreras[:6]
+            ]
             for c in viejas[:3]:
                 try:
                     r = s.get(c["enlace"], timeout=(5, 12))
