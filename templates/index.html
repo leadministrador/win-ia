@@ -846,6 +846,12 @@
   @keyframes latir-tag{ 50%{ opacity:.55; } }
   /* ===== INGRESO ===== */
   .hero-usuario{ margin-bottom:20px; min-height:52px; }
+  .btn-panel{
+    background:var(--carmin); color:var(--hueso);
+    border:none; text-decoration:none;
+    display:inline-flex; align-items:center; justify-content:center;
+  }
+  .btn-panel:hover{ background:#a33; }
   .btn-entrar{
     font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
     background:var(--bronce); color:var(--tinta); border:none;
@@ -1430,6 +1436,7 @@
       <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
       <button class="btn btn-ghost" onclick="abrirBuscadorCaballo()">🔍 Buscar caballo</button>
       <button class="btn btn-ghost" onclick="abrirSeguidos()">🔔 Caballos seguidos <span id="contador-seguidos" class="contador-seg" style="display:none;">0</span></button>
+      <a class="btn btn-panel" id="btn-panel" href="/admin" style="display:none;">⚙ Panel</a>
     </div>
   </div>
 </div>
@@ -2345,6 +2352,7 @@ async function verSiSoyAdmin(){
       + (claveAdminDeLaDireccion() ? '?clave=' + encodeURIComponent(claveAdminDeLaDireccion()) : ''));
     soyAdmin = !!d.es_admin;
   }catch(e){ soyAdmin = false; }
+  mostrarBotonPanel();
 }
 
 async function traerDatosOficiales(fecha, hipodromo){
@@ -3159,6 +3167,11 @@ async function verEstadoRegistro(){
   aplicarEstadoRegistro();
 }
 
+function mostrarBotonPanel(){
+  const b = document.getElementById('btn-panel');
+  if (b) b.style.display = soyAdmin ? 'inline-flex' : 'none';
+}
+
 function aplicarEstadoRegistro(){
   const btn = document.getElementById('btn-cambiar-modo');
   const o = document.getElementById('login-o');
@@ -3310,6 +3323,7 @@ async function salir(){
   miUsuario = null;
   window._sesion = null;
   soyAdmin = false;
+  mostrarBotonPanel();
   pintarUsuario();
   mostrarToast('Cerraste la sesión.');
 }
