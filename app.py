@@ -5083,6 +5083,152 @@ def admin_historico():
     )
 
 
+# ============================================================
+# COPIA DE SEGURIDAD
+# El disco de Render puede fallar o borrarse. Todo lo que junto la app
+# (usuarios, pronosticos, el algoritmo aprendido, el historico) se puede
+# bajar en un solo archivo y guardar en un pendrive.
+# ============================================================
+
+# Lo que NO se respalda: se puede volver a traer del sitio, y ocuparia
+# espacio de mas.
+TABLAS_QUE_NO_VAN = {"cache", "sqlite_sequence", "sesiones", "pedidos_clave"}
+
+
+@app.route("/api/admin/copia", methods=["GET", "POST"])
+def admin_copia():
+    """
+    Arma un archivo con todo lo importante y lo manda para descargar.
+    Se puede abrir directo desde la barra de direccion.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+
+    con = db()
+    tablas = [f["name"] for f in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+
+    copia = {
+        "app": "LEA WIN IA",
+        "version": 1,
+        "hecha_en": datetime.now().isoformat(timespec="seconds"),
+        "fecha_argentina": hoy_argentina(),
+        "tablas": {},
+    }
+
+    for t in tablas:
+        if t in TABLAS_QUE_NO_VAN:
+            continue
+        try:
+            filas = con.execute(f"SELECT * FROM {t}").fetchall()
+            copia["tablas"][t] = [dict(f) for f in filas]
+        except Exception:
+            continue
+    con.close()
+
+    # Un resumen arriba, para saber de un vistazo que trae.
+    copia["resumen"] = {t: len(v) for t, v in copia["tablas"].items() if v}
+
+    texto = json.dumps(copia, ensure_ascii=False, indent=1)
+    nombre = f"lea-win-ia-{hoy_argentina()}.json"
+
+    return Response(
+        texto,
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
+@app.get("/api/admin/copia-resumen")
+def admin_copia_resumen():
+    """Cuanto pesa y que trae la copia, sin bajarla."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    tablas = [f["name"] for f in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    resumen, total = {}, 0
+    for t in tablas:
+        if t in TABLAS_QUE_NO_VAN:
+            continue
+        try:
+            n = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+            if n:
+                resumen[t] = n
+                total += n
+        except Exception:
+            continue
+    con.close()
+
+    # Cuanto ocupa el archivo de la base, para dar una idea del tamaño.
+    try:
+        tam = os.path.getsize(DB)
+    except Exception:
+        tam = 0
+
+    return jsonify(ok=True, resumen=resumen, filas_totales=total,
+                   tamano_mb=round(tam / 1024 / 1024, 2))
+
+
+@app.post("/api/admin/restaurar")
+def admin_restaurar():
+    """
+    Vuelve a poner los datos de una copia. Se usa solo si se perdio todo.
+    NO borra lo que ya hay: agrega lo que falte y respeta lo existente.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    if d.get("app") != "LEA WIN IA" or "tablas" not in d:
+        return jsonify(ok=False,
+                       error="Ese archivo no es una copia de esta app."), 400
+
+    con = db()
+    puestas, saltadas = {}, {}
+    for tabla, filas in d["tablas"].items():
+        if tabla in TABLAS_QUE_NO_VAN or not isinstance(filas, list) or not filas:
+            continue
+        # Solo tablas que de verdad existen, para no ejecutar cualquier cosa.
+        existe = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tabla,)
+        ).fetchone()
+        if not existe:
+            continue
+
+        columnas = [f[1] for f in con.execute(f"PRAGMA table_info({tabla})").fetchall()]
+        n_ok, n_no = 0, 0
+        for fila in filas:
+            if not isinstance(fila, dict):
+                continue
+            cols = [c for c in fila.keys() if c in columnas]
+            if not cols:
+                continue
+            marcas = ",".join("?" for _ in cols)
+            try:
+                con.execute(
+                    f"INSERT OR IGNORE INTO {tabla} ({','.join(cols)}) VALUES ({marcas})",
+                    [fila[c] for c in cols],
+                )
+                n_ok += 1
+            except Exception:
+                n_no += 1
+        puestas[tabla] = n_ok
+        if n_no:
+            saltadas[tabla] = n_no
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, restauradas=puestas, con_problemas=saltadas,
+                   mensaje=("Copia restaurada. Lo que ya estaba se respetó, "
+                            "solo se agregó lo que faltaba."))
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
