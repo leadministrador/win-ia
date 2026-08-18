@@ -4743,6 +4743,64 @@ def _ya_guardada(url):
         return False
 
 
+def _campana_hasta(caballo, fecha_corte):
+    """
+    Deja en la ficha SOLO las carreras anteriores a la fecha que se va a
+    pronosticar. Es imprescindible: la ficha que trae el sitio hoy incluye
+    la carrera que queremos pronosticar y todas las posteriores. Si no se
+    recorta, el pronostico ya sabe como termino y el acierto seria falso.
+    """
+    if not fecha_corte:
+        return caballo
+
+    def antes(c):
+        f = c.get("fecha", "")     # viene como DD/MM/AAAA
+        try:
+            d, m, a = f.split("/")
+            return f"{a}-{m}-{d}" < fecha_corte
+        except (ValueError, AttributeError):
+            return False
+
+    h = dict(caballo)
+    previas = [c for c in (h.get("carreras") or []) if antes(c)]
+    h["carreras"] = previas
+
+    # Los contadores se recalculan solo con lo anterior.
+    puestos = [c["puesto"] for c in previas if c.get("puesto")]
+    h["corridas"] = len(previas)
+    h["victorias"] = sum(1 for p in puestos if p == 1)
+    h["podios"] = sum(1 for p in puestos if p <= 3)
+    h["actuaciones"] = [
+        f"{c['fecha']} {c.get('hipodromo','')} {c['puesto']}º"
+        for c in previas if c.get("puesto")
+    ][:20]
+
+    # La forma reciente: los puestos de las ultimas, de la mas nueva a la
+    # mas vieja. Es lo que el programa publica como "8 ultimas".
+    h["forma"] = "".join(
+        str(min(9, c["puesto"])) + "S"
+        for c in previas[:8] if c.get("puesto")
+    )
+
+    # Dias sin correr, contados hasta la fecha de esta carrera.
+    if previas:
+        try:
+            d, m, a = previas[0]["fecha"].split("/")
+            ultima = datetime(int(a), int(m), int(d))
+            esta = datetime.strptime(fecha_corte, "%Y-%m-%d")
+            h["dias_sin_correr"] = (esta - ultima).days
+        except (ValueError, AttributeError):
+            h["dias_sin_correr"] = None
+    else:
+        h["dias_sin_correr"] = None
+
+    # La frase resumen del sitio habla de toda la campaña, incluida la
+    # posterior. Se descarta para no filtrar informacion del futuro.
+    h["campana"] = ""
+    h["efectividad"] = ""
+    return h
+
+
 def guardar_carrera_historica(url):
     """
     Abre una carrera vieja, guarda quienes corrieron y anota a cada
@@ -4821,6 +4879,45 @@ def guardar_carrera_historica(url):
         if p.get("perfil"):
             _sumar_a_la_cola(p["perfil"], "caballo")
             nuevos += 1
+
+    # --- APRENDER DE ESTA CARRERA ---
+    # Es lo mas valioso: la carrera ya se corrio, asi que se puede
+    # pronosticar a ciegas y comparar contra lo que de verdad paso.
+    # Cada carrera vieja suma al aprendizaje del algoritmo.
+    #
+    # OJO: hace falta la campaña de cada caballo. Sin ella todos puntuan
+    # igual y el pronostico no significaria nada. Se traen de a uno, con
+    # pausa, para no golpear al sitio. La ficha queda en cache 6 horas,
+    # asi que un caballo que corrio varias veces se pide una sola vez.
+    try:
+        corredores = [p for p in data["participantes"] if not p.get("retirado")]
+        if len(corredores) >= 2 and any(p.get("puesto") for p in corredores):
+            con_campana = []
+            for p in corredores:
+                antes = cache_get(f"ficha:{p.get('perfil','')}", TTL_FICHA_CABALLO)[1]
+                completo = enrich_horse(dict(p))
+                # SOLO lo anterior a esta carrera: si no, el pronostico
+                # ya sabria como termino y el acierto seria falso.
+                con_campana.append(_campana_hasta(completo, fecha))
+                if not antes and p.get("perfil"):
+                    _pausa_prudente()   # solo si de verdad hubo que pedirla
+
+            pesos = cargar_pesos()
+            _, top = rankear(
+                con_campana,
+                {"participantes": con_campana,
+                 "pista_dia": detalle.get("estado_txt") or data.get("estado", ""),
+                 "hora": detalle.get("hora", "")},
+                pesos,
+            )
+            registrar_pronostico(
+                url=url, numero=data.get("carrera"),
+                fecha=fecha, hipodromo=hip,
+                top=top, participantes=con_campana,
+                pesos=pesos, ya_corrida=True,
+            )
+    except Exception:
+        pass   # que un fallo al aprender nunca corte la recoleccion
 
     _marcar_hecho(url)
     return nuevos
