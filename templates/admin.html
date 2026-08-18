@@ -119,6 +119,12 @@
   .op-cond.sel{
     background:var(--verde-turf); color:var(--hueso); border-color:var(--verde-turf);
   }
+  .aviso-copia{
+    background:#f7f0e0; border-left:3px solid var(--bronce);
+    padding:12px 14px; border-radius:0 5px 5px 0; margin-top:14px;
+    font-size:13px; line-height:1.55;
+  }
+  .aviso-copia b{ color:var(--carmin); }
   .anio-fila{
     display:flex; align-items:center; gap:11px; padding:7px 0;
   }
@@ -343,6 +349,27 @@
   </div>
 
 
+
+  <h2>Copia de seguridad</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Todo lo que junta la app vive en el disco de Render. Si ese disco falla,
+    se pierde. Bajá el archivo cada tanto y guardalo en un pendrive.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-copia"></div>
+
+    <a class="btn btn-run" id="btn-bajar-copia" style="width:100%; margin-top:16px;
+       display:block; text-align:center; text-decoration:none;"
+       href="#">Bajar la copia ahora</a>
+
+    <div class="aviso-copia">
+      <b>Guardala en dos lugares.</b> Un pendrive se puede perder o romper.
+      Subila también a Google Drive o mandátela por correo.
+    </div>
+
+    <div class="progreso-txt" id="copia-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Interruptores</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Se prenden y apagan al instante, sin tener que publicar nada.
@@ -638,6 +665,35 @@ async function guardarCondiciones(){
   }
 }
 
+// ---------- Copia de seguridad ----------
+async function verCopia(){
+  try{
+    const r = await fetch('/api/admin/copia-resumen?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    const nombres = {
+      usuarios: 'usuarios', pronosticos: 'pronósticos', historico: 'carreras viejas',
+      algoritmo: 'pesos del algoritmo', seguidos: 'caballos seguidos',
+      datos_caballo: 'datos de usuarios', datos_oficiales: 'datos oficiales',
+      condiciones: 'condiciones', anuncios: 'anuncios',
+      suscripciones: 'celulares', carreras: 'carreras', ajustes: 'ajustes',
+      avisos_enviados: 'avisos', por_explorar: 'por explorar',
+    };
+    const cont = document.getElementById('chips-copia');
+    const partes = Object.entries(d.resumen)
+      .sort((a,b) => b[1] - a[1])
+      .map(([t,n]) => `<div class="chip-dato"><b>${n}</b>${nombres[t] || t}</div>`);
+    cont.innerHTML = partes.join('') ||
+      '<div class="progreso-txt">Todavía no hay nada para respaldar.</div>';
+
+    const btn = document.getElementById('btn-bajar-copia');
+    btn.href = '/api/admin/copia?clave=' + encodeURIComponent(clave);
+    document.getElementById('copia-estado').textContent =
+      `${d.filas_totales} datos en total · la base pesa ${d.tamano_mb} MB`;
+  }catch(e){}
+}
+
 // ---------- Historico de años anteriores ----------
 async function verHistorico(){
   try{
@@ -709,6 +765,7 @@ async function cambiarAjuste(claveAjuste, encendido){
     });
     verAjustes();
 verHistorico();
+verCopia();
 setInterval(verHistorico, 60000);
   }catch(e){}
 }
@@ -897,6 +954,7 @@ verEstadoAvisos();
 verAnuncios();
 verAjustes();
 verHistorico();
+verCopia();
 setInterval(verHistorico, 60000);
 </script>
 </body>
