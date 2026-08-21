@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacidad — LEA WIN IA</title>
+<link rel="icon" href="/static/icono-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Archivo:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --verde-turf:#153832; --verde-turf-2:#1f4a42;
+    --pergamino:#f2ebda; --pergamino-2:#e7dcc2;
+    --bronce:#b6904f; --bronce-claro:#d9b877;
+    --carmin:#8c2a2a; --tinta:#241b14; --hueso:#faf6ee;
+    --verde-vivo:#2b8c6b;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--hueso); color:var(--tinta);
+    font-family:'Archivo',sans-serif; font-size:17px; line-height:1.7;
+  }
+  .cab{
+    background:linear-gradient(180deg, var(--verde-turf-2) 0%, var(--verde-turf) 100%);
+    color:var(--hueso); padding:34px 22px 30px;
+  }
+  .cab-in{ max-width:680px; margin:0 auto; }
+  .marca{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    letter-spacing:.06em; margin-bottom:16px;
+  }
+  .marca span{
+    font-family:'Space Mono',monospace; font-size:10px; color:var(--tinta);
+    background:var(--bronce-claro); padding:2px 6px; border-radius:3px;
+  }
+  h1{ font-family:'Fraunces',serif; font-size:31px; font-weight:600; margin:0 0 8px; }
+  .desde{ font-family:'Space Mono',monospace; font-size:12px; opacity:.75; }
+  .wrap{ max-width:680px; margin:0 auto; padding:30px 22px 70px; }
+  h2{
+    font-family:'Fraunces',serif; font-size:22px; font-weight:600;
+    margin:34px 0 10px; padding-top:20px;
+    border-top:1px solid var(--pergamino-2);
+  }
+  h2:first-of-type{ border-top:none; padding-top:0; margin-top:0; }
+  p{ margin:0 0 15px; }
+  ul{ margin:0 0 15px; padding-left:22px; }
+  li{ margin-bottom:9px; }
+  b{ color:var(--verde-turf); }
+  .tabla-datos{
+    border:1px solid var(--pergamino-2); border-radius:8px;
+    overflow:hidden; margin:18px 0;
+  }
+  .fila-dato{
+    display:flex; gap:14px; padding:14px 16px;
+    border-bottom:1px solid var(--pergamino-2);
+  }
+  .fila-dato:last-child{ border-bottom:none; }
+  .fila-dato:nth-child(odd){ background:var(--pergamino); }
+  .qual{
+    font-family:'Fraunces',serif; font-weight:600; font-size:16px;
+    width:130px; flex-shrink:0;
+  }
+  .para{ font-size:15.5px; line-height:1.6; }
+  .destacado{
+    background:#e8f4ef; border-left:4px solid var(--verde-vivo);
+    padding:16px 18px; border-radius:0 7px 7px 0; margin:20px 0;
+  }
+  .destacado b{ color:var(--verde-vivo); }
+  .datos{
+    background:var(--pergamino); border-radius:8px; padding:18px 20px;
+    margin-top:26px; font-size:16px;
+  }
+  .datos div{ margin-bottom:7px; }
+  .volver{
+    display:block; text-align:center; margin-top:34px;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--verde-turf); color:var(--hueso);
+    padding:16px; border-radius:8px; text-decoration:none;
+  }
+  .aviso-borrador{
+    background:#fff4d6; border:2px dashed var(--bronce);
+    padding:16px 18px; border-radius:8px; margin-bottom:26px;
+    font-size:15px; line-height:1.6;
+  }
+  @media (max-width:520px){
+    .fila-dato{ flex-direction:column; gap:5px; }
+    .qual{ width:auto; }
+  }
+</style>
+</head>
+<body>
+
+<div class="cab">
+  <div class="cab-in">
+    <div class="marca">LEA WIN <span>IA</span></div>
+    <h1>Cómo cuidamos tus datos</h1>
+    <div class="desde">Última actualización: {{ fecha }}</div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="aviso-borrador">
+    <b>Nota para el administrador:</b> este texto es un borrador en lenguaje
+    claro. Conviene que lo revise un abogado antes de publicarlo.
+    Este aviso se saca antes de publicar.
+  </div>
+
+  <h2>En resumen</h2>
+  <div class="destacado">
+    <p style="margin:0;">
+      Guardamos <b>lo mínimo</b> para que la aplicación funcione.
+      No vendemos tus datos, no los cedemos a anunciantes y
+      <b>nunca vemos tu tarjeta</b>.
+    </p>
+  </div>
+
+  <h2>Qué guardamos y para qué</h2>
+
+  <div class="tabla-datos">
+    <div class="fila-dato">
+      <div class="qual">Nombre de usuario</div>
+      <div class="para">Para reconocerte al entrar. Podés poner un apodo,
+        no hace falta tu nombre real.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Contraseña</div>
+      <div class="para">Se guarda <b>cifrada</b>. Ni nosotros podemos verla.
+        Si la olvidás, se cambia por una nueva; nunca se recupera la vieja.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Teléfono</div>
+      <div class="para">Para poder contactarte si hay un problema con tu
+        cuenta o con un pago.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Caballos que seguís</div>
+      <div class="para">Para avisarte cuando vuelven a correr.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Lo que cargás</div>
+      <div class="para">Lo que anotás de cada caballo (cómo lo viste, el
+        vendaje, los kilos). Es <b>tuyo</b>: solo lo ves vos y solo afecta
+        tu pronóstico.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Avisos al celular</div>
+      <div class="para">Si activás las notificaciones, guardamos una
+        dirección que crea tu navegador. <b>No es tu número</b> ni permite
+        identificarte fuera de la aplicación.</div>
+    </div>
+    <div class="fila-dato">
+      <div class="qual">Registro de uso</div>
+      <div class="para">Nuestro servidor anota qué páginas se pidieron y
+        cuándo, como cualquier sitio. Sirve para detectar fallas.</div>
+    </div>
+  </div>
+
+  <h2>Lo que NO guardamos</h2>
+  <ul>
+    <li><b>Tu tarjeta.</b> El pago lo procesa Mercado Pago. Los números
+        de tarjeta nunca pasan por nuestro servidor.</li>
+    <li><b>Tu ubicación.</b> No pedimos ni usamos el lugar donde estás.</li>
+    <li><b>Tus contactos, fotos ni archivos.</b> La aplicación no accede
+        a nada de eso.</li>
+    <li><b>Correo electrónico.</b> No es obligatorio para tener cuenta.</li>
+  </ul>
+
+  <h2>Con quién los compartimos</h2>
+  <p>
+    Con nadie, salvo lo imprescindible para que funcione:
+  </p>
+  <ul>
+    <li><b>Mercado Pago</b>, para procesar el cobro. Ellos manejan sus
+        propios datos con su política.</li>
+    <li><b>El servidor donde vive la aplicación</b> (Render), que guarda
+        la base de datos.</li>
+    <li><b>Google y Apple</b>, solo para entregar las notificaciones al
+        celular. Reciben el aviso, no tus datos personales.</li>
+  </ul>
+  <p>
+    <b>No vendemos ni cedemos tus datos</b> a nadie con fines de
+    publicidad, ni armamos listas para terceros.
+  </p>
+
+  <h2>Cuánto tiempo los guardamos</h2>
+  <ul>
+    <li>Mientras tengas la cuenta abierta.</li>
+    <li>Si pedís que la borremos, se borra lo que te identifica.</li>
+    <li>Los datos de carreras y pronósticos quedan, pero
+        <b>sin quedar ligados a vos</b>.</li>
+    <li>Los registros de pago se conservan el tiempo que exige la ley
+        impositiva.</li>
+  </ul>
+
+  <h2>Tus derechos</h2>
+  <p>
+    Según la ley argentina de protección de datos personales
+    (Ley 25.326), podés en cualquier momento:
+  </p>
+  <ul>
+    <li><b>Ver</b> qué datos tenemos tuyos.</li>
+    <li><b>Corregirlos</b> si están mal.</li>
+    <li><b>Pedir que los borremos</b>.</li>
+  </ul>
+  <p>
+    Para cualquiera de esas cosas, escribinos por WhatsApp al número de
+    abajo. Respondemos en un plazo razonable.
+  </p>
+  <p style="font-size:15px; opacity:.8;">
+    La Agencia de Acceso a la Información Pública es el organismo de
+    control y atiende los reclamos de quien considere que sus datos
+    no fueron tratados correctamente.
+  </p>
+
+  <h2>Menores de edad</h2>
+  <p>
+    Esta aplicación está pensada para <b>mayores de 18 años</b>. Si sos
+    menor, no crees una cuenta. Si detectamos una cuenta de un menor,
+    la damos de baja.
+  </p>
+
+  <h2>Seguridad</h2>
+  <ul>
+    <li>Las contraseñas se guardan cifradas, no en texto común.</li>
+    <li>La conexión con la aplicación va cifrada (candado en el navegador).</li>
+    <li>Hacemos copias de seguridad para no perder tu información.</li>
+  </ul>
+  <p>
+    Ningún sistema es cien por ciento seguro. Si alguna vez hubiera un
+    problema que afecte tus datos, te lo vamos a avisar.
+  </p>
+
+  <div class="datos">
+    <div><b>Responsable:</b> {{ responsable }}</div>
+    <div><b>Domicilio:</b> {{ ciudad }}, {{ provincia }} ({{ cp }})</div>
+    <div><b>Contacto:</b> WhatsApp {{ whatsapp }}</div>
+    <div><b>Aplicación:</b> {{ sitio }}</div>
+  </div>
+
+  <a class="volver" href="/">Volver a la aplicación</a>
+
+</div>
+</body>
+</html>
