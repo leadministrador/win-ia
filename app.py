@@ -5229,6 +5229,36 @@ def admin_restaurar():
                             "solo se agregó lo que faltaba."))
 
 
+# ============================================================
+# TERMINOS Y PRIVACIDAD
+# Hacen falta para cobrar y para publicar en cualquier tienda.
+# Los datos del responsable se cargan en Render, asi se cambian
+# sin tocar el codigo.
+# ============================================================
+
+DATOS_LEGALES = {
+    "responsable": os.getenv("LEGAL_RESPONSABLE", "Leandro Lencina"),
+    "ciudad": os.getenv("LEGAL_CIUDAD", "General Cabrera"),
+    "provincia": os.getenv("LEGAL_PROVINCIA", "Córdoba"),
+    "cp": os.getenv("LEGAL_CP", "5809"),
+    "whatsapp": os.getenv("LEGAL_WHATSAPP", "+54 9 3584 181338"),
+    "sitio": os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com"),
+}
+
+# Cuando cambien los textos, subir esta fecha para avisar a los usuarios.
+FECHA_LEGALES = os.getenv("LEGAL_FECHA", "18 de agosto de 2026")
+
+
+@app.get("/terminos")
+def pagina_terminos():
+    return render_template("terminos.html", fecha=FECHA_LEGALES, **DATOS_LEGALES)
+
+
+@app.get("/privacidad")
+def pagina_privacidad():
+    return render_template("privacidad.html", fecha=FECHA_LEGALES, **DATOS_LEGALES)
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
