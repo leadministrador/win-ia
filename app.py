@@ -26,6 +26,9 @@ HEADERS = {
     "Accept-Language": "es-AR,es;q=0.9"
 }
 DB = os.getenv("LEA_DB", "lea_win.db")
+# Version de los terminos. Al cambiarlos, subir esta fecha: asi queda
+# registrado que version acepto cada usuario.
+FECHA_LEGALES = os.getenv("LEGAL_FECHA", "18 de agosto de 2026")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 def clean(v):
@@ -94,7 +97,9 @@ def init_db():
       creado_en TEXT NOT NULL,
       ultimo_ingreso TEXT,
       bloqueado INTEGER DEFAULT 0,
-      es_admin INTEGER DEFAULT 0     -- 1 = puede cargar datos oficiales
+      es_admin INTEGER DEFAULT 0,    -- 1 = puede cargar datos oficiales
+      acepto_en TEXT,                -- cuando acepto los terminos
+      acepto_version TEXT            -- que version acepto
     );
     CREATE TABLE IF NOT EXISTS sesiones(
       token TEXT PRIMARY KEY,
@@ -198,6 +203,10 @@ def init_db():
         columnas = [f[1] for f in con.execute("PRAGMA table_info(usuarios)").fetchall()]
         if "es_admin" not in columnas:
             con.execute("ALTER TABLE usuarios ADD COLUMN es_admin INTEGER DEFAULT 0")
+        if "acepto_en" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN acepto_en TEXT")
+        if "acepto_version" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN acepto_version TEXT")
     except Exception:
         pass
 
@@ -3159,6 +3168,12 @@ def api_registro():
         return jsonify(ok=False, error=error), 400
     telefono = _limpiar_telefono(telefono)
 
+    # Sin aceptar los terminos no se puede crear la cuenta.
+    if not d.get("acepto"):
+        return jsonify(ok=False, falta_aceptar=True,
+                       error=("Tenés que aceptar los términos y la política "
+                              "de privacidad para crear la cuenta.")), 400
+
     clave_usuario = normalize_text(usuario)
     con = db()
     ya = con.execute("SELECT id FROM usuarios WHERE usuario=?",
@@ -3171,9 +3186,10 @@ def api_registro():
     ahora = datetime.now().isoformat(timespec="seconds")
     cur = con.execute("""
         INSERT INTO usuarios(usuario, usuario_visible, clave_hash, telefono,
-                             creado_en, ultimo_ingreso)
-        VALUES(?,?,?,?,?,?)
-    """, (clave_usuario, usuario, _cifrar_clave(clave), telefono, ahora, ahora))
+                             creado_en, ultimo_ingreso, acepto_en, acepto_version)
+        VALUES(?,?,?,?,?,?,?,?)
+    """, (clave_usuario, usuario, _cifrar_clave(clave), telefono, ahora, ahora,
+          ahora, FECHA_LEGALES))
     uid = cur.lastrowid
     token = secrets.token_urlsafe(32)
     con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
@@ -3304,7 +3320,7 @@ def admin_usuarios():
     con = db()
     filas = con.execute("""
         SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso,
-               bloqueado, es_admin
+               bloqueado, es_admin, acepto_en, acepto_version
         FROM usuarios ORDER BY id DESC LIMIT 200
     """).fetchall()
     total = con.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
@@ -5244,10 +5260,6 @@ DATOS_LEGALES = {
     "whatsapp": os.getenv("LEGAL_WHATSAPP", "+54 9 3584 181338"),
     "sitio": os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com"),
 }
-
-# Cuando cambien los textos, subir esta fecha para avisar a los usuarios.
-FECHA_LEGALES = os.getenv("LEGAL_FECHA", "18 de agosto de 2026")
-
 
 @app.get("/terminos")
 def pagina_terminos():
