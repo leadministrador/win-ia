@@ -915,6 +915,24 @@
     font-family:'Space Mono',monospace; font-size:10.5px;
     opacity:.55; margin-top:6px; line-height:1.5;
   }
+  .login-acepto{
+    background:var(--pergamino); border:1.5px solid var(--pergamino-2);
+    border-radius:8px; padding:13px 14px; margin-bottom:14px;
+  }
+  .login-acepto.falta{
+    border-color:var(--carmin); border-width:2px; background:#fbeeee;
+  }
+  .acepto-fila{
+    display:flex; gap:11px; align-items:flex-start; cursor:pointer;
+  }
+  .acepto-fila input{
+    width:22px; height:22px; flex-shrink:0; margin:1px 0 0;
+    accent-color:var(--verde-vivo); cursor:pointer;
+  }
+  .acepto-fila span{ font-size:14px; line-height:1.55; }
+  .acepto-fila a{
+    color:var(--verde-turf); font-weight:600;
+  }
   .login-error{
     color:var(--carmin); font-size:13px; line-height:1.5;
     min-height:18px; margin-bottom:10px;
@@ -1654,6 +1672,17 @@
       <div class="ayuda-campo">
         Con la característica, sin el 0 ni el 15.
       </div>
+    </div>
+
+    <div class="login-acepto" id="login-acepto" style="display:none;">
+      <label class="acepto-fila">
+        <input type="checkbox" id="acepto-todo" onchange="alTildarAcepto()">
+        <span>Leí y acepto los
+          <a href="/terminos" target="_blank" rel="noopener">términos y condiciones</a>
+          y la
+          <a href="/privacidad" target="_blank" rel="noopener">política de privacidad</a>.
+        </span>
+      </label>
     </div>
 
     <div class="login-error" id="login-error"></div>
@@ -3234,6 +3263,8 @@ function actualizarModo(){
     modoRegistro ? 'Crear la cuenta' : 'Entrar';
   document.getElementById('campo-telefono').style.display =
     modoRegistro ? 'block' : 'none';
+  document.getElementById('login-acepto').style.display =
+    modoRegistro ? 'block' : 'none';
   document.getElementById('btn-cambiar-modo').textContent =
     modoRegistro ? 'Ya tengo cuenta, quiero entrar' : 'Crear una cuenta gratis';
   document.getElementById('login-olvide').style.display =
@@ -3258,11 +3289,17 @@ async function enviarLogin(){
     document.getElementById('login-telefono').focus();
     return;
   }
+  if (modoRegistro && !document.getElementById('acepto-todo').checked){
+    err.textContent = 'Tenés que aceptar los términos para crear la cuenta.';
+    document.getElementById('login-acepto').classList.add('falta');
+    return;
+  }
   btn.disabled = true;
   err.textContent = '';
   try{
     const d = await apiPost(modoRegistro ? '/api/registro' : '/api/ingresar',
-                            {usuario, clave, telefono});
+                            {usuario, clave, telefono,
+                             acepto: modoRegistro ? true : undefined});
     miUsuario = d.usuario;
     // Se guarda por las dudas, si el navegador bloquea la cookie.
     try{ window._sesion = d.token; }catch(e){}
@@ -3309,6 +3346,11 @@ async function pedirEnlaceClave(){
       err.innerHTML = e.message;
     }
   }
+}
+
+function alTildarAcepto(){
+  document.getElementById('login-acepto').classList.remove('falta');
+  document.getElementById('login-error').textContent = '';
 }
 
 function pasarACrear(){
