@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Términos y condiciones — LEA WIN IA</title>
+<link rel="icon" href="/static/icono-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Archivo:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --verde-turf:#153832; --verde-turf-2:#1f4a42;
+    --pergamino:#f2ebda; --pergamino-2:#e7dcc2;
+    --bronce:#b6904f; --bronce-claro:#d9b877;
+    --carmin:#8c2a2a; --tinta:#241b14; --hueso:#faf6ee;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--hueso); color:var(--tinta);
+    font-family:'Archivo',sans-serif; font-size:17px; line-height:1.7;
+  }
+  .cab{
+    background:linear-gradient(180deg, var(--verde-turf-2) 0%, var(--verde-turf) 100%);
+    color:var(--hueso); padding:34px 22px 30px;
+  }
+  .cab-in{ max-width:680px; margin:0 auto; }
+  .marca{
+    font-family:'Fraunces',serif; font-weight:700; font-size:14px;
+    letter-spacing:.06em; margin-bottom:16px;
+  }
+  .marca span{
+    font-family:'Space Mono',monospace; font-size:10px; color:var(--tinta);
+    background:var(--bronce-claro); padding:2px 6px; border-radius:3px;
+  }
+  h1{ font-family:'Fraunces',serif; font-size:31px; font-weight:600; margin:0 0 8px; }
+  .desde{ font-family:'Space Mono',monospace; font-size:12px; opacity:.75; }
+  .wrap{ max-width:680px; margin:0 auto; padding:30px 22px 70px; }
+  h2{
+    font-family:'Fraunces',serif; font-size:22px; font-weight:600;
+    margin:34px 0 10px; padding-top:20px;
+    border-top:1px solid var(--pergamino-2);
+  }
+  h2:first-of-type{ border-top:none; padding-top:0; margin-top:0; }
+  p{ margin:0 0 15px; }
+  ul{ margin:0 0 15px; padding-left:22px; }
+  li{ margin-bottom:9px; }
+  b{ color:var(--verde-turf); }
+  .destacado{
+    background:var(--pergamino); border-left:4px solid var(--carmin);
+    padding:16px 18px; border-radius:0 7px 7px 0; margin:20px 0;
+  }
+  .destacado b{ color:var(--carmin); }
+  .datos{
+    background:var(--pergamino); border-radius:8px; padding:18px 20px;
+    margin-top:26px; font-size:16px;
+  }
+  .datos div{ margin-bottom:7px; }
+  .volver{
+    display:block; text-align:center; margin-top:34px;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
+    background:var(--verde-turf); color:var(--hueso);
+    padding:16px; border-radius:8px; text-decoration:none;
+  }
+  .aviso-borrador{
+    background:#fff4d6; border:2px dashed var(--bronce);
+    padding:16px 18px; border-radius:8px; margin-bottom:26px;
+    font-size:15px; line-height:1.6;
+  }
+</style>
+</head>
+<body>
+
+<div class="cab">
+  <div class="cab-in">
+    <div class="marca">LEA WIN <span>IA</span></div>
+    <h1>Términos y condiciones</h1>
+    <div class="desde">Última actualización: {{ fecha }}</div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="aviso-borrador">
+    <b>Nota para el administrador:</b> este texto es un borrador redactado en
+    lenguaje claro. Antes de publicarlo conviene que lo revise un abogado,
+    sobre todo por la parte del cobro y del torneo con premio.
+    Este aviso se saca antes de publicar.
+  </div>
+
+  <h2>Qué es esta aplicación</h2>
+  <p>
+    LEA WIN IA es una herramienta de <b>información y análisis</b> sobre
+    carreras de caballos en Argentina. Toma los datos públicos que publica
+    el Stud Book Argentino y arma un pronóstico de los primeros cuatro
+    puestos de cada carrera.
+  </p>
+  <p>
+    Al usar la aplicación aceptás estos términos. Si no estás de acuerdo
+    con alguno, no la uses.
+  </p>
+
+  <h2>Lo que la aplicación NO es</h2>
+  <div class="destacado">
+    <p style="margin:0;">
+      <b>Esta aplicación no recibe apuestas ni tiene juego de azar por dinero.</b>
+      No se apuesta, no se juega y no se paga premio en efectivo.
+      Es una herramienta de análisis, igual que un diario deportivo.
+    </p>
+  </div>
+  <p>
+    Tampoco es asesoramiento. El pronóstico es una <b>opinión calculada</b>
+    a partir de datos, no una predicción certera. Las carreras dependen de
+    muchísimas cosas que ningún cálculo puede prever.
+  </p>
+  <p>
+    Si decidís apostar en algún lugar habilitado, eso es una decisión tuya
+    y solo tuya. No nos hacemos responsables de las pérdidas, ni tenemos
+    derecho sobre las ganancias.
+  </p>
+
+  <h2>El pronóstico y sus límites</h2>
+  <ul>
+    <li>El acierto de los pronósticos es <b>parcial y variable</b>. En el
+        panel público mostramos el porcentaje real, sin maquillarlo.</li>
+    <li>Los datos vienen del Stud Book Argentino. Si ellos publican algo
+        con error o fuera de término, eso se refleja acá.</li>
+    <li>Un caballo puede quedar retirado, cambiar de jockey o correr en
+        condiciones distintas a las publicadas.</li>
+    <li>No garantizamos ningún resultado, ni de una carrera ni del conjunto.</li>
+  </ul>
+
+  <h2>Tu cuenta</h2>
+  <ul>
+    <li>Para usar la mayoría de las funciones hace falta crear una cuenta
+        con un nombre de usuario, una contraseña y un teléfono.</li>
+    <li>Sos responsable de cuidar tu contraseña. Si se la das a otro,
+        esa persona entra como si fueras vos.</li>
+    <li>Una cuenta es de uso personal.</li>
+    <li>Podemos cerrar una cuenta que use la aplicación para molestar a
+        otros, para dañar el servicio o para revender el contenido.</li>
+  </ul>
+
+  <h2>La suscripción</h2>
+  <ul>
+    <li>Hay una parte gratuita y una parte que requiere suscripción paga.</li>
+    <li>El precio y qué incluye figuran en la pantalla de pago, antes de
+        que confirmes nada.</li>
+    <li>El cobro se hace a través de <b>Mercado Pago</b>. Nosotros no vemos
+        ni guardamos los datos de tu tarjeta.</li>
+    <li>La suscripción <b>se renueva sola</b> cada período, hasta que la
+        canceles.</li>
+    <li>Podés <b>cancelarla vos mismo desde la aplicación</b>, cuando
+        quieras, con un botón. No hace falta llamar ni escribir a nadie.</li>
+    <li>Al cancelar, seguís teniendo acceso hasta que termine el período
+        que ya pagaste. No se cobra el siguiente.</li>
+    <li>Los períodos ya usados no se devuelven, salvo que la aplicación
+        haya estado caída por culpa nuestra durante un tiempo importante.</li>
+  </ul>
+
+  <h2>Si cambia el precio</h2>
+  <p>
+    Podemos cambiar el precio. Si eso pasa, te avisamos con
+    <b>al menos 30 días</b> de anticipación, por notificación o dentro de
+    la aplicación. Si el precio nuevo no te sirve, cancelás antes de que
+    empiece a regir y no se te cobra.
+  </p>
+
+  <h2>Si el servicio se interrumpe</h2>
+  <p>
+    Hacemos lo posible para que la aplicación esté siempre disponible, pero
+    depende de cosas que no controlamos: el servidor, internet, y sobre todo
+    el sitio del Stud Book Argentino, que es la fuente de los datos.
+  </p>
+  <p>
+    Si el servicio queda caído mucho tiempo por un problema nuestro,
+    escribinos y vemos cómo compensarlo.
+  </p>
+
+  <h2>Torneos de pronóstico</h2>
+  <p>
+    De vez en cuando podemos organizar torneos de pronóstico entre los
+    usuarios. Cuando eso pase, <b>cada torneo va a tener sus propias
+    reglas publicadas</b>: quién puede participar, cómo se puntúa, qué
+    premio hay y cómo se entrega.
+  </p>
+  <div class="destacado">
+    <p style="margin:0;">
+      <b>No se apuesta dinero en los torneos.</b> No hay pozo, no se paga
+      por participar más allá de la suscripción, y el premio nunca es
+      dinero en efectivo.
+    </p>
+  </div>
+
+  <h2>Los datos y el contenido</h2>
+  <ul>
+    <li>Los datos de carreras y caballos son <b>información pública</b> del
+        Stud Book Argentino. No son nuestros y no reclamamos derechos
+        sobre ellos.</li>
+    <li>El pronóstico, el modo de calcularlo y el diseño de la aplicación
+        <b>sí son nuestros</b>.</li>
+    <li>Podés usar la aplicación para vos. No podés copiar el contenido
+        para armar un servicio parecido, ni revender los pronósticos.</li>
+  </ul>
+
+  <h2>Qué pasa si algo sale mal</h2>
+  <p>
+    La aplicación se ofrece <b>tal como está</b>. Hacemos las cosas con
+    cuidado, pero no podemos garantizar que nunca haya un error, un dato
+    mal leído o una caída del servicio.
+  </p>
+  <p>
+    Nuestra responsabilidad, en cualquier caso, no puede superar lo que
+    hayas pagado de suscripción en los últimos tres meses.
+  </p>
+
+  <h2>Cambios en estos términos</h2>
+  <p>
+    Si cambiamos algo importante de este texto, te avisamos dentro de la
+    aplicación. Si seguís usándola después del aviso, entendemos que estás
+    de acuerdo. Si no, podés cancelar la suscripción.
+  </p>
+
+  <h2>Dónde se resuelve un conflicto</h2>
+  <p>
+    Estos términos se rigen por las leyes de la República Argentina.
+    Ante cualquier conflicto, se aplican los tribunales ordinarios de la
+    <b>Provincia de Córdoba</b>, sin perjuicio de los derechos que la Ley
+    de Defensa del Consumidor le reconozca al usuario.
+  </p>
+
+  <div class="datos">
+    <div><b>Responsable:</b> {{ responsable }}</div>
+    <div><b>Domicilio:</b> {{ ciudad }}, {{ provincia }} ({{ cp }})</div>
+    <div><b>Contacto:</b> WhatsApp {{ whatsapp }}</div>
+    <div><b>Aplicación:</b> {{ sitio }}</div>
+  </div>
+
+  <a class="volver" href="/">Volver a la aplicación</a>
+
+</div>
+</body>
+</html>
