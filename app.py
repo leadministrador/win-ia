@@ -5317,17 +5317,92 @@ def recolectar_historico():
         time.sleep(10 * 60)
 
 
+# Estado del ultimo afinamiento, para consultarlo sin esperar.
+AJUSTE = {"corriendo": False, "resultado": None, "empezo": ""}
+
+
+def _afinar_en_segundo_plano():
+    """
+    Afina sin hacer esperar a la pantalla. Con miles de carreras esto
+    puede tardar minutos, y el servidor corta las esperas largas.
+    """
+    AJUSTE["corriendo"] = True
+    AJUSTE["empezo"] = ahora_argentina().strftime("%H:%M:%S")
+    try:
+        AJUSTE["resultado"] = ajustar_algoritmo()
+    except Exception as e:
+        AJUSTE["resultado"] = {"ok": False, "motivo": str(e)[:200]}
+    finally:
+        AJUSTE["corriendo"] = False
+
+
 @app.route("/api/admin/ajustar", methods=["GET", "POST"])
 def admin_ajustar():
     """
-    Afina los pesos ahora, sin esperar a la madrugada. Tarda un rato:
-    prueba cada peso contra cientos de carreras reales.
+    Arranca el afinamiento y contesta enseguida. El trabajo sigue en el
+    servidor; el resultado se consulta con /api/admin/ajuste-estado.
     """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if AJUSTE["corriendo"]:
+        return jsonify(ok=True, corriendo=True,
+                       mensaje="Ya se está afinando. Esperá un momento.")
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    con.close()
+    if n < 60:
+        return jsonify(ok=False,
+                       error=f"Solo hay {n} carreras, hacen falta 60."), 400
+
+    AJUSTE["resultado"] = None
+    threading.Thread(target=_afinar_en_segundo_plano, daemon=True).start()
+    return jsonify(ok=True, corriendo=True,
+                   mensaje=(f"Afinando contra {n} carreras. Puede tardar "
+                            "unos minutos. Podés cerrar esta página: "
+                            "el servidor sigue trabajando."))
+
+
+@app.get("/api/admin/ajuste-estado")
+def admin_ajuste_estado():
+    """Cómo va el afinamiento, o cómo terminó."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    r = AJUSTE["resultado"]
+    if AJUSTE["corriendo"]:
+        return jsonify(ok=True, corriendo=True, empezo=AJUSTE["empezo"],
+                       mensaje="Probando cada variable contra las carreras…")
+    if not r:
+        return jsonify(ok=True, corriendo=False, sin_datos=True,
+                       mensaje="Todavía no se afinó nada en esta sesión.")
+    if not r.get("ok"):
+        return jsonify(ok=False, corriendo=False,
+                       error=r.get("motivo", "No se pudo afinar.")), 400
+
+    d = dict(r)
+    d.pop("ok", None)
+    return jsonify(ok=True, corriendo=False, **d,
+                   mensaje=(f"Listo. Probado contra {d['carreras_usadas']} "
+                            f"carreras. Acierto del GANADOR: "
+                            f"{d['ganador_antes']}% → {d['ganador_ahora']}%. "
+                            f"Entre los cuatro: {d['top4_antes']}% → "
+                            f"{d['top4_ahora']}%. "
+                            f"Se cambiaron {len(d['cambios'])} pesos y se "
+                            f"descartaron {len(d['descartados_por_casualidad'])} "
+                            "que mejoraban en un grupo pero no en el otro."))
+
+
+@app.get("/api/admin/ajustar-directo")
+def admin_ajustar_directo():
+    """El afinamiento esperando la respuesta. Solo para pruebas."""
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
     r = ajustar_algoritmo()
     if not r.get("ok"):
         return jsonify(ok=False, error=r.get("motivo", "No se pudo ajustar.")), 400
+    # El resultado ya trae su propio "ok", asi que se saca antes de
+    # armar la respuesta. Si no, Flask lo recibe dos veces y falla.
+    r.pop("ok", None)
     return jsonify(ok=True, **r,
                    mensaje=(f"Probado contra {r['carreras_usadas']} carreras. "
                             f"Acierto del GANADOR: {r['ganador_antes']}% → "
