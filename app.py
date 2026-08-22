@@ -193,6 +193,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS por_explorar(
       url TEXT PRIMARY KEY,           -- ficha de caballo o carrera
       tipo TEXT NOT NULL,             -- caballo | carrera
+      fecha TEXT,                     -- para ir de lo nuevo a lo viejo
       hecho INTEGER DEFAULT 0,
       intentos INTEGER DEFAULT 0,
       agregado_en TEXT NOT NULL
@@ -207,6 +208,9 @@ def init_db():
             con.execute("ALTER TABLE usuarios ADD COLUMN acepto_en TEXT")
         if "acepto_version" not in columnas:
             con.execute("ALTER TABLE usuarios ADD COLUMN acepto_version TEXT")
+        cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
+        if cols_cola and "fecha" not in cols_cola:
+            con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
     except Exception:
         pass
 
@@ -954,6 +958,8 @@ PESOS_INICIALES = {
     "largada_favorable": 5.0,
     # De dia o de noche: hay caballos que rinden distinto con luz artificial.
     "horario_favorable": 4.0,
+    # Distancia: no es lo mismo un caballo de 1000 que uno de 2000 metros.
+    "distancia_favorable": 6.0,
 }
 
 def cargar_pesos():
@@ -1291,6 +1297,38 @@ def score_horse(h, context, pesos=None):
                     score -= P["horario_favorable"] * 0.7
                     reasons.append(f"corriendo {cuando} no entró entre los tres primeros")
 
+    # --- Distancia ---
+    # No es lo mismo un caballo de 1000 metros que uno de 2000. Se mira
+    # como le fue en distancias PARECIDAS a la de hoy.
+    dist_hoy = _to_float(context.get("distancia"))
+    if dist_hoy and h.get("carreras"):
+        cercanas, lejanas = [], []
+        for c in h.get("carreras", []):
+            d = _to_float(c.get("distancia"))
+            if not d or not c.get("puesto"):
+                continue
+            # "Parecida" es hasta 200 metros de diferencia.
+            if abs(d - dist_hoy) <= 200:
+                cercanas.append(c["puesto"])
+            else:
+                lejanas.append(c["puesto"])
+
+        if len(cercanas) >= 2:
+            entro = sum(1 for p in cercanas if p <= 3)
+            metros = int(dist_hoy)
+            if entro >= len(cercanas) * 0.5:
+                score += P["distancia_favorable"]
+                reasons.append(
+                    f"en {metros} metros entró {entro} de {len(cercanas)} veces")
+            elif entro == 0:
+                score -= P["distancia_favorable"] * 0.8
+                reasons.append(
+                    f"en {metros} metros no entró entre los tres primeros")
+        elif not cercanas and lejanas:
+            # Nunca corrio esa distancia: es una incognita.
+            score -= P["distancia_favorable"] * 0.4
+            reasons.append(f"nunca corrió en {int(dist_hoy)} metros")
+
     # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
     # Sin esto, los genericos tapan a los que de verdad explican el puesto.
     PRIORIDAD = [
@@ -1301,6 +1339,7 @@ def score_horse(h, context, pesos=None):
         "el entrenador", "la caballeriza",
         "descanso justo", "hace", "corrió hace",
         "victoria", "llegada",
+        "en 1", "en 2", "nunca corrió en",
         "largando", "corriendo de", "lleva", "pesa", "viento",
         "carreras corridas", "experiencia", "debuta",
     ]
@@ -2168,6 +2207,7 @@ def analizar():
         "participantes": horses,
         "pista_dia": data.get("pista_dia", ""),
         "hora": data.get("hora", ""),
+        "distancia": data.get("distancia", ""),
     }
     for campo in OPCIONES_CONDICIONES:
         contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
@@ -2339,8 +2379,9 @@ def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
     con.commit()
     con.close()
 
-    if resultado:
-        ajustar_algoritmo()
+    # El ajuste ya NO se hace aca: probar cada peso contra 400 carreras
+    # tarda demasiado para hacerlo en cada carrera. Corre una vez por
+    # noche, al terminar la recoleccion.
 
 
 def ordenar_para_pronosticar(participantes):
@@ -2415,46 +2456,185 @@ def rankear(participantes, contexto, pesos):
     return ranked, top
 
 
+def _carreras_para_aprender(limite=None):
+    """
+    Trae TODAS las carreras ya corridas del historico. Cada peso se prueba
+    contra todas: es la unica forma de saber si una variable sirve de
+    verdad o si acerto de casualidad.
+    El tope existe solo por si algun dia son cientos de miles.
+    """
+    if limite is None:
+        limite = int(os.getenv("CARRERAS_PARA_APRENDER", "20000"))
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT url, fecha, hipodromo, pista, estado, distancia, participantes
+            FROM historico
+            WHERE participantes IS NOT NULL
+            ORDER BY fecha DESC LIMIT ?
+        """, (limite,)).fetchall()
+        con.close()
+    except Exception:
+        return []
+
+    carreras = []
+    for f in filas:
+        try:
+            ps = json.loads(f["participantes"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(ps) < 3 or not any(p.get("puesto") for p in ps):
+            continue
+        carreras.append({
+            "participantes": ps,
+            "estado": f["estado"] or "",
+            "pista": f["pista"] or "",
+            "fecha": f["fecha"] or "",
+            "distancia": f["distancia"] or "",
+        })
+    return carreras
+
+
+def _cuanto_acierta(carreras, pesos):
+    """
+    Vuelve a pronosticar esas carreras con esos pesos y devuelve cuanto
+    acerto. Es la unica forma honesta de saber si un peso sirve: probarlo.
+    """
+    if not carreras:
+        return 0.0, 0.0
+    ganadores, top4, n = 0, 0, 0
+    for c in carreras:
+        corredores = [p for p in c["participantes"] if p.get("nombre")]
+        if len(corredores) < 3:
+            continue
+        try:
+            _, top = rankear(
+                corredores,
+                {"participantes": corredores,
+                 "pista_dia": c["estado"], "pista": c["pista"],
+                 "distancia": c.get("distancia", "")},
+                pesos,
+            )
+        except Exception:
+            continue
+        llegados = sorted([p for p in corredores if p.get("puesto")],
+                          key=lambda p: p["puesto"])[:4]
+        if not llegados or not top:
+            continue
+        reales = [p["nombre"] for p in llegados]
+        predichos = [p["nombre"] for p in top]
+        if predichos[0] == reales[0]:
+            ganadores += 1
+        top4 += len(set(predichos) & set(reales))
+        n += 1
+    if not n:
+        return 0.0, 0.0
+    return ganadores / n * 100, top4 / (n * 4) * 100
+
+
 def ajustar_algoritmo():
     """
-    Compara los pronosticos ya resueltos y afina los pesos.
-    Cada peso tiene un piso y un techo para que nunca se anule: si todos
-    los pesos llegaran a cero, todos los caballos puntuarian igual y el
-    pronostico dejaria de significar algo.
+    Afina los pesos PROBANDO cada uno contra carreras reales.
+
+    Lo importante: un cambio no se acepta porque haya funcionado una vez.
+    Las carreras se parten en DOS MITADES. Un cambio se prueba en la
+    primera; si mejora, se VERIFICA en la segunda. Solo se acepta si
+    mejora en las dos. Si mejora en una sola, fue casualidad.
+
+    Antes se movian todos los pesos juntos para el mismo lado, asi que
+    nunca se descubria cual servia. Terminaban todos en el piso.
     """
-    con = db()
-    filas = con.execute("""
-        SELECT acierto_ganador, aciertos_top4, pesos_usados
-        FROM pronosticos WHERE resultado IS NOT NULL
-        ORDER BY id DESC LIMIT 200
-    """).fetchall()
-    con.close()
+    todas = _carreras_para_aprender()
+    if len(todas) < 60:
+        return {"ok": False, "motivo": f"solo hay {len(todas)} carreras, hacen falta 60"}
 
-    if len(filas) < 20:
-        return  # con menos de 20 carreras no hay con que aprender
-
-    recientes = filas[:30]
-    historico = filas
-
-    tasa_reciente = sum(f["aciertos_top4"] or 0 for f in recientes) / (len(recientes) * 4)
-    tasa_historica = sum(f["aciertos_top4"] or 0 for f in historico) / (len(historico) * 4)
+    # Dos mitades, mezcladas para que no queden todas las viejas de un lado.
+    import random as _r
+    mezcla = list(todas)
+    _r.Random(7).shuffle(mezcla)
+    mitad = len(mezcla) // 2
+    grupo_a, grupo_b = mezcla[:mitad], mezcla[mitad:]
 
     pesos = cargar_pesos()
-    direccion = 1.0 if tasa_reciente >= tasa_historica else -1.0
-    paso = 0.02 * direccion
+    base_ga, base_ta = _cuanto_acierta(grupo_a, pesos)
+    base_gb, base_tb = _cuanto_acierta(grupo_b, pesos)
 
-    for clave in pesos:
+    # Lo que se busca es ACERTAR EL GANADOR. El acierto entre los cuatro
+    # solo desempata, porque con el ganador solo puede haber empates.
+    def puntaje(g, t):
+        return g * 10 + t
+
+    mejor_a = puntaje(base_ga, base_ta)
+    mejor_b = puntaje(base_gb, base_tb)
+    cambios, descartados = [], []
+
+    for clave in sorted(pesos.keys()):
         inicial = PESOS_INICIALES[clave]
-        nuevo = pesos[clave] + (abs(inicial) * paso)   # paso fijo, no proporcional
-        # Cada peso se mueve como mucho entre la mitad y el doble del inicial.
-        piso = abs(inicial) * 0.5
-        techo = abs(inicial) * 2.0
-        if inicial >= 0:
-            pesos[clave] = max(piso, min(techo, nuevo))
-        else:
-            pesos[clave] = min(-piso, max(-techo, nuevo))
+        actual = pesos[clave]
+        piso, techo = abs(inicial) * 0.3, abs(inicial) * 2.5
+        if inicial < 0:
+            piso, techo = -techo, -piso
 
-    guardar_pesos(pesos)
+        # Se prueban tres valores: mas alto, mas bajo, y en cero.
+        candidatos = []
+        paso = max(abs(inicial) * 0.35, 0.5)
+        for nuevo in (actual + paso, actual - paso, 0.0):
+            if inicial >= 0:
+                nuevo = max(piso, min(techo, nuevo))
+            else:
+                nuevo = min(piso, max(techo, nuevo))
+            if abs(nuevo - actual) > 0.05:
+                candidatos.append(round(nuevo, 2))
+
+        for nuevo in candidatos:
+            prueba = dict(pesos)
+            prueba[clave] = nuevo
+
+            # 1) ¿Mejora en la primera mitad?
+            ga, ta = _cuanto_acierta(grupo_a, prueba)
+            if puntaje(ga, ta) <= mejor_a + 1.0:
+                continue   # ni siquiera mejora aca, se descarta
+
+            # 2) ¿Se REPITE en la segunda mitad? Si no, fue casualidad.
+            gb, tb = _cuanto_acierta(grupo_b, prueba)
+            if puntaje(gb, tb) <= mejor_b:
+                descartados.append({
+                    "peso": clave, "probado": nuevo,
+                    "motivo": "mejoró en un grupo pero no en el otro",
+                })
+                continue
+
+            # Mejora en los dos: es real.
+            mejor_a = puntaje(ga, ta)
+            mejor_b = puntaje(gb, tb)
+            pesos[clave] = nuevo
+            cambios.append({
+                "peso": clave, "de": round(actual, 2), "a": nuevo,
+                "ganador": round((ga + gb) / 2, 2),
+                "top4": round((ta + tb) / 2, 2),
+            })
+            break   # se pasa al siguiente peso
+
+    if cambios:
+        guardar_pesos(pesos)
+
+    # El acierto final, medido contra TODAS las carreras.
+    fin_g, fin_t = _cuanto_acierta(todas, pesos)
+    ini_g, ini_t = (base_ga + base_gb) / 2, (base_ta + base_tb) / 2
+
+    return {
+        "ok": True,
+        "carreras_usadas": len(todas),
+        "grupo_prueba": len(grupo_a),
+        "grupo_verificacion": len(grupo_b),
+        # Lo que importa: acertar el ganador.
+        "ganador_antes": round(ini_g, 2),
+        "ganador_ahora": round(fin_g, 2),
+        "top4_antes": round(ini_t, 2),
+        "top4_ahora": round(fin_t, 2),
+        "cambios": cambios,
+        "descartados_por_casualidad": descartados,
+    }
 
 # ============================================================
 # PANEL DE ADMIN — solo accesible con la clave ADMIN_KEY.
@@ -4705,16 +4885,22 @@ def _pausa_prudente():
     time.sleep(PAUSA_HISTORICO + random.uniform(0, 2.0))
 
 
-def _sumar_a_la_cola(url, tipo):
-    """Anota una direccion para visitarla mas adelante."""
+def _sumar_a_la_cola(url, tipo, fecha=""):
+    """
+    Anota una direccion para visitarla mas adelante. La fecha sirve para
+    recorrer de lo mas nuevo a lo mas viejo, en orden.
+    """
     if not url:
         return
+    # Si no vino la fecha, se intenta sacar de la propia direccion.
+    if not fecha:
+        fecha = meeting_date_from_url(url)
     try:
         con = db()
         con.execute("""
-            INSERT OR IGNORE INTO por_explorar(url, tipo, agregado_en)
-            VALUES(?,?,?)
-        """, (url, tipo, datetime.now().isoformat(timespec="seconds")))
+            INSERT OR IGNORE INTO por_explorar(url, tipo, fecha, agregado_en)
+            VALUES(?,?,?,?)
+        """, (url, tipo, fecha or "", datetime.now().isoformat(timespec="seconds")))
         con.commit()
         con.close()
     except Exception:
@@ -4733,15 +4919,23 @@ def _marcar_hecho(url):
 
 def _siguiente_de_la_cola():
     """
-    Lo proximo a visitar. Se priorizan las CARRERAS sobre los caballos:
-    una carrera guarda datos utiles enseguida, un caballo solo abre camino.
+    Lo proximo a visitar. Va de lo MAS NUEVO a lo mas viejo: primero se
+    completa 2026, despues 2025, despues 2024. Asi el historico crece en
+    orden y siempre se tiene lo mas reciente, que es lo que mas se parece
+    a las carreras de hoy.
+    Las carreras van antes que los caballos: una carrera guarda datos
+    enseguida, un caballo solo abre camino.
     """
     try:
         con = db()
         fila = con.execute("""
             SELECT url, tipo FROM por_explorar
             WHERE hecho=0 AND intentos < 3
-            ORDER BY (tipo='carrera') DESC, rowid ASC LIMIT 1
+            ORDER BY (tipo='carrera') DESC,
+                     (fecha IS NULL OR fecha='') ASC,
+                     fecha DESC,
+                     rowid ASC
+            LIMIT 1
         """).fetchone()
         con.close()
         return dict(fila) if fila else None
@@ -4848,10 +5042,41 @@ def guardar_carrera_historica(url):
         if m:
             fecha = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
 
+    # El hipodromo. La direccion de una carrera vieja viene como
+    # /reuniones/carrera/ID/x/N, sin el nombre. Asi que se busca de tres
+    # formas, en orden.
     hip = ""
+
+    # 1) Si la direccion SI lo trae (algunas lo hacen).
     m = re.search(r"/reuniones/\w+/\d+/\d{8}-([a-z\-]+?)-\d+", url)
     if m:
         hip = m.group(1).replace("-", " ").title()
+
+    # 2) En un enlace de la propia pagina que vuelva a la reunion.
+    if not hip:
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"/reuniones/detalle/\d+/\d{8}-([a-z\-]+?)-\d+", a["href"])
+            if m:
+                hip = m.group(1).replace("-", " ").title()
+                break
+
+    # 3) En el texto: el sitio nombra al hipodromo arriba de la carrera.
+    if not hip:
+        texto = clean(soup.get_text(" "))
+        for nombre in ["San Isidro", "Palermo", "La Plata", "Rosario",
+                       "Tandil", "Dolores", "Azul", "Tucumán", "La Punta",
+                       "Córdoba", "Mendoza", "Santa Fe", "Neuquén",
+                       "San Rafael", "Río Cuarto"]:
+            if nombre.lower() in texto.lower():
+                hip = nombre
+                break
+
+    # 4) Ultimo recurso: la sigla que aparece en la ficha (ARG, SIS, LPA).
+    if not hip:
+        m = re.search(r"\b(ARG|SIS|LPA|ROS|TAN|DOL|AZL|TUC|SLU|CBA|MZA|SFE)\b",
+                      clean(soup.get_text(" ")))
+        if m:
+            hip = nombre_hipodromo(m.group(1))
 
     participantes = [{
         "nombre": p.get("nombre"),
@@ -4923,7 +5148,8 @@ def guardar_carrera_historica(url):
                 con_campana,
                 {"participantes": con_campana,
                  "pista_dia": detalle.get("estado_txt") or data.get("estado", ""),
-                 "hora": detalle.get("hora", "")},
+                 "hora": detalle.get("hora", ""),
+                 "distancia": data.get("distancia", "")},
                 pesos,
             )
             registrar_pronostico(
@@ -4953,7 +5179,15 @@ def explorar_caballo(url_perfil):
     nuevas = 0
     for c in carreras:
         if c.get("enlace"):
-            _sumar_a_la_cola(c["enlace"], "carrera")
+            # La fecha viene como DD/MM/AAAA; se guarda como AAAA-MM-DD
+            # para poder ordenar de lo mas nuevo a lo mas viejo.
+            f = ""
+            try:
+                d, m, a = c.get("fecha", "").split("/")
+                f = f"{a}-{m}-{d}"
+            except (ValueError, AttributeError):
+                pass
+            _sumar_a_la_cola(c["enlace"], "carrera", f)
             nuevas += 1
 
     _marcar_hecho(url_perfil)
@@ -5063,7 +5297,46 @@ def recolectar_historico():
             _pausa_prudente()
 
         HISTORICO["corriendo"] = False
+
+        # Al terminar la noche, afinar los pesos con lo que se junto.
+        # Se hace una sola vez por noche porque es lento: prueba cada
+        # peso contra cientos de carreras reales.
+        try:
+            r = ajustar_algoritmo()
+            if r.get("ok"):
+                HISTORICO["ultimo_ajuste"] = {
+                    "cuando": ahora_argentina().strftime("%Y-%m-%d %H:%M"),
+                    "ganador_antes": r["ganador_antes"],
+                    "ganador_ahora": r["ganador_ahora"],
+                    "carreras": r["carreras_usadas"],
+                    "cambios": len(r["cambios"]),
+                }
+        except Exception:
+            pass
+
         time.sleep(10 * 60)
+
+
+@app.route("/api/admin/ajustar", methods=["GET", "POST"])
+def admin_ajustar():
+    """
+    Afina los pesos ahora, sin esperar a la madrugada. Tarda un rato:
+    prueba cada peso contra cientos de carreras reales.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    r = ajustar_algoritmo()
+    if not r.get("ok"):
+        return jsonify(ok=False, error=r.get("motivo", "No se pudo ajustar.")), 400
+    return jsonify(ok=True, **r,
+                   mensaje=(f"Probado contra {r['carreras_usadas']} carreras. "
+                            f"Acierto del GANADOR: {r['ganador_antes']}% → "
+                            f"{r['ganador_ahora']}%. "
+                            f"Entre los cuatro: {r['top4_antes']}% → "
+                            f"{r['top4_ahora']}%. "
+                            f"Se cambiaron {len(r['cambios'])} pesos. "
+                            f"Se descartaron {len(r['descartados_por_casualidad'])} "
+                            f"que mejoraban en un grupo pero no en el otro."))
 
 
 @app.get("/api/admin/historico")
