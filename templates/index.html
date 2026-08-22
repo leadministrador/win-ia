@@ -773,6 +773,10 @@
     font-family:'Fraunces',serif; font-size:21px; font-weight:600;
     line-height:1.35; color:var(--verde-turf);
   }
+  .hoy-pista{
+    font-family:'Archivo',sans-serif; font-size:15px;
+    margin-top:7px; opacity:.85;
+  }
   .of-rot{
     font-family:'Space Mono',monospace; font-size:9.5px; text-transform:uppercase;
     letter-spacing:.09em; color:var(--carmin); margin-bottom:6px;
@@ -1323,6 +1327,13 @@
     font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
     margin-top:12px; line-height:1.6;
   }
+  .btn-buscar-fecha{
+    width:100%; margin-top:14px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:16px; background:var(--pergamino);
+    border:1.5px solid var(--pergamino-2); color:var(--verde-turf);
+    padding:15px; border-radius:8px; cursor:pointer; min-height:54px;
+  }
+  .btn-buscar-fecha:hover{ border-color:var(--bronce); background:#fff; }
   .nota-viejas{
     font-family:'Archivo',sans-serif; font-size:13.5px; line-height:1.6;
     background:var(--pergamino); border-left:3px solid var(--bronce);
@@ -1508,7 +1519,7 @@
     <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
     <div class="hero-usuario" id="hero-usuario"></div>
     <div class="hero-actions">
-      <button class="btn btn-primary" onclick="abrirBuscadorCarrera()">Buscar carrera</button>
+      <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
       <button class="btn btn-ghost" onclick="abrirBuscadorCaballo()">🔍 Buscar caballo</button>
       <button class="btn btn-ghost" onclick="abrirSeguidos()">🔔 Caballos seguidos <span id="contador-seguidos" class="contador-seg" style="display:none;">0</span></button>
       <a class="btn btn-panel" id="btn-panel" href="/admin" style="display:none;">⚙ Panel</a>
@@ -1940,15 +1951,12 @@ async function cargarCalendario(){
       chip.onclick = ()=> elegirFecha(f, d, chip);
       grid.appendChild(chip);
     });
-    if (cuantasViejas > 0){
-      const nota = document.createElement('div');
-      nota.className = 'nota-viejas';
-      nota.innerHTML =
-        'Se muestran los últimos 10 días. Para fechas anteriores, usá ' +
-        '<button class="link-viejas" onclick="abrirBuscadorCarrera()">' +
-        'Buscar carrera</button>.';
-      grid.parentElement.appendChild(nota);
-    }
+    // Al final de las fechas, para llegar a las de antes.
+    const btnCal = document.createElement('button');
+    btnCal.className = 'btn-buscar-fecha';
+    btnCal.textContent = '🗓 Buscar carrera por fecha';
+    btnCal.onclick = abrirBuscadorCarrera;
+    grid.parentElement.appendChild(btnCal);
 
     if (data.aviso){
       grid.innerHTML += estadoMsg(data.aviso, true);
@@ -3188,7 +3196,24 @@ async function traerCondiciones(fecha, hipodromo){
     condicionesMias = {};
     pintarCondiciones();
   }catch(e){
-    document.getElementById('caja-condiciones').style.display = 'none';
+    // Aunque falle al traerlas, el recuadro se muestra igual: el usuario
+    // tiene que poder poner cómo ve la pista de todos modos.
+    condicionesOficiales = {};
+    observacionesReunion = '';
+    condicionesMias = {};
+    if (!camposCondiciones.length){
+      camposCondiciones = [
+        {clave:'pista',  titulo:'Pista',
+         opciones:['Arena','Arena (Codo)','Césped']},
+        {clave:'estado', titulo:'Estado',
+         opciones:['Normal','Liviana','Húmeda','Pesada','Barrosa']},
+        {clave:'viento', titulo:'Viento',
+         opciones:['Sin viento','A favor','En contra','Cruzado']},
+        {clave:'clima',  titulo:'Clima',
+         opciones:['Despejado','Nublado','Llovizna','Lluvia']},
+      ];
+    }
+    pintarCondiciones();
   }
 }
 
@@ -3210,17 +3235,15 @@ function pintarCondiciones(){
   const hayDelAdmin = puestas.length > 0;
   const aMostrar = hayDelAdmin ? puestas : delStudBook;
 
-  // Si nadie cargó las condiciones, se invita al usuario a ponerlas.
+  // Siempre se invita al usuario a poner cómo ve la pista. Debajo se
+  // muestra lo que hay, sin decir de dónde sale.
   // Lo que cargue solo cambia SU pronóstico: el oficial usa lo del admin.
-  const sinNada = !aMostrar.length;
-
-  document.getElementById('oficiales-caja').innerHTML = sinNada
-    ? `<div class="pedir-pista">Poné cómo está la pista hoy</div>`
-    : `<div class="of-rot">${hayDelAdmin
-         ? 'Condiciones oficiales'
-         : 'Según el Stud Book'}</div>
-       <div class="of-txt">${aMostrar.join(' · ')}</div>
-       ${observacionesReunion ? '<div class="of-obs">'+observacionesReunion+'</div>' : ''}`;
+  document.getElementById('oficiales-caja').innerHTML =
+    `<div class="pedir-pista">Poné cómo está la pista hoy</div>` +
+    (aMostrar.length
+      ? `<div class="hoy-pista">Hoy: ${aMostrar.join(' · ')}</div>` : '') +
+    (observacionesReunion
+      ? `<div class="of-obs">${observacionesReunion}</div>` : '');
 
   const cont = document.getElementById('ajuste-usuario');
   cont.innerHTML = camposCondiciones.map(c => {
