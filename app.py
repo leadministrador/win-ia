@@ -2463,7 +2463,8 @@ def rankear(participantes, contexto, pesos):
 
 
 # Para saber por que el afinamiento sirve o no, sin adivinar.
-APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0}
+APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0,
+               "ultima_vez_con": 0}
 
 
 def _carreras_para_aprender(limite=None):
@@ -2592,6 +2593,15 @@ def ajustar_algoritmo():
     nunca se descubria cual servia. Terminaban todos en el piso.
     """
     todas = _carreras_para_aprender()
+
+    # Si no hay carreras nuevas desde la ultima vez, no tiene sentido
+    # hacer todo el calculo otra vez: daria exactamente lo mismo.
+    if todas and len(todas) == APRENDIZAJE.get("ultima_vez_con", 0):
+        return {"ok": False, "sin_novedades": True,
+                "motivo": (f"No hay carreras nuevas desde la última vez "
+                           f"(las mismas {len(todas)}). Afinar de nuevo "
+                           "daría el mismo resultado.")}
+
     if len(todas) < 60:
         sin = APRENDIZAJE.get("carreras_sin_campana", 0)
         fichas = APRENDIZAJE.get("fichas_disponibles", 0)
@@ -2673,6 +2683,8 @@ def ajustar_algoritmo():
 
     if cambios:
         guardar_pesos(pesos)
+
+    APRENDIZAJE["ultima_vez_con"] = len(todas)
 
     # El acierto final, medido contra TODAS las carreras.
     fin_g, fin_t = _cuanto_acierta(todas, pesos)
@@ -4916,6 +4928,9 @@ HORA_INICIO_RECOLECCION = int(os.getenv("RECOLECCION_DESDE", "3"))   # 3 de la m
 HORA_FIN_RECOLECCION = int(os.getenv("RECOLECCION_HASTA", "7"))      # 7 de la mañana
 PAUSA_HISTORICO = float(os.getenv("PAUSA_HISTORICO", "3.0"))         # segundos
 
+# Cuando se arranca a mano, sin esperar al horario de la madrugada.
+A_MANO = {"prendido": False, "desde": None}
+
 HISTORICO = {
     "corriendo": False,
     "carreras_guardadas": 0,
@@ -4927,6 +4942,10 @@ HISTORICO = {
 
 
 def _es_horario_de_recoleccion():
+    # Si se prendio a mano, trabaja aunque no sea la hora.
+    if A_MANO["prendido"]:
+        return True
+
     h = ahora_argentina().hour
     if HORA_INICIO_RECOLECCION < HORA_FIN_RECOLECCION:
         return HORA_INICIO_RECOLECCION <= h < HORA_FIN_RECOLECCION
@@ -5400,7 +5419,8 @@ def recolectar_historico():
     while True:
         if not _es_horario_de_recoleccion() or not ajuste("recoleccion_historico"):
             HISTORICO["corriendo"] = False
-            time.sleep(15 * 60)
+            # Se revisa seguido para que el boton haga efecto enseguida.
+            time.sleep(20)
             continue
 
         HISTORICO["corriendo"] = True
@@ -5541,6 +5561,10 @@ def admin_ajuste_estado():
         return jsonify(ok=True, corriendo=False, sin_datos=True,
                        mensaje="Todavía no se afinó nada en esta sesión.")
     if not r.get("ok"):
+        # Que no haya novedades no es un error: es que no hace falta.
+        if r.get("sin_novedades"):
+            return jsonify(ok=True, corriendo=False, sin_novedades=True,
+                           mensaje=r.get("motivo", ""))
         return jsonify(ok=False, corriendo=False,
                        error=r.get("motivo", "No se pudo afinar.")), 400
 
@@ -5577,6 +5601,61 @@ def admin_ajustar_directo():
                             f"Se cambiaron {len(r['cambios'])} pesos. "
                             f"Se descartaron {len(r['descartados_por_casualidad'])} "
                             f"que mejoraban en un grupo pero no en el otro."))
+
+
+@app.route("/api/admin/historico-arrancar", methods=["GET", "POST"])
+def admin_historico_arrancar():
+    """Arranca el historico ahora, sin esperar a la madrugada."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    A_MANO["prendido"] = True
+    A_MANO["desde"] = ahora_argentina().strftime("%H:%M")
+    return jsonify(ok=True, prendido=True,
+                   mensaje=("Arrancando. Va a juntar carreras hasta que lo "
+                            "pares. Podés cerrar esta página."))
+
+
+@app.route("/api/admin/historico-parar", methods=["GET", "POST"])
+def admin_historico_parar():
+    """Para el historico. Vuelve a su horario de 3 a 7."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    A_MANO["prendido"] = False
+    A_MANO["desde"] = None
+    return jsonify(ok=True, prendido=False,
+                   mensaje="Parado. Vuelve a arrancar solo a las 3 de la mañana.")
+
+
+@app.route("/api/admin/historico-limpiar", methods=["GET", "POST"])
+def admin_historico_limpiar():
+    """
+    Borra lo juntado y arranca de cero. Se usa cuando lo guardado quedo
+    incompleto y no sirve para afinar.
+    NO toca usuarios, condiciones ni nada cargado a mano.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    con.execute("DELETE FROM historico")
+    con.execute("DELETE FROM fichas")
+    con.execute("DELETE FROM por_explorar")
+    # Los pronosticos que salieron de ahi se hicieron sin la campaña,
+    # asi que no valen para medir.
+    con.execute("DELETE FROM pronosticos WHERE url LIKE '%/reuniones/carrera/%'")
+    con.commit()
+    con.close()
+
+    HISTORICO.update({
+        "carreras_guardadas": 0, "caballos_vistos": 0,
+        "pendientes": 0, "ultimo": "Se empezó de cero.",
+        "frenado_por_el_sitio": False,
+    })
+    return jsonify(ok=True, borradas=n,
+                   mensaje=(f"Se borraron {n} carreras. Tus usuarios y lo "
+                            "cargado a mano no se tocaron. Tocá «Arrancar» "
+                            "para empezar de nuevo."))
 
 
 @app.get("/api/admin/historico")
