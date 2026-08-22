@@ -5658,6 +5658,94 @@ def admin_historico_limpiar():
                             "para empezar de nuevo."))
 
 
+@app.get("/api/admin/diag-historico")
+def admin_diag_historico():
+    """
+    Muestra paso a paso que pasa cuando el historico intenta arrancar.
+    Sirve para ver donde se traba, sin adivinar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    informe = {
+        "prendido_a_mano": A_MANO["prendido"],
+        "desde": A_MANO["desde"],
+        "en_horario": _es_horario_de_recoleccion(),
+        "hora_argentina": hora_argentina(),
+        "interruptor_del_panel": ajuste("recoleccion_historico"),
+        "estado": dict(HISTORICO),
+    }
+
+    con = db()
+    informe["en_la_base"] = {
+        "carreras": con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"],
+        "fichas": con.execute("SELECT COUNT(*) c FROM fichas").fetchone()["c"],
+        "cola_pendiente": con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=0").fetchone()["c"],
+        "cola_hecha": con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=1").fetchone()["c"],
+    }
+    con.close()
+
+    # Probar de verdad cada paso, sin guardar nada.
+    pasos = []
+
+    # 1) ¿Se puede abrir el calendario?
+    try:
+        soup = fetch(BASE + "/reuniones")
+        reuniones = calendar_from_meetings(soup)
+        pasos.append({
+            "paso": "1. abrir el calendario",
+            "ok": True,
+            "reuniones": len(reuniones),
+            "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:3]],
+        })
+    except Exception as e:
+        reuniones = []
+        pasos.append({"paso": "1. abrir el calendario", "ok": False,
+                      "error": str(e)[:150]})
+
+    # 2) ¿Se puede abrir una reunion y sacar sus carreras?
+    if reuniones:
+        try:
+            soup = fetch(reuniones[0]["url"])
+            carreras = extract_races_from_meeting(soup)
+            pasos.append({
+                "paso": "2. abrir una reunion",
+                "ok": bool(carreras),
+                "carreras": len(carreras),
+            })
+        except Exception as e:
+            carreras = []
+            pasos.append({"paso": "2. abrir una reunion", "ok": False,
+                          "error": str(e)[:150]})
+
+        # 3) ¿Se pueden leer los participantes y sus fichas?
+        if carreras:
+            try:
+                data = parse_race(soup, carreras[0]["numero"])
+                ps = (data or {}).get("participantes", [])
+                con_perfil = [p for p in ps if p.get("perfil")]
+                pasos.append({
+                    "paso": "3. leer los participantes",
+                    "ok": bool(con_perfil),
+                    "participantes": len(ps),
+                    "con_ficha": len(con_perfil),
+                    "ejemplo": con_perfil[0]["perfil"] if con_perfil else "",
+                })
+            except Exception as e:
+                pasos.append({"paso": "3. leer los participantes", "ok": False,
+                              "error": str(e)[:150]})
+
+    informe["pasos"] = pasos
+    informe["DIAGNOSTICO"] = (
+        "Todo bien: debería estar juntando."
+        if all(p.get("ok") for p in pasos) and pasos
+        else "Falla en alguno de los pasos de arriba."
+    )
+    return jsonify(ok=True, **informe)
+
+
 @app.get("/api/admin/historico")
 def admin_historico():
     """Cuanto se lleva juntado del historico."""
