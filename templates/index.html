@@ -520,7 +520,7 @@
   .barra-top.visible{ display:block; }
   .carga-fila{ display:flex; align-items:center; gap:15px; }
   .caballito{
-    width:44px; height:44px; flex-shrink:0;
+    width:58px; height:58px; flex-shrink:0;
     animation:galope 1.1s ease-in-out infinite;
   }
   @keyframes galope{
@@ -529,11 +529,11 @@
   }
   .carga-texto{ flex:1; min-width:0; }
   .carga-titulo{
-    font-family:'Fraunces',serif; font-size:19px; font-weight:600; line-height:1.25;
+    font-family:'Fraunces',serif; font-size:25px; font-weight:600; line-height:1.25;
   }
   .carga-paso{
-    font-family:'Space Mono',monospace; font-size:12.5px;
-    color:var(--bronce-claro); margin-top:5px;
+    font-family:'Space Mono',monospace; font-size:15px;
+    color:var(--bronce-claro); margin-top:7px;
   }
   .pista-carga{
     margin-top:15px; height:10px; background:rgba(255,255,255,.16);
@@ -768,6 +768,10 @@
   .oficiales-caja{
     background:var(--pergamino); border-left:3px solid var(--carmin);
     padding:12px 14px; border-radius:0 5px 5px 0; margin-bottom:12px;
+  }
+  .pedir-pista{
+    font-family:'Fraunces',serif; font-size:21px; font-weight:600;
+    line-height:1.35; color:var(--verde-turf);
   }
   .of-rot{
     font-family:'Space Mono',monospace; font-size:9.5px; text-transform:uppercase;
@@ -1276,6 +1280,59 @@
     color:#fff; border:none; padding:14px; border-radius:8px;
     cursor:pointer; min-height:50px;
   }
+  /* ===== BUSCAR CARRERA POR CALENDARIO ===== */
+  .cal-overlay{
+    position:fixed; inset:0; background:rgba(21,56,50,.66);
+    display:none; align-items:center; justify-content:center;
+    z-index:75; padding:16px; backdrop-filter:blur(3px);
+  }
+  .cal-overlay.visible{ display:flex; }
+  .cal-caja{
+    background:var(--hueso); border-radius:12px; width:100%;
+    max-width:480px; max-height:90vh; overflow-y:auto;
+    padding:26px 22px 24px; position:relative;
+  }
+  .cal-titulo{
+    font-family:'Fraunces',serif; font-size:24px; font-weight:600;
+    padding-right:34px;
+  }
+  .cal-sub{ font-size:14px; opacity:.7; margin:6px 0 20px; }
+  .cal-paso{ margin-bottom:18px; }
+  .cal-paso > label{
+    display:block; font-family:'Space Mono',monospace; font-size:11px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6;
+    margin-bottom:9px;
+  }
+  .cal-ops{ display:flex; gap:8px; flex-wrap:wrap; }
+  .cal-op{
+    font-family:'Archivo',sans-serif; font-size:15px; font-weight:600;
+    padding:12px 16px; border-radius:8px; cursor:pointer;
+    border:1.5px solid var(--pergamino-2); background:var(--pergamino);
+    min-height:48px; display:flex; align-items:center;
+  }
+  .cal-op:hover{ border-color:var(--bronce); }
+  .cal-op.sel{
+    background:var(--verde-turf); color:var(--hueso);
+    border-color:var(--verde-turf);
+  }
+  .cal-cargando{
+    font-family:'Space Mono',monospace; font-size:12.5px; opacity:.65;
+    padding:8px 0;
+  }
+  .cal-aviso{
+    font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
+    margin-top:12px; line-height:1.6;
+  }
+  .nota-viejas{
+    font-family:'Archivo',sans-serif; font-size:13.5px; line-height:1.6;
+    background:var(--pergamino); border-left:3px solid var(--bronce);
+    padding:12px 14px; border-radius:0 6px 6px 0; margin-top:14px;
+  }
+  .link-viejas{
+    background:none; border:none; cursor:pointer; padding:0;
+    font-family:'Archivo',sans-serif; font-size:13.5px; font-weight:600;
+    color:var(--verde-turf); text-decoration:underline;
+  }
   .estado-msg{
     font-family:'Space Mono',monospace;
     font-size:13px;
@@ -1391,9 +1448,9 @@
 
     /* Cartel de carga */
     .barra-top{ padding:18px 17px 16px; }
-    .carga-titulo{ font-size:18px; }
-    .carga-paso{ font-size:12px; }
-    .caballito{ width:40px; height:40px; }
+    .carga-titulo{ font-size:23px; }
+    .carga-paso{ font-size:14px; }
+    .caballito{ width:54px; height:54px; }
 
     /* Mensajes */
     .estado-msg{ font-size:14px; padding:16px 4px; }
@@ -1451,7 +1508,7 @@
     <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
     <div class="hero-usuario" id="hero-usuario"></div>
     <div class="hero-actions">
-      <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
+      <button class="btn btn-primary" onclick="abrirBuscadorCarrera()">Buscar carrera</button>
       <button class="btn btn-ghost" onclick="abrirBuscadorCaballo()">🔍 Buscar caballo</button>
       <button class="btn btn-ghost" onclick="abrirSeguidos()">🔔 Caballos seguidos <span id="contador-seguidos" class="contador-seg" style="display:none;">0</span></button>
       <a class="btn btn-panel" id="btn-panel" href="/admin" style="display:none;">⚙ Panel</a>
@@ -1592,7 +1649,7 @@
 </div>
 
 <div class="aviso-demo">
-  <p>Datos oficiales del Stud Book Argentino · actualizados con cache de hasta 15-20 minutos.</p>
+  <p>Creado por leadministrador</p>
 </div>
 
 <!-- FICHA CABALLO -->
@@ -1726,6 +1783,41 @@
   </div>
 </div>
 
+<div class="cal-overlay" id="cal-overlay" onclick="if(event.target===this) cerrarBuscadorCarrera()">
+  <div class="cal-caja">
+    <button class="tab-cerrar" onclick="cerrarBuscadorCarrera()">✕</button>
+    <div class="cal-titulo">Buscar una carrera</div>
+    <div class="cal-sub">Elegí el año, el mes y el día.</div>
+
+    <div class="cal-paso">
+      <label>Año</label>
+      <div class="cal-ops" id="cal-anios"></div>
+    </div>
+
+    <div class="cal-paso" id="cal-paso-mes" style="display:none;">
+      <label>Mes</label>
+      <div class="cal-ops" id="cal-meses"></div>
+    </div>
+
+    <div class="cal-paso" id="cal-paso-dia" style="display:none;">
+      <label>Día</label>
+      <div class="cal-ops" id="cal-dias"></div>
+    </div>
+
+    <div class="cal-paso" id="cal-paso-hip" style="display:none;">
+      <label>Hipódromo</label>
+      <div class="cal-ops" id="cal-hips"></div>
+    </div>
+
+    <div class="cal-paso" id="cal-paso-car" style="display:none;">
+      <label>Carrera</label>
+      <div class="cal-ops" id="cal-carreras"></div>
+    </div>
+
+    <div class="cal-aviso" id="cal-aviso"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1820,7 +1912,17 @@ async function cargarCalendario(){
       grid.innerHTML = estadoMsg('No hay reuniones publicadas por ahora.', true);
       return;
     }
-    const fechasUnicas = [...new Set(calendarioCache.map(r => r.fecha))].sort();
+    // Solo desde 10 dias atras hacia adelante. Las mas viejas se buscan
+    // con el calendario del buscador, no aca: si no la lista se hace
+    // larguisima y hay que bajar mucho para llegar a la de hoy.
+    const hoyCal = hoyArgentina || new Date().toISOString().slice(0,10);
+    const limite = new Date(hoyCal + 'T00:00:00');
+    limite.setDate(limite.getDate() - 10);
+    const desdeCal = limite.toISOString().slice(0,10);
+
+    const todasLasFechas = [...new Set(calendarioCache.map(r => r.fecha))].sort();
+    const fechasUnicas = todasLasFechas.filter(f => f >= desdeCal);
+    const cuantasViejas = todasLasFechas.length - fechasUnicas.length;
     grid.innerHTML = '';
     fechasUnicas.forEach(f=>{
       const d = new Date(f + 'T00:00:00');
@@ -1838,6 +1940,16 @@ async function cargarCalendario(){
       chip.onclick = ()=> elegirFecha(f, d, chip);
       grid.appendChild(chip);
     });
+    if (cuantasViejas > 0){
+      const nota = document.createElement('div');
+      nota.className = 'nota-viejas';
+      nota.innerHTML =
+        'Se muestran los últimos 10 días. Para fechas anteriores, usá ' +
+        '<button class="link-viejas" onclick="abrirBuscadorCarrera()">' +
+        'Buscar carrera</button>.';
+      grid.parentElement.appendChild(nota);
+    }
+
     if (data.aviso){
       grid.innerHTML += estadoMsg(data.aviso, true);
     }
@@ -3098,14 +3210,17 @@ function pintarCondiciones(){
   const hayDelAdmin = puestas.length > 0;
   const aMostrar = hayDelAdmin ? puestas : delStudBook;
 
-  document.getElementById('oficiales-caja').innerHTML = `
-    <div class="of-rot">${hayDelAdmin
-      ? 'Condiciones oficiales'
-      : 'Según el Stud Book'}</div>
-    <div class="of-txt">${aMostrar.length
-      ? aMostrar.join(' · ')
-      : 'Todavía no hay condiciones publicadas.'}</div>
-    ${observacionesReunion ? '<div class="of-obs">'+observacionesReunion+'</div>' : ''}`;
+  // Si nadie cargó las condiciones, se invita al usuario a ponerlas.
+  // Lo que cargue solo cambia SU pronóstico: el oficial usa lo del admin.
+  const sinNada = !aMostrar.length;
+
+  document.getElementById('oficiales-caja').innerHTML = sinNada
+    ? `<div class="pedir-pista">Poné cómo está la pista hoy</div>`
+    : `<div class="of-rot">${hayDelAdmin
+         ? 'Condiciones oficiales'
+         : 'Según el Stud Book'}</div>
+       <div class="of-txt">${aMostrar.join(' · ')}</div>
+       ${observacionesReunion ? '<div class="of-obs">'+observacionesReunion+'</div>' : ''}`;
 
   const cont = document.getElementById('ajuste-usuario');
   cont.innerHTML = camposCondiciones.map(c => {
@@ -3379,6 +3494,7 @@ async function salir(){
 
 // Ventanas que se abren encima, en el orden en que se cierran.
 const VENTANAS = [
+  {id: 'cal-overlay',  clase: 'visible', cerrar: () => cerrarBuscadorCarrera()},
   {id: 'aviso-cuenta', clase: 'visible', cerrar: () => cerrarAvisoCuenta()},
   {id: 'login-overlay', clase: 'visible', cerrar: () => cerrarLogin()},
   {id: 'tab-overlay',   clase: 'visible', cerrar: () => cerrarTabulada()},
@@ -3741,6 +3857,150 @@ async function pedirPermisoAvisos(){
     mostrarToast('No se pudieron activar los avisos. ' + e.message);
     return false;
   }
+}
+
+
+// ============================================================
+// BUSCAR UNA CARRERA POR CALENDARIO
+// Año, mes, día, hipódromo y carrera. Las fechas viejas salen de lo
+// que juntó el histórico; las de ahora, del Stud Book.
+// ============================================================
+
+let calDatos = null;
+let calElegido = {anio:'', mes:'', dia:'', hipodromo:''};
+
+const MESES_NOMBRE = ['','enero','febrero','marzo','abril','mayo','junio',
+  'julio','agosto','septiembre','octubre','noviembre','diciembre'];
+
+async function abrirBuscadorCarrera(){
+  document.getElementById('cal-overlay').classList.add('visible');
+  sumarAlHistorial();
+  calElegido = {anio:'', mes:'', dia:'', hipodromo:''};
+  ['cal-paso-mes','cal-paso-dia','cal-paso-hip','cal-paso-car']
+    .forEach(id => document.getElementById(id).style.display = 'none');
+  document.getElementById('cal-aviso').textContent = '';
+  document.getElementById('cal-anios').innerHTML =
+    '<div class="cal-cargando">Buscando fechas…</div>';
+
+  try{
+    calDatos = await apiGet('/api/buscar-fechas');
+    pintarAnios();
+  }catch(e){
+    document.getElementById('cal-anios').innerHTML =
+      '<div class="cal-cargando">No se pudo buscar. ' + e.message + '</div>';
+  }
+}
+
+function cerrarBuscadorCarrera(){
+  document.getElementById('cal-overlay').classList.remove('visible');
+}
+
+function pintarAnios(){
+  const c = document.getElementById('cal-anios');
+  if (!calDatos || !calDatos.anios.length){
+    c.innerHTML = '<div class="cal-cargando">Todavía no hay fechas guardadas.</div>';
+    return;
+  }
+  c.innerHTML = calDatos.anios.map(a =>
+    `<div class="cal-op" onclick="elegirAnio('${a.anio}')">${a.anio}</div>`).join('');
+}
+
+function elegirAnio(anio){
+  calElegido = {anio, mes:'', dia:'', hipodromo:''};
+  marcarElegido('cal-anios', anio);
+  const a = calDatos.anios.find(x => x.anio === anio);
+  document.getElementById('cal-meses').innerHTML = (a ? a.meses : []).map(m =>
+    `<div class="cal-op" onclick="elegirMes('${m}')">${MESES_NOMBRE[parseInt(m,10)]}</div>`
+  ).join('');
+  document.getElementById('cal-paso-mes').style.display = 'block';
+  ['cal-paso-dia','cal-paso-hip','cal-paso-car']
+    .forEach(id => document.getElementById(id).style.display = 'none');
+  document.getElementById('cal-aviso').textContent = '';
+}
+
+function elegirMes(mes){
+  calElegido.mes = mes;
+  calElegido.dia = '';
+  marcarElegido('cal-meses', MESES_NOMBRE[parseInt(mes,10)]);
+
+  const prefijo = calElegido.anio + '-' + mes + '-';
+  const dias = calDatos.fechas.filter(f => f.fecha.startsWith(prefijo));
+  document.getElementById('cal-dias').innerHTML = dias.length
+    ? dias.map(f =>
+        `<div class="cal-op" onclick="elegirDia('${f.fecha}')">${f.fecha.slice(8)}</div>`
+      ).join('')
+    : '<div class="cal-cargando">No hay carreras guardadas de ese mes.</div>';
+  document.getElementById('cal-paso-dia').style.display = 'block';
+  ['cal-paso-hip','cal-paso-car']
+    .forEach(id => document.getElementById(id).style.display = 'none');
+}
+
+function elegirDia(fecha){
+  calElegido.dia = fecha;
+  calElegido.hipodromo = '';
+  marcarElegido('cal-dias', fecha.slice(8));
+
+  const f = calDatos.fechas.find(x => x.fecha === fecha);
+  const hips = (f && f.hipodromos.length) ? f.hipodromos : [''];
+  document.getElementById('cal-hips').innerHTML = hips.map(h =>
+    `<div class="cal-op" onclick="elegirHipCal('${h.replace(/'/g,"\\'")}')">${h || 'Todos'}</div>`
+  ).join('');
+  document.getElementById('cal-paso-hip').style.display = 'block';
+  document.getElementById('cal-paso-car').style.display = 'none';
+}
+
+async function elegirHipCal(hip){
+  calElegido.hipodromo = hip;
+  marcarElegido('cal-hips', hip || 'Todos');
+  const cont = document.getElementById('cal-carreras');
+  cont.innerHTML = '<div class="cal-cargando">Buscando las carreras…</div>';
+  document.getElementById('cal-paso-car').style.display = 'block';
+
+  try{
+    const d = await apiGet('/api/carreras-de?fecha=' + encodeURIComponent(calElegido.dia)
+      + '&hipodromo=' + encodeURIComponent(hip));
+    if (!d.carreras || !d.carreras.length){
+      cont.innerHTML = '<div class="cal-cargando">No hay carreras de esa fecha.</div>';
+      return;
+    }
+    cont.innerHTML = d.carreras.map((c,i) =>
+      `<div class="cal-op" onclick="verCarreraDelCalendario(${i})">${c.numero}ª</div>`
+    ).join('');
+    window._calCarreras = d.carreras;
+    window._calUrl = d.url || '';
+    document.getElementById('cal-aviso').textContent =
+      d.fuente === 'histórico'
+        ? 'Estas carreras salen de lo que juntó la app.'
+        : 'Estas carreras salen del Stud Book.';
+  }catch(e){
+    cont.innerHTML = '<div class="cal-cargando">' + e.message + '</div>';
+  }
+}
+
+async function verCarreraDelCalendario(i){
+  const c = (window._calCarreras || [])[i];
+  if (!c) return;
+  cerrarBuscadorCarrera();
+
+  // Se arma el contexto como si se hubiera llegado por los pasos.
+  fechaElegida = calElegido.dia;
+  hipodromoElegido = {hipodromo: calElegido.hipodromo, url: window._calUrl || c.url};
+  meetingUrlElegida = window._calUrl || c.url;
+
+  document.getElementById('card-comp').style.display = 'block';
+  document.querySelectorAll('.step').forEach(s => s.classList.remove('open'));
+  document.getElementById('paso-comp').classList.add('open');
+  document.getElementById('buscar').scrollIntoView({behavior:'smooth'});
+
+  const falso = {numero: c.numero, titulo: (c.titulo || (c.numero + 'ª Carrera')),
+                 hora: c.hora || ''};
+  await elegirCarrera(falso, {classList:{add(){}, remove(){}}});
+}
+
+function marcarElegido(contenedor, texto){
+  document.querySelectorAll('#' + contenedor + ' .cal-op').forEach(el => {
+    el.classList.toggle('sel', el.textContent.trim() === String(texto).trim());
+  });
 }
 
 // ---------- Arranque ----------
