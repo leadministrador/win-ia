@@ -5409,37 +5409,45 @@ def _sembrar_si_hace_falta():
             continue
 
 
-def recolectar_historico():
+def trabajar_una_tanda(cuantos=None, forzar=False):
     """
-    Tarea de fondo. Solo trabaja en el horario permitido y a paso lento.
-    Si el sitio deja de responder, frena y espera al dia siguiente.
-    """
-    time.sleep(120)   # dejar que el servidor arranque tranquilo
+    Hace un poco de trabajo del historico y vuelve enseguida.
 
-    while True:
+    Por que en tandas y no una tarea permanente: el servidor de Render
+    reinicia su proceso cada tanto y MATA cualquier tarea de fondo.
+    Una tarea que corre para siempre nunca sobrevive ahi. Una tanda
+    corta, en cambio, siempre termina.
+
+    Se llama sola cuando alguien entra al panel, y desde el boton.
+    """
+    if not forzar:
         if not _es_horario_de_recoleccion() or not ajuste("recoleccion_historico"):
-            HISTORICO["corriendo"] = False
-            # Se revisa seguido para que el boton haga efecto enseguida.
-            time.sleep(20)
-            continue
+            return {"hecho": 0, "motivo": "fuera de horario o apagado"}
 
-        HISTORICO["corriendo"] = True
-        HISTORICO["frenado_por_el_sitio"] = False
-        fallos_seguidos = 0
+    if HISTORICO.get("corriendo"):
+        return {"hecho": 0, "motivo": "ya hay una tanda en curso"}
 
-        try:
-            # Primero se completa lo que quedo a medias, despues se sigue.
-            rehacer = _completar_lo_que_falta()
-            if rehacer:
-                HISTORICO["ultimo"] = (
-                    f"Completando {rehacer} carreras que quedaron sin la "
-                    "campaña de sus caballos.")
-            _sembrar_si_hace_falta()
-        except Exception:
-            pass
+    if cuantos is None:
+        cuantos = int(os.getenv("TANDA_HISTORICO", "12"))
 
-        # Trabajar mientras siga siendo el horario permitido.
-        while _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
+    HISTORICO["corriendo"] = True
+    HISTORICO["frenado_por_el_sitio"] = False
+    hechos, fallos = 0, 0
+
+    try:
+        # Si no hay nada por hacer, se busca por donde empezar.
+        if _contar_pendientes() == 0:
+            try:
+                rehacer = _completar_lo_que_falta()
+                if rehacer:
+                    HISTORICO["ultimo"] = f"Completando {rehacer} carreras."
+                else:
+                    _sembrar_si_hace_falta()
+                    HISTORICO["ultimo"] = "Buscando por dónde empezar…"
+            except Exception:
+                pass
+
+        for _ in range(cuantos):
             siguiente = _siguiente_de_la_cola()
             if not siguiente:
                 HISTORICO["ultimo"] = "No queda nada por explorar."
@@ -5459,47 +5467,59 @@ def recolectar_historico():
                 r = guardar_carrera_historica(url)
                 if r >= 0:
                     HISTORICO["carreras_guardadas"] += 1
-                    HISTORICO["ultimo"] = f"carrera guardada · {url[-40:]}"
+                    HISTORICO["ultimo"] = f"carrera guardada · {url[-38:]}"
             else:
                 r = explorar_caballo(url)
                 if r >= 0:
                     HISTORICO["caballos_vistos"] += 1
-                    HISTORICO["ultimo"] = f"caballo explorado · {url[-40:]}"
+                    HISTORICO["ultimo"] = f"caballo explorado · {url[-38:]}"
 
-            # Si el sitio no responde varias veces seguidas, se frena.
             if r < 0:
-                fallos_seguidos += 1
-                if fallos_seguidos >= 5:
+                fallos += 1
+                if fallos >= 3:
                     HISTORICO["frenado_por_el_sitio"] = True
-                    HISTORICO["ultimo"] = ("El sitio dejó de responder. "
-                                           "Se frena hasta mañana.")
+                    HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
                     break
-                time.sleep(30)   # darle aire al sitio
             else:
-                fallos_seguidos = 0
+                fallos = 0
+                hechos += 1
 
             HISTORICO["pendientes"] = _contar_pendientes()
             _pausa_prudente()
-
+    finally:
         HISTORICO["corriendo"] = False
 
-        # Al terminar la noche, afinar los pesos con lo que se junto.
-        # Se hace una sola vez por noche porque es lento: prueba cada
-        # peso contra cientos de carreras reales.
+    return {"hecho": hechos, "pendientes": _contar_pendientes()}
+
+
+def recolectar_historico():
+    """
+    Sigue existiendo por si el servidor permite tareas de fondo.
+    En Render no sobrevive, por eso ademas se trabaja en tandas.
+    """
+    time.sleep(120)
+
+    while True:
         try:
-            r = ajustar_algoritmo()
-            if r.get("ok"):
-                HISTORICO["ultimo_ajuste"] = {
-                    "cuando": ahora_argentina().strftime("%Y-%m-%d %H:%M"),
-                    "ganador_antes": r["ganador_antes"],
-                    "ganador_ahora": r["ganador_ahora"],
-                    "carreras": r["carreras_usadas"],
-                    "cambios": len(r["cambios"]),
-                }
+            if _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
+                trabajar_una_tanda(cuantos=40)
+                # Al terminar la noche, afinar con lo que se junto.
+                if not _es_horario_de_recoleccion():
+                    try:
+                        r = ajustar_algoritmo()
+                        if r.get("ok"):
+                            HISTORICO["ultimo_ajuste"] = {
+                                "cuando": ahora_argentina().strftime("%Y-%m-%d %H:%M"),
+                                "ganador_antes": r["ganador_antes"],
+                                "ganador_ahora": r["ganador_ahora"],
+                                "carreras": r["carreras_usadas"],
+                                "cambios": len(r["cambios"]),
+                            }
+                    except Exception:
+                        pass
         except Exception:
             pass
-
-        time.sleep(10 * 60)
+        time.sleep(30)
 
 
 # Estado del ultimo afinamiento, para consultarlo sin esperar.
@@ -5610,6 +5630,11 @@ def admin_historico_arrancar():
         return jsonify(ok=False, error="Acceso restringido."), 403
     A_MANO["prendido"] = True
     A_MANO["desde"] = ahora_argentina().strftime("%H:%M")
+
+    # Arranca a trabajar YA, sin esperar nada.
+    threading.Thread(target=trabajar_una_tanda,
+                     kwargs={"forzar": True}, daemon=True).start()
+
     return jsonify(ok=True, prendido=True,
                    mensaje=("Arrancando. Va a juntar carreras hasta que lo "
                             "pares. Podés cerrar esta página."))
@@ -5748,9 +5773,21 @@ def admin_diag_historico():
 
 @app.get("/api/admin/historico")
 def admin_historico():
-    """Cuanto se lleva juntado del historico."""
+    """
+    Cuanto se lleva juntado. Ademas ADELANTA TRABAJO: cada vez que se
+    consulta, hace una tanda corta. Asi el historico avanza aunque el
+    servidor mate las tareas de fondo, que es lo que pasa en Render.
+    """
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
+
+    # Una tanda en segundo plano, para no hacer esperar a la pantalla.
+    try:
+        if (_es_horario_de_recoleccion() and ajuste("recoleccion_historico")
+                and not HISTORICO.get("corriendo")):
+            threading.Thread(target=trabajar_una_tanda, daemon=True).start()
+    except Exception:
+        pass
     con = db()
     total = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
     pend = con.execute("SELECT COUNT(*) c FROM por_explorar WHERE hecho=0").fetchone()["c"]
