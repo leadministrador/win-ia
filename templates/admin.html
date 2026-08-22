@@ -252,6 +252,10 @@
   <div class="caja-recolector">
     <div class="chips" id="chips-historico"></div>
     <div class="progreso-txt" id="hist-estado" style="margin-top:12px;"></div>
+
+    <button class="btn btn-run" style="width:100%; margin-top:14px;"
+            onclick="ajustarAhora()">Afinar el algoritmo ahora</button>
+    <div class="progreso-txt" id="ajuste-estado" style="margin-top:10px;"></div>
     <div id="hist-anios" style="margin-top:14px;"></div>
   </div>
   <h2>Recolección automática</h2>
@@ -663,6 +667,28 @@ async function guardarCondiciones(){
   }catch(e){
     est.textContent = 'No se pudo guardar: ' + e.message;
   }
+}
+
+// ---------- Afinar el algoritmo ----------
+async function ajustarAhora(){
+  const e = document.getElementById('ajuste-estado');
+  e.textContent = 'Probando cada variable contra cientos de carreras… ' +
+                  'esto tarda un rato.';
+  try{
+    const r = await fetch('/api/admin/ajustar?clave=' + encodeURIComponent(clave),
+                          {method:'POST'});
+    const d = await r.json();
+    if (d.ok === false){ e.textContent = d.error; return; }
+
+    let txt = d.mensaje;
+    if (d.cambios && d.cambios.length){
+      txt += '\n\n' + d.cambios
+        .map(c => `· ${c.peso}: ${c.de} → ${c.a}  (ganador ${c.ganador}%)`).join('\n');
+    }
+    e.style.whiteSpace = 'pre-line';
+    e.textContent = txt;
+    cargar();
+  }catch(err){ e.textContent = 'No se pudo ajustar: ' + err.message; }
 }
 
 // ---------- Copia de seguridad ----------
