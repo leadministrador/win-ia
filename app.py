@@ -5988,6 +5988,134 @@ def pagina_privacidad():
     return render_template("privacidad.html", fecha=FECHA_LEGALES, **DATOS_LEGALES)
 
 
+@app.get("/api/buscar-fechas")
+def api_buscar_fechas():
+    """
+    Que fechas hay con carreras, para el calendario del buscador.
+    Junta lo que publica el sitio hoy y lo que junto el historico.
+    """
+    anio = request.args.get("anio", "")
+    mes = request.args.get("mes", "")
+
+    fechas = {}
+
+    # 1) Lo que el sitio publica ahora.
+    try:
+        cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
+                           lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+        for r in cal or []:
+            f = r["fecha"]
+            hip = _limpiar_nombre_hipodromo(r["hipodromo"])
+            fechas.setdefault(f, set()).add(hip)
+    except Exception:
+        pass
+
+    # 2) Lo que junto el historico, que es de donde salen las viejas.
+    try:
+        con = db()
+        for r in con.execute("""
+            SELECT DISTINCT fecha, hipodromo FROM historico
+            WHERE fecha IS NOT NULL AND fecha != ''
+        """).fetchall():
+            if r["hipodromo"]:
+                fechas.setdefault(r["fecha"], set()).add(r["hipodromo"])
+            else:
+                fechas.setdefault(r["fecha"], set())
+        con.close()
+    except Exception:
+        pass
+
+    # Si se pidio un mes, se filtra.
+    if anio and mes:
+        prefijo = f"{anio}-{int(mes):02d}-"
+        fechas = {f: h for f, h in fechas.items() if f.startswith(prefijo)}
+
+    # Que años y meses tienen algo, para armar el calendario.
+    anios = {}
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT DISTINCT substr(fecha,1,4) a, substr(fecha,6,2) m
+            FROM historico WHERE fecha IS NOT NULL AND fecha != ''
+        """).fetchall()
+        con.close()
+        for f in filas:
+            anios.setdefault(f["a"], set()).add(f["m"])
+    except Exception:
+        pass
+
+    # El mes de hoy siempre esta, porque el sitio lo publica.
+    hoy = hoy_argentina()
+    anios.setdefault(hoy[:4], set()).add(hoy[5:7])
+
+    return jsonify(
+        ok=True,
+        fechas=[{"fecha": f, "hipodromos": sorted(h)}
+                for f, h in sorted(fechas.items(), reverse=True)],
+        anios=[{"anio": a, "meses": sorted(m)} for a, m in sorted(anios.items(), reverse=True)],
+        hoy=hoy,
+    )
+
+
+@app.get("/api/carreras-de")
+def api_carreras_de():
+    """
+    Las carreras de una fecha e hipodromo. Primero busca en lo guardado
+    por el historico; si no esta, va al sitio.
+    """
+    fecha = clean(request.args.get("fecha", ""))
+    hip = clean(request.args.get("hipodromo", ""))
+    if not fecha:
+        return jsonify(ok=False, error="Falta la fecha."), 400
+
+    # 1) En lo guardado.
+    guardadas = []
+    try:
+        con = db()
+        q = "SELECT url, numero, distancia, pista, estado FROM historico WHERE fecha=?"
+        args = [fecha]
+        if hip:
+            q += " AND hipodromo=?"
+            args.append(hip)
+        for r in con.execute(q + " ORDER BY numero", args).fetchall():
+            guardadas.append({
+                "numero": r["numero"], "url": r["url"],
+                "distancia": r["distancia"], "pista": r["pista"],
+                "estado": r["estado"], "de": "guardada",
+            })
+        con.close()
+    except Exception:
+        pass
+
+    if guardadas:
+        return jsonify(ok=True, carreras=guardadas, fuente="histórico")
+
+    # 2) Si no esta guardada, se pide al sitio.
+    try:
+        cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
+                           lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+        buscado = normalize_text(_limpiar_nombre_hipodromo(hip)) if hip else ""
+        for r in cal or []:
+            if r["fecha"] != fecha:
+                continue
+            if buscado and normalize_text(
+                    _limpiar_nombre_hipodromo(r["hipodromo"])) != buscado:
+                continue
+            cs = extract_races_from_meeting(fetch(r["url"]))
+            if cs:
+                return jsonify(ok=True, fuente="Stud Book", url=r["url"],
+                               hipodromo=_limpiar_nombre_hipodromo(r["hipodromo"]),
+                               carreras=[{**c, "de": "sitio"} for c in cs])
+    except Exception:
+        pass
+
+    return jsonify(ok=False,
+                   error=("No hay carreras guardadas de esa fecha. "
+                          "Las fechas viejas se van completando a medida "
+                          "que el histórico avanza."),
+                   carreras=[]), 404
+
+
 @app.get("/api/videos")
 def videos():
     horse = request.args.get("caballo","").strip()
