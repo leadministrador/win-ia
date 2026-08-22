@@ -5002,11 +5002,21 @@ def _siguiente_de_la_cola():
 
 
 def _ya_guardada(url):
+    """
+    Dice si esa carrera ya esta guardada Y COMPLETA. Si quedo sin el
+    perfil de sus caballos, se considera incompleta y hay que rehacerla:
+    sin el perfil no se puede llegar a la campaña, y sin campaña no se
+    puede afinar.
+    """
     try:
         con = db()
-        f = con.execute("SELECT 1 FROM historico WHERE url=?", (url,)).fetchone()
+        f = con.execute("SELECT participantes FROM historico WHERE url=?",
+                        (url,)).fetchone()
         con.close()
-        return bool(f)
+        if not f:
+            return False
+        ps = json.loads(f["participantes"])
+        return bool(ps) and any(p.get("perfil") for p in ps)
     except Exception:
         return False
 
@@ -5303,6 +5313,58 @@ def _contar_pendientes():
         return 0
 
 
+def _completar_lo_que_falta():
+    """
+    Las carreras guardadas antes de tener la tabla de fichas quedaron
+    incompletas: no guardaron ni el perfil de cada caballo ni su campaña.
+    Asi no sirven para afinar.
+
+    Esto las vuelve a poner en la cola para visitarlas de nuevo. Al
+    reabrirlas se guardan completas y ademas se anotan sus caballos, que
+    es de donde sale la campaña.
+
+    NO SE BORRA NADA: lo que hay se conserva y se completa encima.
+    """
+    try:
+        con = db()
+        filas = con.execute(
+            "SELECT url, participantes FROM historico"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return 0
+
+    a_rehacer = []
+    for f in filas:
+        try:
+            ps = json.loads(f["participantes"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # Si ninguno tiene perfil, esa carrera se guardo incompleta.
+        if ps and not any(p.get("perfil") for p in ps):
+            a_rehacer.append(f["url"])
+
+    if not a_rehacer:
+        return 0
+
+    # Se sacan de "hecho" para que se vuelvan a visitar.
+    try:
+        con = db()
+        for url in a_rehacer:
+            con.execute("""
+                INSERT INTO por_explorar(url, tipo, fecha, hecho, intentos, agregado_en)
+                VALUES(?,'carrera',?,0,0,?)
+                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0
+            """, (url, meeting_date_from_url(url) or "",
+                  datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        return 0
+
+    return len(a_rehacer)
+
+
 def _sembrar_si_hace_falta():
     """
     Si la cola esta vacia, se arranca con los caballos que corren hoy.
@@ -5346,6 +5408,12 @@ def recolectar_historico():
         fallos_seguidos = 0
 
         try:
+            # Primero se completa lo que quedo a medias, despues se sigue.
+            rehacer = _completar_lo_que_falta()
+            if rehacer:
+                HISTORICO["ultimo"] = (
+                    f"Completando {rehacer} carreras que quedaron sin la "
+                    "campaña de sus caballos.")
             _sembrar_si_hace_falta()
         except Exception:
             pass
