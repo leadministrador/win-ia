@@ -190,6 +190,12 @@ def init_db():
       participantes TEXT,             -- todos los que corrieron, en JSON
       guardado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS fichas(
+      perfil TEXT PRIMARY KEY,        -- la direccion de su ficha
+      nombre TEXT,
+      carreras TEXT,                  -- toda su campaña, en JSON
+      actualizada_en TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS por_explorar(
       url TEXT PRIMARY KEY,           -- ficha de caballo o carrera
       tipo TEXT NOT NULL,             -- caballo | carrera
@@ -2456,6 +2462,10 @@ def rankear(participantes, contexto, pesos):
     return ranked, top
 
 
+# Para saber por que el afinamiento sirve o no, sin adivinar.
+APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0}
+
+
 def _carreras_para_aprender(limite=None):
     """
     Trae TODAS las carreras ya corridas del historico. Cada peso se prueba
@@ -2477,7 +2487,22 @@ def _carreras_para_aprender(limite=None):
     except Exception:
         return []
 
+    # Las campañas se leen UNA vez y quedan en memoria: un caballo aparece
+    # en muchas carreras y seria absurdo buscarlo cada vez.
+    fichas = {}
+    try:
+        con = db()
+        for f in con.execute("SELECT perfil, carreras FROM fichas").fetchall():
+            try:
+                fichas[f["perfil"]] = json.loads(f["carreras"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        con.close()
+    except Exception:
+        pass
+
     carreras = []
+    sin_campana = 0
     for f in filas:
         try:
             ps = json.loads(f["participantes"])
@@ -2485,13 +2510,35 @@ def _carreras_para_aprender(limite=None):
             continue
         if len(ps) < 3 or not any(p.get("puesto") for p in ps):
             continue
+
+        # A cada caballo se le pega su campaña, recortada a lo ANTERIOR a
+        # esta carrera. Sin esto todos puntuan igual y medir no sirve.
+        completos, con_datos = [], 0
+        for p in ps:
+            h = dict(p)
+            camp = fichas.get(p.get("perfil", ""))
+            if camp:
+                h["carreras"] = camp
+                h = _campana_hasta(h, f["fecha"] or "")
+                if h.get("carreras"):
+                    con_datos += 1
+            completos.append(h)
+
+        # Si casi ninguno tiene campaña, esa carrera no sirve para medir.
+        if con_datos < max(2, len(ps) * 0.4):
+            sin_campana += 1
+            continue
+
         carreras.append({
-            "participantes": ps,
+            "participantes": completos,
             "estado": f["estado"] or "",
             "pista": f["pista"] or "",
             "fecha": f["fecha"] or "",
             "distancia": f["distancia"] or "",
         })
+
+    APRENDIZAJE["carreras_sin_campana"] = sin_campana
+    APRENDIZAJE["fichas_disponibles"] = len(fichas)
     return carreras
 
 
@@ -2546,7 +2593,16 @@ def ajustar_algoritmo():
     """
     todas = _carreras_para_aprender()
     if len(todas) < 60:
-        return {"ok": False, "motivo": f"solo hay {len(todas)} carreras, hacen falta 60"}
+        sin = APRENDIZAJE.get("carreras_sin_campana", 0)
+        fichas = APRENDIZAJE.get("fichas_disponibles", 0)
+        if sin:
+            return {"ok": False, "motivo": (
+                f"Hay carreras guardadas, pero {sin} no tienen la campaña de "
+                f"sus caballos, así que no se puede medir con ellas. "
+                f"Fichas guardadas: {fichas}. "
+                "Se van completando a medida que el histórico avanza.")}
+        return {"ok": False,
+                "motivo": f"solo hay {len(todas)} carreras útiles, hacen falta 60"}
 
     # Dos mitades, mezcladas para que no queden todas las viejas de un lado.
     import random as _r
@@ -2625,6 +2681,8 @@ def ajustar_algoritmo():
     return {
         "ok": True,
         "carreras_usadas": len(todas),
+        "carreras_sin_campana": APRENDIZAJE.get("carreras_sin_campana", 0),
+        "fichas_guardadas": APRENDIZAJE.get("fichas_disponibles", 0),
         "grupo_prueba": len(grupo_a),
         "grupo_verificacion": len(grupo_b),
         # Lo que importa: acertar el ganador.
@@ -5089,6 +5147,12 @@ def guardar_carrera_historica(url):
         "caballeriza": p.get("caballeriza"),
         "cuerpos": p.get("cuerpos"),
         "pago": p.get("pago"),
+        # La direccion de su ficha: con esto se busca su campaña guardada
+        # a la hora de afinar. Sin esto no hay con que medir.
+        "perfil": p.get("perfil", ""),
+        "rend_jockey": p.get("rend_jockey"),
+        "rend_entrenador": p.get("rend_entrenador"),
+        "rend_caballeriza": p.get("rend_caballeriza"),
     } for p in data["participantes"] if not p.get("retirado")]
 
     detalle = {}
@@ -5176,6 +5240,39 @@ def explorar_caballo(url_perfil):
         return -1
 
     carreras = _tabla_carreras_del_perfil(soup)
+
+    # Se guarda la campaña UNA sola vez por caballo. Un caballo que corrio
+    # 20 veces aparece en 20 carreras: guardarla en cada una seria repetir
+    # lo mismo veinte veces y llenar el disco al pedo.
+    # Esto es lo que le faltaba al afinamiento para poder medir.
+    try:
+        nombre = ""
+        for et in ("h1", "h2"):
+            h = soup.find(et)
+            if h and clean(h.get_text(" ")):
+                nombre = clean(h.get_text(" "))
+                break
+        livianas = [{
+            "fecha": x.get("fecha", ""),
+            "puesto": x.get("puesto"),
+            "distancia": x.get("distancia", ""),
+            "estado": x.get("estado", ""),
+            "pista": x.get("pista", ""),
+            "numero": x.get("numero", ""),
+            "kilos": x.get("kilos", ""),
+            "hipodromo": x.get("hipodromo", ""),
+        } for x in carreras]
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, actualizada_en)
+            VALUES(?,?,?,?)
+        """, (url_perfil, nombre, json.dumps(livianas, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
     nuevas = 0
     for c in carreras:
         if c.get("enlace"):
