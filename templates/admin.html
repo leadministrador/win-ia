@@ -125,6 +125,10 @@
     font-size:13px; line-height:1.55;
   }
   .aviso-copia b{ color:var(--carmin); }
+  .dos-botones{
+    display:flex; gap:9px; margin-top:14px;
+  }
+  .dos-botones .btn{ flex:1; }
   .anio-fila{
     display:flex; align-items:center; gap:11px; padding:7px 0;
   }
@@ -253,8 +257,18 @@
     <div class="chips" id="chips-historico"></div>
     <div class="progreso-txt" id="hist-estado" style="margin-top:12px;"></div>
 
-    <button class="btn btn-run" style="width:100%; margin-top:14px;"
+    <div class="dos-botones">
+      <button class="btn btn-run" id="btn-hist-on" onclick="historicoArrancar()">
+        Arrancar</button>
+      <button class="btn btn-stop" id="btn-hist-off" onclick="historicoParar()">
+        Parar</button>
+    </div>
+
+    <button class="btn btn-run" style="width:100%; margin-top:10px;"
             onclick="ajustarAhora()">Afinar el algoritmo ahora</button>
+
+    <button class="btn btn-borrar" style="width:100%; margin-top:10px;"
+            onclick="historicoLimpiar()">Borrar todo y empezar de cero</button>
     <div class="progreso-txt" id="ajuste-estado" style="margin-top:10px;"></div>
     <div id="hist-anios" style="margin-top:14px;"></div>
   </div>
@@ -667,6 +681,44 @@ async function guardarCondiciones(){
   }catch(e){
     est.textContent = 'No se pudo guardar: ' + e.message;
   }
+}
+
+// ---------- Arrancar y parar el historico ----------
+async function historicoArrancar(){
+  const e = document.getElementById('hist-estado');
+  try{
+    const r = await fetch('/api/admin/historico-arrancar?clave='
+                          + encodeURIComponent(clave), {method:'POST'});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    setTimeout(verHistorico, 3000);
+  }catch(err){ e.textContent = 'No se pudo arrancar: ' + err.message; }
+}
+
+async function historicoParar(){
+  const e = document.getElementById('hist-estado');
+  try{
+    const r = await fetch('/api/admin/historico-parar?clave='
+                          + encodeURIComponent(clave), {method:'POST'});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    setTimeout(verHistorico, 2000);
+  }catch(err){ e.textContent = 'No se pudo parar: ' + err.message; }
+}
+
+async function historicoLimpiar(){
+  if (!confirm('Esto BORRA todas las carreras juntadas y arranca de cero.\n\n' +
+               'Tus usuarios y lo que cargaste a mano NO se tocan.\n\n¿Seguro?')) return;
+  const e = document.getElementById('hist-estado');
+  e.textContent = 'Borrando…';
+  try{
+    const r = await fetch('/api/admin/historico-limpiar?clave='
+                          + encodeURIComponent(clave), {method:'POST'});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    verHistorico();
+    cargar();
+  }catch(err){ e.textContent = 'No se pudo borrar: ' + err.message; }
 }
 
 // ---------- Afinar el algoritmo ----------
