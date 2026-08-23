@@ -179,6 +179,25 @@ def init_db():
       cargado_en TEXT NOT NULL,
       PRIMARY KEY(caballo, fecha, hipodromo)
     );
+    CREATE TABLE IF NOT EXISTS suscripciones_pago(
+      usuario_id INTEGER PRIMARY KEY,
+      estado TEXT NOT NULL,           -- al_dia | vencida | cancelada | pendiente
+      id_mercadopago TEXT,            -- el numero que da Mercado Pago
+      paga_hasta TEXT,                -- AAAA-MM-DD: hasta cuando tiene acceso
+      ultimo_pago TEXT,
+      monto REAL,
+      creada_en TEXT NOT NULL,
+      actualizada_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pagos(
+      id TEXT PRIMARY KEY,            -- el numero del pago en Mercado Pago
+      usuario_id INTEGER,
+      monto REAL,
+      estado TEXT,
+      fecha TEXT,
+      detalle TEXT,
+      guardado_en TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS historico(
       url TEXT PRIMARY KEY,           -- la direccion de la carrera
       fecha TEXT,                     -- AAAA-MM-DD
@@ -1870,14 +1889,21 @@ def carrera():
     if not url.startswith(BASE) or not numero.isdigit():
         return jsonify(ok=False,error="Datos inválidos."),400
 
-    # Sin cuenta solo se ve la proxima carrera a correrse.
-    if not usuario_actual() and not es_admin():
+    # Sin la suscripcion al dia solo se ve la proxima carrera a correrse.
+    # Con el cobro apagado, esta_al_dia() da True para todos y la app
+    # funciona igual que antes.
+    if not puede_ver_todo():
         if not _es_la_proxima(url, numero):
+            hay_usuario = bool(usuario_actual())
             return jsonify(
                 ok=False,
-                necesita_cuenta=True,
-                error=("Sin cuenta solo podés ver la carrera que está por correrse. "
-                       "Creá una cuenta gratis para ver todas."),
+                necesita_cuenta=not hay_usuario,
+                necesita_pagar=hay_usuario,
+                error=("Con la suscripción al día vas a poder ver todas las "
+                       "carreras, de todas las fechas."
+                       if hay_usuario else
+                       "Sin cuenta solo podés ver la carrera que está por "
+                       "correrse. Creá tu cuenta gratis."),
             ), 401
 
     clave = f"carrera:{url}:{numero}"
@@ -2055,10 +2081,15 @@ def buscar_ejemplares(termino):
 
 @app.get("/api/buscar-caballo")
 def api_buscar_caballo():
-    if not usuario_actual() and not es_admin():
+    if not puede_ver_todo():
+        hay_usuario = bool(usuario_actual())
         return jsonify(
-            ok=False, necesita_cuenta=True,
-            error="Creá una cuenta gratis para buscar cualquier caballo.",
+            ok=False,
+            necesita_cuenta=not hay_usuario,
+            necesita_pagar=hay_usuario,
+            error=("El buscador de caballos viene con la suscripción."
+                   if hay_usuario else
+                   "Creá tu cuenta para buscar cualquier caballo."),
             resultados=[],
         ), 401
     termino = request.args.get("q", "").strip()
@@ -6114,6 +6145,395 @@ def api_carreras_de():
                           "Las fechas viejas se van completando a medida "
                           "que el histórico avanza."),
                    carreras=[]), 404
+
+
+# ============================================================
+# SUSCRIPCION Y COBRO
+# El cobro lo hace Mercado Pago. Nosotros nunca vemos la tarjeta.
+# Las claves se cargan en Render, para no dejarlas en el codigo.
+#
+# Como funciona:
+#   - Cualquiera crea su cuenta gratis
+#   - Sin pagar ve solo la carrera del dia, como el que no tiene cuenta
+#   - Pagando ve todo
+#   - Si deja de pagar, la cuenta queda y vuelve a ver solo la del dia
+# ============================================================
+
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+MP_PUBLIC_KEY = os.getenv("MP_PUBLIC_KEY", "")
+MP_API = "https://api.mercadopago.com"
+
+PRECIO_MENSUAL = float(os.getenv("PRECIO_MENSUAL", "2400"))
+DIAS_DE_GRACIA = int(os.getenv("DIAS_DE_GRACIA", "3"))
+
+# Lo que gana el que paga. Se muestra en la pantalla de suscripcion.
+LO_QUE_INCLUYE = [
+    "Todas las carreras, de todas las fechas",
+    "Buscador de caballos con su campaña completa",
+    "Avisos al celular cuando tu caballo corre",
+    "Cargar tus propios datos del paddock",
+    "Videos y tabuladas de cada carrera",
+    "Participar en los torneos de pronóstico",
+]
+
+
+def hay_cobro():
+    """Si no estan las claves, el cobro esta apagado y todo sigue gratis."""
+    return bool(MP_ACCESS_TOKEN)
+
+
+def _mp(metodo, ruta, datos=None):
+    """Habla con Mercado Pago. Devuelve (salio_bien, respuesta)."""
+    if not MP_ACCESS_TOKEN:
+        return False, {"error": "faltan las claves de Mercado Pago"}
+    cab = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        if metodo == "POST":
+            r = requests.post(MP_API + ruta, headers=cab, json=datos, timeout=(5, 20))
+        else:
+            r = requests.get(MP_API + ruta, headers=cab, timeout=(5, 20))
+        try:
+            cuerpo = r.json()
+        except ValueError:
+            cuerpo = {"texto": r.text[:300]}
+        return r.status_code < 300, cuerpo
+    except Exception as e:
+        return False, {"error": str(e)[:200]}
+
+
+def suscripcion_de(usuario_id):
+    """La suscripcion de un usuario, o None."""
+    if not usuario_id:
+        return None
+    try:
+        con = db()
+        f = con.execute("SELECT * FROM suscripciones_pago WHERE usuario_id=?",
+                        (usuario_id,)).fetchone()
+        con.close()
+        return dict(f) if f else None
+    except Exception:
+        return None
+
+
+def esta_al_dia(usuario_id):
+    """
+    Dice si ese usuario puede ver todo.
+    Si el cobro esta apagado, TODOS pueden: asi la app sigue andando
+    igual que antes hasta que se prenda de verdad.
+    """
+    if not hay_cobro():
+        return True
+    s = suscripcion_de(usuario_id)
+    if not s or not s.get("paga_hasta"):
+        return False
+    # Se dan unos dias de gracia por si el cobro se demora.
+    try:
+        limite = (datetime.strptime(s["paga_hasta"], "%Y-%m-%d")
+                  + timedelta(days=DIAS_DE_GRACIA)).strftime("%Y-%m-%d")
+    except ValueError:
+        return False
+    return hoy_argentina() <= limite and s.get("estado") != "cancelada"
+
+
+def puede_ver_todo():
+    """El que mira la pantalla, ¿puede ver todo?"""
+    if es_admin():
+        return True
+    u = usuario_actual()
+    return bool(u) and esta_al_dia(u["id"])
+
+
+@app.get("/api/mi-suscripcion")
+def api_mi_suscripcion():
+    """Como esta mi suscripcion, para mostrarlo en la app."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, al_dia=False,
+                       cobro_prendido=hay_cobro(),
+                       precio=PRECIO_MENSUAL, incluye=LO_QUE_INCLUYE)
+
+    s = suscripcion_de(u["id"]) or {}
+    return jsonify(
+        ok=True, ingresado=True,
+        al_dia=esta_al_dia(u["id"]),
+        cobro_prendido=hay_cobro(),
+        es_admin=es_admin(),
+        estado=s.get("estado", "sin_suscripcion"),
+        paga_hasta=s.get("paga_hasta", ""),
+        ultimo_pago=s.get("ultimo_pago", ""),
+        precio=PRECIO_MENSUAL,
+        incluye=LO_QUE_INCLUYE,
+    )
+
+
+@app.post("/api/suscribirme")
+def api_suscribirme():
+    """
+    Arma el cobro en Mercado Pago y devuelve la direccion donde pagar.
+    El usuario sale de la app, paga, y vuelve.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Entrá a tu cuenta para suscribirte."), 401
+    if not hay_cobro():
+        return jsonify(ok=False,
+                       error="El cobro todavía no está habilitado."), 503
+    if esta_al_dia(u["id"]):
+        return jsonify(ok=False, ya_al_dia=True,
+                       error="Ya tenés la suscripción al día."), 400
+
+    sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
+    datos = {
+        "reason": "LEA WIN IA — suscripción mensual",
+        "external_reference": f"usuario-{u['id']}",
+        "payer_email": f"usuario{u['id']}@win-ia.com.ar",
+        "back_url": f"{sitio}/suscripcion",
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": PRECIO_MENSUAL,
+            "currency_id": "ARS",
+        },
+        "status": "pending",
+    }
+
+    ok, r = _mp("POST", "/preapproval", datos)
+    if not ok:
+        return jsonify(ok=False, error="No se pudo armar el cobro.",
+                       detalle=str(r)[:300]), 502
+
+    donde_pagar = r.get("init_point") or r.get("sandbox_init_point", "")
+    if not donde_pagar:
+        return jsonify(ok=False, error="Mercado Pago no devolvió la dirección de pago.",
+                       detalle=str(r)[:300]), 502
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       monto, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='pendiente', id_mercadopago=excluded.id_mercadopago,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "pendiente", r.get("id", ""), PRECIO_MENSUAL, ahora, ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, pagar_en=donde_pagar, id=r.get("id", ""))
+
+
+@app.post("/api/cancelar-suscripcion")
+def api_cancelar_suscripcion():
+    """
+    El usuario cancela cuando quiere, con un boton. Sigue teniendo acceso
+    hasta que termine el periodo que ya pago.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, error="Entrá a tu cuenta."), 401
+
+    s = suscripcion_de(u["id"])
+    if not s:
+        return jsonify(ok=False, error="No tenés ninguna suscripción."), 404
+
+    if s.get("id_mercadopago"):
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}", {"status": "cancelled"})
+
+    con = db()
+    con.execute("""UPDATE suscripciones_pago SET estado='cancelada',
+                   actualizada_en=? WHERE usuario_id=?""",
+                (datetime.now().isoformat(timespec="seconds"), u["id"]))
+    con.commit()
+    con.close()
+
+    hasta = s.get("paga_hasta", "")
+    return jsonify(ok=True, paga_hasta=hasta,
+                   mensaje=("Cancelaste la suscripción. " +
+                            (f"Seguís teniendo acceso hasta el {hasta}."
+                             if hasta else "No se te va a cobrar más.")))
+
+
+@app.route("/api/pago-aviso", methods=["GET", "POST"])
+def api_pago_aviso():
+    """
+    Mercado Pago avisa acá cada vez que pasa algo con un pago.
+    Nunca se confia en lo que llega: se vuelve a preguntar a Mercado Pago.
+    """
+    d = request.get_json(silent=True) or {}
+    tipo = (d.get("type") or request.args.get("type") or "").lower()
+    idd = str((d.get("data") or {}).get("id")
+              or request.args.get("data.id") or d.get("id") or "")
+
+    if not idd:
+        return jsonify(ok=True, nota="sin identificador"), 200
+
+    # Un pago suelto
+    if "payment" in tipo:
+        ok, pago = _mp("GET", f"/v1/payments/{idd}")
+        if ok:
+            _anotar_pago(pago)
+        return jsonify(ok=True), 200
+
+    # Una suscripcion que cambio de estado
+    if "preapproval" in tipo or "subscription" in tipo:
+        ok, sus = _mp("GET", f"/preapproval/{idd}")
+        if ok:
+            _actualizar_suscripcion(sus)
+        return jsonify(ok=True), 200
+
+    return jsonify(ok=True), 200
+
+
+def _usuario_de_referencia(ref):
+    """De 'usuario-7' saca el 7."""
+    try:
+        return int(str(ref or "").replace("usuario-", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _anotar_pago(pago):
+    """Guarda un pago y, si se aprobo, da un mes mas de acceso."""
+    uid = _usuario_de_referencia(pago.get("external_reference"))
+    estado = pago.get("status", "")
+    ahora = datetime.now().isoformat(timespec="seconds")
+
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO pagos(id, usuario_id, monto, estado,
+                                         fecha, detalle, guardado_en)
+            VALUES(?,?,?,?,?,?,?)
+        """, (str(pago.get("id", "")), uid,
+              pago.get("transaction_amount"), estado,
+              pago.get("date_approved") or pago.get("date_created", ""),
+              json.dumps({k: pago.get(k) for k in
+                          ("payment_method_id", "payment_type_id", "description")},
+                         ensure_ascii=False),
+              ahora))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+    if estado == "approved" and uid:
+        _dar_un_mes(uid, pago.get("transaction_amount"))
+
+
+def _dar_un_mes(usuario_id, monto=None):
+    """Suma un mes de acceso desde hoy, o desde cuando vencia."""
+    s = suscripcion_de(usuario_id) or {}
+    hoy = hoy_argentina()
+    desde = hoy
+    if s.get("paga_hasta") and s["paga_hasta"] > hoy:
+        desde = s["paga_hasta"]   # si le quedaban dias, se le suman
+
+    try:
+        hasta = (datetime.strptime(desde, "%Y-%m-%d")
+                 + timedelta(days=30)).strftime("%Y-%m-%d")
+    except ValueError:
+        hasta = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       ultimo_pago, monto, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='al_dia', paga_hasta=excluded.paga_hasta,
+          ultimo_pago=excluded.ultimo_pago, actualizada_en=excluded.actualizada_en
+    """, (usuario_id, "al_dia", hasta, hoy, monto or PRECIO_MENSUAL, ahora, ahora))
+    con.commit()
+    con.close()
+
+    # Avisarle al celular que quedo al dia.
+    try:
+        avisar_a_usuario(usuario_id, "Suscripción al día",
+                         f"Tenés acceso completo hasta el {hasta}.",
+                         "/suscripcion", "pago")
+    except Exception:
+        pass
+    return hasta
+
+
+def _actualizar_suscripcion(sus):
+    """Cuando Mercado Pago avisa que una suscripcion cambio."""
+    uid = _usuario_de_referencia(sus.get("external_reference"))
+    if not uid:
+        return
+    estado_mp = (sus.get("status") or "").lower()
+    estado = {"authorized": "al_dia", "paused": "vencida",
+              "cancelled": "cancelada", "pending": "pendiente"}.get(estado_mp, estado_mp)
+
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       creada_en, actualizada_en)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado=excluded.estado, id_mercadopago=excluded.id_mercadopago,
+          actualizada_en=excluded.actualizada_en
+    """, (uid, estado, str(sus.get("id", "")),
+          datetime.now().isoformat(timespec="seconds"),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+
+@app.get("/suscripcion")
+def pantalla_suscripcion():
+    """La pantalla donde se ve qué incluye y se paga."""
+    return render_template("suscripcion.html",
+                           precio=int(PRECIO_MENSUAL),
+                           incluye=LO_QUE_INCLUYE,
+                           cobro_prendido=hay_cobro())
+
+
+@app.post("/api/admin/dar-acceso")
+def admin_dar_acceso():
+    """
+    El admin le da acceso a alguien a mano: un regalo, una prueba,
+    o alguien que pago por fuera.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    try:
+        dias = int(d.get("dias", 30))
+    except (TypeError, ValueError):
+        dias = 30
+    dias = max(1, min(3650, dias))
+
+    con = db()
+    f = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+
+    hasta = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       monto, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='al_dia', paga_hasta=excluded.paga_hasta,
+          actualizada_en=excluded.actualizada_en
+    """, (f["id"], "al_dia", hasta, 0, ahora, ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, hasta=hasta,
+                   mensaje=f"{f['usuario_visible']} tiene acceso hasta el {hasta}.")
 
 
 @app.get("/api/videos")
