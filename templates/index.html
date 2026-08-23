@@ -1774,6 +1774,19 @@
 </div>
 
 
+<div class="aviso-overlay" id="aviso-pagar" onclick="if(event.target===this) cerrarAvisoPagar()">
+  <div class="aviso-caja">
+    <div class="aviso-icono">⭐</div>
+    <div class="aviso-tit">Esto viene con la suscripción</div>
+    <div class="aviso-txt">
+      Con la suscripción al día accedés a <b>todas las carreras</b>,
+      el buscador de caballos, los avisos al celular y los torneos.
+    </div>
+    <a class="btn-crear" href="/suscripcion">Ver la suscripción</a>
+    <button class="btn-luego" onclick="cerrarAvisoPagar()">Ahora no</button>
+  </div>
+</div>
+
 <div class="aviso-overlay" id="aviso-cuenta" onclick="if(event.target===this) cerrarAvisoCuenta()">
   <div class="aviso-caja">
     <div class="aviso-icono">🔒</div>
@@ -1849,12 +1862,32 @@ let participantesActuales = [];
 let caballoActual = null;
 let seguidos = [];
 
+function abrirAvisoPagar(){
+  document.getElementById('aviso-pagar').classList.add('visible');
+  sumarAlHistorial();
+}
+function cerrarAvisoPagar(){
+  document.getElementById('aviso-pagar').classList.remove('visible');
+}
+
 function abrirAvisoCuenta(){
   document.getElementById('aviso-cuenta').classList.add('visible');
   sumarAlHistorial();
 }
 function cerrarAvisoCuenta(){
   document.getElementById('aviso-cuenta').classList.remove('visible');
+}
+
+function invitacionPagar(mensaje){
+  return `<div class="solo-usuarios">
+    <div class="su-tit">Esto viene con la suscripción</div>
+    <div class="su-txt">${mensaje}</div>
+    <a href="/suscripcion" style="display:block; text-align:center;
+       text-decoration:none; margin-top:12px; font-family:'Archivo',sans-serif;
+       font-weight:600; font-size:15px; background:var(--bronce);
+       color:var(--tinta); padding:14px; border-radius:7px;">
+      Ver la suscripción</a>
+  </div>`;
 }
 
 function invitacionCuenta(mensaje){
@@ -1885,6 +1918,7 @@ async function apiGet(url){
   if (!r.ok || data.ok === false){
     const err = new Error(data.error || 'Error de conexión con el servidor.');
     err.necesitaCuenta = !!data.necesita_cuenta;
+    err.necesitaPagar = !!data.necesita_pagar;
     err.noExiste = !!data.no_existe;
     err.sinCelular = !!data.sin_celular;
     throw err;
@@ -2124,12 +2158,13 @@ async function elegirCarrera(c, itemEl){
     }
   }catch(e){
     ocultarBarra();
-    if (e.necesitaCuenta){
-      list.innerHTML = invitacionCuenta(e.message);
+    if (e.necesitaCuenta || e.necesitaPagar){
+      list.innerHTML = e.necesitaPagar
+        ? invitacionPagar(e.message) : invitacionCuenta(e.message);
       document.getElementById('pronostico').innerHTML = '';
       const caja = document.getElementById('caja-condiciones');
       if (caja) caja.style.display = 'none';
-      abrirAvisoCuenta();
+      if (e.necesitaPagar) abrirAvisoPagar(); else abrirAvisoCuenta();
     } else {
       list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
     }
@@ -2758,9 +2793,10 @@ async function consultarSugerencias(q){
   }catch(e){
     if (miNumero !== sugPeticion) return;
     sugUltimos = [];
-    if (e.necesitaCuenta){
-      sug.innerHTML = invitacionCuenta(e.message);
-      abrirAvisoCuenta();
+    if (e.necesitaCuenta || e.necesitaPagar){
+      sug.innerHTML = e.necesitaPagar
+        ? invitacionPagar(e.message) : invitacionCuenta(e.message);
+      if (e.necesitaPagar) abrirAvisoPagar(); else abrirAvisoCuenta();
     } else {
       sug.innerHTML = '<div class="sug-estado">' + e.message + '</div>';
     }
@@ -3518,6 +3554,7 @@ async function salir(){
 // Ventanas que se abren encima, en el orden en que se cierran.
 const VENTANAS = [
   {id: 'cal-overlay',  clase: 'visible', cerrar: () => cerrarBuscadorCarrera()},
+  {id: 'aviso-pagar',  clase: 'visible', cerrar: () => cerrarAvisoPagar()},
   {id: 'aviso-cuenta', clase: 'visible', cerrar: () => cerrarAvisoCuenta()},
   {id: 'login-overlay', clase: 'visible', cerrar: () => cerrarLogin()},
   {id: 'tab-overlay',   clase: 'visible', cerrar: () => cerrarTabulada()},
