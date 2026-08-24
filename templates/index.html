@@ -923,6 +923,37 @@
     font-family:'Space Mono',monospace; font-size:10.5px;
     opacity:.55; margin-top:6px; line-height:1.5;
   }
+  .elegir-plan{
+    background:var(--pergamino); border:1.5px solid var(--pergamino-2);
+    border-radius:9px; padding:15px 14px; margin-bottom:14px;
+  }
+  .ep-rot{
+    font-family:'Space Mono',monospace; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6;
+    margin-bottom:12px;
+  }
+  .ep-op{
+    display:flex; gap:11px; align-items:flex-start; cursor:pointer;
+    background:var(--hueso); border:1.5px solid var(--pergamino-2);
+    border-radius:8px; padding:13px 13px; margin-bottom:9px;
+  }
+  .ep-op:has(input:checked){
+    border-color:var(--verde-vivo); background:#f2faf7;
+  }
+  .ep-op.no-hay{ opacity:.45; }
+  .ep-op input{
+    width:21px; height:21px; flex-shrink:0; margin:2px 0 0;
+    accent-color:var(--verde-vivo); cursor:pointer;
+  }
+  .ep-tit{
+    font-family:'Fraunces',serif; font-size:16.5px; font-weight:600;
+    line-height:1.3;
+  }
+  .ep-sub{ font-size:13.5px; line-height:1.5; opacity:.78; margin-top:3px; }
+  .ep-nota{
+    font-size:12.5px; line-height:1.55; opacity:.7; margin-top:11px;
+    padding-top:11px; border-top:1px solid var(--pergamino-2);
+  }
   .login-acepto{
     background:var(--pergamino); border:1.5px solid var(--pergamino-2);
     border-radius:8px; padding:13px 14px; margin-bottom:14px;
@@ -1746,6 +1777,35 @@
       </div>
     </div>
 
+    <div class="elegir-plan" id="elegir-plan" style="display:none;">
+      <div class="ep-rot">¿Cómo querés empezar?</div>
+
+      <label class="ep-op" id="ep-prueba">
+        <input type="radio" name="plan" value="prueba" checked
+               onchange="elegirPlan('prueba')">
+        <div class="ep-txt">
+          <div class="ep-tit">Probar gratis un día</div>
+          <div class="ep-sub">Acceso completo hasta las 23:59 de hoy.
+            Sin tarjeta, sin compromiso.</div>
+        </div>
+      </label>
+
+      <label class="ep-op">
+        <input type="radio" name="plan" value="pago"
+               onchange="elegirPlan('pago')">
+        <div class="ep-txt">
+          <div class="ep-tit">Suscribirme · $2.400 por mes</div>
+          <div class="ep-sub">Todo, todos los días. Se renueva solo,
+            cancelás cuando quieras.</div>
+        </div>
+      </label>
+
+      <div class="ep-nota" id="ep-nota">
+        Si no elegís ninguna, vas a ver solo la carrera que está por
+        correrse, según la hora del boletín oficial.
+      </div>
+    </div>
+
     <div class="login-acepto" id="login-acepto" style="display:none;">
       <label class="acepto-fila">
         <input type="checkbox" id="acepto-todo" onchange="alTildarAcepto()">
@@ -1777,6 +1837,16 @@
   </div>
 </div>
 
+
+<div class="aviso-overlay" id="aviso-vencido" onclick="if(event.target===this) cerrarAvisoVencido()">
+  <div class="aviso-caja">
+    <div class="aviso-icono">⏳</div>
+    <div class="aviso-tit" id="venc-tit">Se terminó tu prueba</div>
+    <div class="aviso-txt" id="venc-txt"></div>
+    <a class="btn-crear" href="/suscripcion">Ver la suscripción</a>
+    <button class="btn-luego" onclick="cerrarAvisoVencido()">Ahora no</button>
+  </div>
+</div>
 
 <div class="aviso-overlay" id="aviso-pagar" onclick="if(event.target===this) cerrarAvisoPagar()">
   <div class="aviso-caja">
@@ -3447,6 +3517,9 @@ function actualizarModo(){
     modoRegistro ? 'block' : 'none';
   document.getElementById('login-acepto').style.display =
     modoRegistro ? 'block' : 'none';
+  const ep = document.getElementById('elegir-plan');
+  if (ep) ep.style.display = modoRegistro ? 'block' : 'none';
+  if (modoRegistro) ajustarOpcionPrueba();
   document.getElementById('btn-cambiar-modo').textContent =
     modoRegistro ? 'Ya tengo cuenta, quiero entrar' : 'Crear una cuenta gratis';
   document.getElementById('login-olvide').style.display =
@@ -3488,9 +3561,12 @@ async function enviarLogin(){
     await verSiSoyAdmin();
     pintarUsuario();
     cerrarLogin();
-    mostrarToast(modoRegistro
+    const eraRegistro = modoRegistro;
+    mostrarToast(eraRegistro
       ? `Cuenta creada. Bienvenido, ${d.usuario}.`
       : `Hola de nuevo, ${d.usuario}.`);
+    // Se hace lo que eligió: probar gratis, o ir a suscribirse.
+    if (eraRegistro) despuesDeCrearCuenta();
     document.getElementById('login-clave').value = '';
   }catch(e){
     err.innerHTML = e.message;
@@ -3563,6 +3639,7 @@ async function salir(){
 const VENTANAS = [
   {id: 'cal-overlay',  clase: 'visible', cerrar: () => cerrarBuscadorCarrera()},
   {id: 'aviso-pagar',  clase: 'visible', cerrar: () => cerrarAvisoPagar()},
+  {id: 'aviso-vencido',clase: 'visible', cerrar: () => cerrarAvisoVencido()},
   {id: 'aviso-cuenta', clase: 'visible', cerrar: () => cerrarAvisoCuenta()},
   {id: 'login-overlay', clase: 'visible', cerrar: () => cerrarLogin()},
   {id: 'tab-overlay',   clase: 'visible', cerrar: () => cerrarTabulada()},
@@ -4069,6 +4146,109 @@ function marcarElegido(contenedor, texto){
   document.querySelectorAll('#' + contenedor + ' .cal-op').forEach(el => {
     el.classList.toggle('sel', el.textContent.trim() === String(texto).trim());
   });
+}
+
+
+// ============================================================
+// ELEGIR CÓMO EMPEZAR
+// Al crear la cuenta se elige: probar gratis un día, o suscribirse.
+// La prueba solo aparece si hoy hay promoción y ese teléfono nunca
+// la usó. Si no elige nada, ve solo la carrera que está por correrse.
+// ============================================================
+
+let planElegido = 'prueba';
+let hayPromocionHoy = false;
+
+function elegirPlan(cual){
+  planElegido = cual;
+}
+
+async function ajustarOpcionPrueba(){
+  try{
+    const d = await apiGet('/api/promocion');
+    hayPromocionHoy = !!d.hay && !d.ya_la_use;
+  }catch(e){ hayPromocionHoy = false; }
+
+  const caja = document.getElementById('ep-prueba');
+  const nota = document.getElementById('ep-nota');
+  if (!caja) return;
+
+  if (hayPromocionHoy){
+    caja.classList.remove('no-hay');
+    caja.querySelector('input').disabled = false;
+    caja.querySelector('.ep-tit').textContent = 'Probar gratis un día';
+    caja.querySelector('.ep-sub').textContent =
+      'Acceso completo hasta las 23:59 de hoy. Sin tarjeta, sin compromiso.';
+    caja.querySelector('input').checked = true;
+    planElegido = 'prueba';
+  } else {
+    // No hay prueba disponible: se muestra apagada y se marca la paga.
+    caja.classList.add('no-hay');
+    caja.querySelector('input').disabled = true;
+    caja.querySelector('input').checked = false;
+    caja.querySelector('.ep-tit').textContent = 'Probar gratis un día';
+    caja.querySelector('.ep-sub').textContent =
+      'Por ahora no está disponible.';
+    const pago = document.querySelector('input[name="plan"][value="pago"]');
+    if (pago) pago.checked = true;
+    planElegido = 'pago';
+  }
+  if (nota) nota.textContent =
+    'Si no elegís ninguna, vas a ver solo la carrera que está por ' +
+    'correrse, según la hora del boletín oficial.';
+}
+
+// Después de crear la cuenta, se hace lo que eligió.
+async function despuesDeCrearCuenta(){
+  if (planElegido === 'pago'){
+    location.href = '/suscripcion';
+    return;
+  }
+  if (planElegido === 'prueba' && hayPromocionHoy){
+    try{
+      const d = await apiPost('/api/probar-gratis', {});
+      if (d.ok) mostrarToast(d.mensaje);
+    }catch(e){ /* si falla, sigue sin prueba */ }
+  }
+}
+
+// Al entrar, avisar si se le venció.
+async function avisarSiVencio(){
+  if (!miUsuario) return;
+  try{
+    const d = await apiGet('/api/mi-suscripcion');
+    if (!d.cobro_prendido || d.al_dia || d.es_admin) return;
+
+    // Se le venció algo que tuvo antes.
+    if (d.estado === 'prueba' || d.estado === 'vencida' ||
+        d.estado === 'cancelada'){
+      abrirAvisoVencido(d.estado);
+    }
+  }catch(e){}
+}
+
+function abrirAvisoVencido(estado){
+  const tit = document.getElementById('venc-tit');
+  const txt = document.getElementById('venc-txt');
+  if (!tit) return;
+  if (estado === 'prueba'){
+    tit.textContent = 'Se terminó tu día de prueba';
+    txt.innerHTML = 'Desde ahora vas a ver solo <b>la carrera que está ' +
+      'por correrse</b>, según la hora del boletín oficial.<br><br>' +
+      'Con la suscripción tenés todas las carreras, el buscador de ' +
+      'caballos, los avisos y los torneos.';
+  } else {
+    tit.textContent = 'Tu suscripción venció';
+    txt.innerHTML = 'Desde ahora vas a ver solo <b>la carrera que está ' +
+      'por correrse</b>, según la hora del boletín oficial.<br><br>' +
+      'Renovala para volver a tener todo.';
+  }
+  document.getElementById('aviso-vencido').classList.add('visible');
+  sumarAlHistorial();
+}
+
+function cerrarAvisoVencido(){
+  document.getElementById('aviso-vencido').classList.remove('visible');
 }
 
 // ---------- Arranque ----------
