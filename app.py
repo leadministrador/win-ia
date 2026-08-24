@@ -198,6 +198,17 @@ def init_db():
       detalle TEXT,
       guardado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS promocion(
+      id INTEGER PRIMARY KEY CHECK (id = 1),   -- una sola fila
+      desde TEXT,                 -- AAAA-MM-DD: desde cuando hay prueba
+      hasta TEXT,                 -- AAAA-MM-DD
+      actualizada_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pruebas_usadas(
+      telefono TEXT PRIMARY KEY,  -- un telefono, una sola prueba
+      usuario_id INTEGER,
+      usada_en TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS historico(
       url TEXT PRIMARY KEY,           -- la direccion de la carrera
       fecha TEXT,                     -- AAAA-MM-DD
@@ -6229,10 +6240,13 @@ def esta_al_dia(usuario_id):
     s = suscripcion_de(usuario_id)
     if not s or not s.get("paga_hasta"):
         return False
-    # Se dan unos dias de gracia por si el cobro se demora.
+
+    # Los dias de gracia son para el que PAGA, por si el cobro se demora.
+    # La prueba gratis NO los tiene: dura solo ese dia, hasta las 23:59.
+    gracia = 0 if s.get("estado") == "prueba" else DIAS_DE_GRACIA
     try:
         limite = (datetime.strptime(s["paga_hasta"], "%Y-%m-%d")
-                  + timedelta(days=DIAS_DE_GRACIA)).strftime("%Y-%m-%d")
+                  + timedelta(days=gracia)).strftime("%Y-%m-%d")
     except ValueError:
         return False
     return hoy_argentina() <= limite and s.get("estado") != "cancelada"
@@ -6534,6 +6548,287 @@ def admin_dar_acceso():
 
     return jsonify(ok=True, hasta=hasta,
                    mensaje=f"{f['usuario_visible']} tiene acceso hasta el {hasta}.")
+
+
+# ============================================================
+# PERIODO DE PRUEBA
+# El que crea cuenta puede probar todo GRATIS hasta las 23:59 de ese
+# dia, pero solo si estamos dentro del calendario de promocion que
+# el admin arma en el panel.
+# Un telefono = una sola prueba. Asi nadie se hace diez cuentas.
+# ============================================================
+
+def promocion_actual():
+    """Desde y hasta cuando hay prueba gratis."""
+    try:
+        con = db()
+        f = con.execute("SELECT desde, hasta FROM promocion WHERE id=1").fetchone()
+        con.close()
+        return dict(f) if f else {"desde": "", "hasta": ""}
+    except Exception:
+        return {"desde": "", "hasta": ""}
+
+
+def hay_promocion():
+    """Si hoy se puede pedir la prueba gratis."""
+    p = promocion_actual()
+    if not p.get("desde") or not p.get("hasta"):
+        return False
+    return p["desde"] <= hoy_argentina() <= p["hasta"]
+
+
+def ya_uso_la_prueba(telefono):
+    """Un telefono, una sola prueba."""
+    solo = _limpiar_telefono(telefono)
+    if not solo:
+        return False
+    try:
+        con = db()
+        f = con.execute("SELECT 1 FROM pruebas_usadas WHERE telefono=?",
+                        (solo,)).fetchone()
+        con.close()
+        return bool(f)
+    except Exception:
+        return False
+
+
+@app.get("/api/promocion")
+def api_promocion():
+    """Si hoy se puede probar gratis, y si YO ya la usé."""
+    p = promocion_actual()
+    u = usuario_actual()
+    usada = False
+    if u:
+        con = db()
+        f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                        (u["id"],)).fetchone()
+        con.close()
+        usada = ya_uso_la_prueba(f["telefono"] if f else "")
+    return jsonify(ok=True, hay=hay_promocion(),
+                   desde=p.get("desde", ""), hasta=p.get("hasta", ""),
+                   ya_la_use=usada)
+
+
+@app.post("/api/probar-gratis")
+def api_probar_gratis():
+    """
+    Da acceso completo hasta las 23:59 de HOY.
+    Solo si estamos en la semana de promocion y ese telefono nunca
+    la uso antes.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá tu cuenta para probar."), 401
+
+    if not hay_promocion():
+        return jsonify(ok=False, sin_promocion=True,
+                       error=("Por ahora no hay prueba gratis. "
+                              "Suscribite para acceder a todo.")), 403
+
+    con = db()
+    f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                    (u["id"],)).fetchone()
+    con.close()
+    tel = _limpiar_telefono(f["telefono"] if f else "")
+
+    if ya_uso_la_prueba(tel):
+        return jsonify(ok=False, ya_usada=True,
+                       error=("Ya usaste tu prueba gratis con este número. "
+                              "Suscribite para seguir viendo todo.")), 403
+
+    if esta_al_dia(u["id"]):
+        return jsonify(ok=False, error="Ya tenés acceso completo."), 400
+
+    # Hasta las 23:59 de hoy.
+    hasta = hoy_argentina()
+    ahora = datetime.now().isoformat(timespec="seconds")
+
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       monto, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='prueba', paga_hasta=excluded.paga_hasta,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "prueba", hasta, 0, ahora, ahora))
+    con.execute("""
+        INSERT OR IGNORE INTO pruebas_usadas(telefono, usuario_id, usada_en)
+        VALUES(?,?,?)
+    """, (tel, u["id"], ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, hasta=hasta,
+                   mensaje=("Listo. Tenés acceso completo a todo hasta las "
+                            "23:59 de hoy. Después, suscribite para seguir."))
+
+
+@app.get("/api/admin/promocion")
+def admin_ver_promocion():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    p = promocion_actual()
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM pruebas_usadas").fetchone()["c"]
+    con.close()
+    return jsonify(ok=True, **p, activa=hay_promocion(),
+                   pruebas_usadas=n, hoy=hoy_argentina())
+
+
+@app.post("/api/admin/promocion")
+def admin_guardar_promocion():
+    """El admin arma la ventana de prueba gratis."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    desde = clean(d.get("desde", ""))
+    hasta = clean(d.get("hasta", ""))
+
+    # Vacío = se apaga la promoción.
+    if not desde and not hasta:
+        con = db()
+        con.execute("""
+            INSERT INTO promocion(id, desde, hasta, actualizada_en)
+            VALUES(1,'','',?)
+            ON CONFLICT(id) DO UPDATE SET desde='', hasta='',
+                                          actualizada_en=excluded.actualizada_en
+        """, (datetime.now().isoformat(timespec="seconds"),))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, desde="", hasta="",
+                       mensaje="Prueba gratis apagada.")
+
+    for f, nombre in [(desde, "desde"), (hasta, "hasta")]:
+        try:
+            datetime.strptime(f, "%Y-%m-%d")
+        except ValueError:
+            return jsonify(ok=False, error=f"La fecha «{nombre}» no es válida."), 400
+    if hasta < desde:
+        return jsonify(ok=False,
+                       error="La fecha de fin no puede ser anterior a la de inicio."), 400
+
+    con = db()
+    con.execute("""
+        INSERT INTO promocion(id, desde, hasta, actualizada_en)
+        VALUES(1,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET desde=excluded.desde,
+                                      hasta=excluded.hasta,
+                                      actualizada_en=excluded.actualizada_en
+    """, (desde, hasta, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, desde=desde, hasta=hasta, activa=hay_promocion(),
+                   mensaje=f"Prueba gratis del {desde} al {hasta}.")
+
+
+@app.get("/api/admin/lista-usuarios")
+def admin_lista_usuarios():
+    """
+    Los usuarios separados: quiénes pagan y quiénes no.
+    Sirve para ver de un vistazo cómo viene y para exportar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    filas = con.execute("""
+        SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
+               u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto
+        FROM usuarios u
+        LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
+        ORDER BY u.id DESC
+    """).fetchall()
+    con.close()
+
+    pagan, no_pagan, probando = [], [], []
+    for f in filas:
+        d = dict(f)
+        d["al_dia"] = esta_al_dia(d["id"])
+        d["estado"] = d.get("estado") or "sin_suscripcion"
+        if d["estado"] == "prueba" and d["al_dia"]:
+            probando.append(d)
+        elif d["al_dia"]:
+            pagan.append(d)
+        else:
+            no_pagan.append(d)
+
+    return jsonify(
+        ok=True,
+        total=len(filas),
+        pagan=pagan, no_pagan=no_pagan, probando=probando,
+        resumen={"pagan": len(pagan), "probando": len(probando),
+                 "no_pagan": len(no_pagan)},
+    )
+
+
+@app.get("/api/admin/exportar-usuarios")
+def admin_exportar_usuarios():
+    """
+    Baja la lista de usuarios como archivo. Sirve para trabajar con
+    ella en una planilla o mandarla a otro lado.
+    Formato: csv (planilla) o json (para programas).
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+    formato = (request.args.get("formato", "csv") or "csv").lower()
+
+    con = db()
+    filas = con.execute("""
+        SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
+               u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto
+        FROM usuarios u
+        LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
+        ORDER BY u.id
+    """).fetchall()
+    con.close()
+
+    datos = []
+    for f in filas:
+        d = dict(f)
+        d["estado"] = d.get("estado") or "sin_suscripcion"
+        d["al_dia"] = "si" if esta_al_dia(d["id"]) else "no"
+        datos.append(d)
+
+    nombre = f"usuarios-lea-win-ia-{hoy_argentina()}"
+
+    if formato == "json":
+        return Response(
+            json.dumps({"app": "LEA WIN IA", "fecha": hoy_argentina(),
+                        "usuarios": datos}, ensure_ascii=False, indent=1),
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{nombre}.json"'},
+        )
+
+    # Planilla, con punto y coma: asi Excel en español la abre bien.
+    columnas = ["id", "usuario_visible", "telefono", "al_dia", "estado",
+                "paga_hasta", "ultimo_pago", "monto", "creado_en",
+                "ultimo_ingreso", "acepto_en", "bloqueado", "es_admin"]
+    titulos = ["Nº", "Usuario", "Teléfono", "Al día", "Estado",
+               "Paga hasta", "Último pago", "Monto", "Se registró",
+               "Último ingreso", "Aceptó términos", "Bloqueado", "Es admin"]
+
+    def limpiar(v):
+        t = "" if v is None else str(v)
+        return t.replace(";", ",").replace("\n", " ")
+
+    lineas = [";".join(titulos)]
+    for d in datos:
+        lineas.append(";".join(limpiar(d.get(c)) for c in columnas))
+
+    # El BOM hace que Excel muestre bien los acentos.
+    texto = "\ufeff" + "\r\n".join(lineas)
+    return Response(
+        texto, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}.csv"'},
+    )
 
 
 @app.get("/api/videos")
