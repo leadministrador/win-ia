@@ -129,6 +129,26 @@
     display:flex; gap:9px; margin-top:14px;
   }
   .dos-botones .btn{ flex:1; }
+  .fila-exportar{
+    display:flex; gap:9px; margin-top:14px; flex-wrap:wrap;
+  }
+  .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
+                       text-decoration:none; }
+  .lista-usuarios{ margin-top:18px; }
+  .u-fila{
+    display:flex; justify-content:space-between; align-items:center;
+    gap:12px; padding:11px 0; border-bottom:1px solid var(--pergamino-2);
+  }
+  .u-fila:last-child{ border-bottom:none; }
+  .u-nom{ font-family:'Fraunces',serif; font-size:16px; font-weight:600; }
+  .u-tel{ font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6; }
+  .u-est{
+    font-family:'Space Mono',monospace; font-size:11px; padding:4px 9px;
+    border-radius:5px; white-space:nowrap; flex-shrink:0;
+  }
+  .u-est.paga{ background:#e8f4ef; color:#1f6b52; }
+  .u-est.prueba{ background:#fff4d6; color:#8a6a1f; }
+  .u-est.nada{ background:var(--pergamino-2); opacity:.7; }
   .anio-fila{
     display:flex; align-items:center; gap:11px; padding:7px 0;
   }
@@ -387,6 +407,73 @@
     </div>
 
     <div class="progreso-txt" id="copia-estado" style="margin-top:11px;"></div>
+  </div>
+
+  <h2>Suscripciones</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Quiénes pagan, quiénes están probando y quiénes no. Podés bajar la
+    lista para trabajarla en una planilla.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-usuarios"></div>
+
+    <div class="fila-exportar">
+      <a class="btn btn-run" id="exp-csv" href="#">Bajar planilla</a>
+      <a class="btn btn-ghost" id="exp-json" href="#">Bajar para programas</a>
+    </div>
+
+    <div class="lista-usuarios" id="lista-usuarios"></div>
+  </div>
+
+  <h2>Prueba gratis</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Elegí entre qué días el que crea una cuenta puede probar todo gratis
+    por un día, hasta las 23:59. Un teléfono, una sola prueba.
+    Si dejás las fechas vacías, la prueba queda apagada.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="campos">
+      <div class="campo">
+        <label>Desde</label>
+        <input type="date" id="promo-desde">
+      </div>
+      <div class="campo">
+        <label>Hasta</label>
+        <input type="date" id="promo-hasta">
+      </div>
+    </div>
+
+    <div class="fila-exportar">
+      <button class="btn btn-run" onclick="guardarPromocion()">
+        Guardar</button>
+      <button class="btn btn-ghost" onclick="apagarPromocion()">
+        Apagar la prueba</button>
+    </div>
+
+    <div class="progreso-txt" id="promo-estado" style="margin-top:11px;"></div>
+  </div>
+
+  <h2>Dar acceso a mano</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Para regalarle acceso a alguien, o si te pagó por fuera.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="campos">
+      <div class="campo">
+        <label>Usuario</label>
+        <input type="text" id="acc-usuario" placeholder="Como se llama en la app">
+      </div>
+      <div class="campo">
+        <label>Días</label>
+        <input type="number" id="acc-dias" value="30" min="1" max="3650">
+      </div>
+    </div>
+    <button class="btn btn-run" style="width:100%; margin-top:12px;"
+            onclick="darAcceso()">Dar acceso</button>
+    <div class="progreso-txt" id="acc-estado" style="margin-top:11px;"></div>
   </div>
   <h2>Interruptores</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
@@ -846,6 +933,117 @@ async function verHistorico(){
   }catch(e){}
 }
 
+
+// ---------- Suscripciones ----------
+async function verUsuarios(){
+  try{
+    const r = await fetch('/api/admin/lista-usuarios?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    document.getElementById('chips-usuarios').innerHTML = `
+      <div class="chip-dato"><b>${d.total}</b>cuentas</div>
+      <div class="chip-dato"><b>${d.resumen.pagan}</b>pagando</div>
+      <div class="chip-dato"><b>${d.resumen.probando}</b>probando</div>
+      <div class="chip-dato"><b>${d.resumen.no_pagan}</b>sin pagar</div>`;
+
+    const base = '/api/admin/exportar-usuarios?clave=' + encodeURIComponent(clave);
+    document.getElementById('exp-csv').href = base + '&formato=csv';
+    document.getElementById('exp-json').href = base + '&formato=json';
+
+    const fila = (u, rot) => `
+      <div class="u-fila">
+        <div>
+          <div class="u-nom">${u.usuario_visible}</div>
+          <div class="u-tel">${u.telefono || 'sin teléfono'}</div>
+        </div>
+        <div class="u-est ${rot}">${
+          rot === 'paga' ? 'hasta ' + (u.paga_hasta || '')
+          : rot === 'prueba' ? 'probando hoy' : 'sin pagar'}</div>
+      </div>`;
+
+    let html = '';
+    if (d.pagan.length){
+      html += '<div class="previa-rot">Pagando</div>' +
+              d.pagan.map(u => fila(u, 'paga')).join('');
+    }
+    if (d.probando.length){
+      html += '<div class="previa-rot">Probando</div>' +
+              d.probando.map(u => fila(u, 'prueba')).join('');
+    }
+    if (d.no_pagan.length){
+      html += '<div class="previa-rot">Sin pagar</div>' +
+              d.no_pagan.slice(0, 40).map(u => fila(u, 'nada')).join('');
+      if (d.no_pagan.length > 40){
+        html += `<div class="progreso-txt">y ${d.no_pagan.length - 40} más. ` +
+                'Bajá la planilla para verlos todos.</div>';
+      }
+    }
+    document.getElementById('lista-usuarios').innerHTML =
+      html || '<div class="progreso-txt">Todavía no hay cuentas.</div>';
+  }catch(e){}
+}
+
+// ---------- Prueba gratis ----------
+async function verPromocion(){
+  try{
+    const r = await fetch('/api/admin/promocion?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+    document.getElementById('promo-desde').value = d.desde || '';
+    document.getElementById('promo-hasta').value = d.hasta || '';
+    document.getElementById('promo-estado').textContent =
+      (d.desde && d.hasta)
+        ? (d.activa
+            ? `Activa ahora, del ${d.desde} al ${d.hasta}. ` +
+              `${d.pruebas_usadas} la usaron.`
+            : `Cargada del ${d.desde} al ${d.hasta}, pero hoy no está activa. ` +
+              `${d.pruebas_usadas} la usaron.`)
+        : `Apagada. ${d.pruebas_usadas} la usaron antes.`;
+  }catch(e){}
+}
+
+async function guardarPromocion(){
+  const e = document.getElementById('promo-estado');
+  e.textContent = 'Guardando…';
+  try{
+    const r = await fetch('/api/admin/promocion?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        desde: document.getElementById('promo-desde').value,
+        hasta: document.getElementById('promo-hasta').value,
+      })});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    if (d.ok) verPromocion();
+  }catch(err){ e.textContent = 'No se pudo guardar: ' + err.message; }
+}
+
+async function apagarPromocion(){
+  if (!confirm('¿Apagar la prueba gratis?\n\n' +
+               'Los que ya la usaron no se ven afectados.')) return;
+  document.getElementById('promo-desde').value = '';
+  document.getElementById('promo-hasta').value = '';
+  guardarPromocion();
+}
+
+// ---------- Dar acceso a mano ----------
+async function darAcceso(){
+  const e = document.getElementById('acc-estado');
+  const u = document.getElementById('acc-usuario').value.trim();
+  if (!u){ e.textContent = 'Poné el nombre del usuario.'; return; }
+  e.textContent = 'Dando acceso…';
+  try{
+    const r = await fetch('/api/admin/dar-acceso?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({usuario: u,
+                            dias: document.getElementById('acc-dias').value})});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    if (d.ok){ document.getElementById('acc-usuario').value = ''; verUsuarios(); }
+  }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
+}
+
 // ---------- Interruptores ----------
 async function verAjustes(){
   try{
@@ -873,6 +1071,8 @@ async function cambiarAjuste(claveAjuste, encendido){
       body: JSON.stringify({clave: claveAjuste, encendido})
     });
     verAjustes();
+verUsuarios();
+verPromocion();
 verHistorico();
 seguirAjuste();
 verCopia();
@@ -1063,6 +1263,8 @@ cargarHipodromosDelDia();
 verEstadoAvisos();
 verAnuncios();
 verAjustes();
+verUsuarios();
+verPromocion();
 verHistorico();
 seguirAjuste();
 verCopia();
