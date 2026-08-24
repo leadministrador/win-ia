@@ -4126,6 +4126,60 @@ def revisar_caballos_seguidos():
     return {"enviados": enviados, "reuniones_revisadas": len(reuniones)}
 
 
+def avisar_a_los_que_vencieron():
+    """
+    Le avisa al celular a los que se les termino la prueba o la
+    suscripcion. Una sola vez por vencimiento.
+    """
+    if not hay_notificaciones():
+        return 0
+    hoy = hoy_argentina()
+    ayer = (ahora_argentina() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    con = db()
+    filas = con.execute("""
+        SELECT s.usuario_id, s.estado, s.paga_hasta
+        FROM suscripciones_pago s
+        JOIN suscripciones u ON u.usuario_id = s.usuario_id
+        WHERE s.paga_hasta = ? AND s.estado IN ('prueba','al_dia','vencida')
+        GROUP BY s.usuario_id
+    """, (ayer,)).fetchall()
+    con.close()
+
+    enviados = 0
+    for f in filas:
+        uid = f["usuario_id"]
+        # Que no se avise dos veces por el mismo vencimiento.
+        if _ya_se_aviso(uid, "suscripcion", "vencio", f["paga_hasta"], ""):
+            continue
+
+        if f["estado"] == "prueba":
+            titulo = "Se terminó tu día de prueba"
+            cuerpo = ("Desde ahora ves solo la carrera que está por correrse. "
+                      "Suscribite para tener todo de nuevo.")
+        else:
+            titulo = "Tu suscripción venció"
+            cuerpo = "Renovala para volver a ver todas las carreras."
+
+        n = avisar_a_usuario(uid, titulo, cuerpo, "/suscripcion", "vencio")
+        if n:
+            _marcar_avisado(uid, "suscripcion", "vencio", f["paga_hasta"], "")
+            enviados += n
+
+        # Se anota como vencida, para no volver a mirarla.
+        try:
+            con = db()
+            con.execute("""UPDATE suscripciones_pago SET estado='vencida',
+                           actualizada_en=? WHERE usuario_id=?""",
+                        (datetime.now().isoformat(timespec="seconds"), uid))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    return enviados
+
+
 def revision_de_avisos():
     """
     Tarea de fondo: revisa cada 15 minutos si hay que avisarle a alguien.
@@ -4135,6 +4189,10 @@ def revision_de_avisos():
     while True:
         try:
             revisar_caballos_seguidos()
+        except Exception:
+            pass
+        try:
+            avisar_a_los_que_vencieron()
         except Exception:
             pass
         time.sleep(15 * 60)
