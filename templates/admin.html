@@ -135,6 +135,32 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .u-grupo{
+    border:1.5px solid var(--pergamino-2); border-radius:8px;
+    margin-bottom:9px; overflow:hidden;
+  }
+  .u-cab{
+    width:100%; display:flex; align-items:center; gap:10px;
+    background:var(--pergamino); border:none; cursor:pointer;
+    padding:14px 14px; text-align:left; min-height:52px;
+    font-family:'Archivo',sans-serif;
+  }
+  .u-cab:hover{ background:#ece2cc; }
+  .u-flecha{
+    font-size:13px; color:var(--bronce); width:14px; flex-shrink:0;
+  }
+  .u-tit{
+    font-family:'Fraunces',serif; font-size:16.5px; font-weight:600; flex:1;
+  }
+  .u-cuenta{
+    font-family:'Space Mono',monospace; font-size:12px;
+    background:var(--verde-turf); color:var(--hueso);
+    padding:3px 10px; border-radius:11px; flex-shrink:0;
+  }
+  .u-cuerpo{
+    display:none; padding:0 14px; max-height:420px; overflow-y:auto;
+  }
+  .u-cuerpo.abierto{ display:block; }
   .u-fila{
     display:flex; justify-content:space-between; align-items:center;
     gap:12px; padding:11px 0; border-bottom:1px solid var(--pergamino-2);
@@ -962,26 +988,43 @@ async function verUsuarios(){
           : rot === 'prueba' ? 'probando hoy' : 'sin pagar'}</div>
       </div>`;
 
-    let html = '';
-    if (d.pagan.length){
-      html += '<div class="previa-rot">Pagando</div>' +
-              d.pagan.map(u => fila(u, 'paga')).join('');
-    }
-    if (d.probando.length){
-      html += '<div class="previa-rot">Probando</div>' +
-              d.probando.map(u => fila(u, 'prueba')).join('');
-    }
-    if (d.no_pagan.length){
-      html += '<div class="previa-rot">Sin pagar</div>' +
-              d.no_pagan.slice(0, 40).map(u => fila(u, 'nada')).join('');
-      if (d.no_pagan.length > 40){
-        html += `<div class="progreso-txt">y ${d.no_pagan.length - 40} más. ` +
-                'Bajá la planilla para verlos todos.</div>';
-      }
-    }
+    // Por abecedario, para encontrarlos rápido.
+    const abc = (a, b) =>
+      (a.usuario_visible || '').localeCompare(b.usuario_visible || '', 'es');
+
+    // Cada grupo en su desplegable: así la lista no empuja el resto
+    // del panel hacia abajo cuando hay muchos.
+    const grupo = (titulo, gente, rot) => {
+      if (!gente.length) return '';
+      const id = 'grp-' + rot;
+      return `
+        <div class="u-grupo">
+          <button class="u-cab" onclick="abrirGrupo('${id}')">
+            <span class="u-flecha" id="${id}-f">▸</span>
+            <span class="u-tit">${titulo}</span>
+            <span class="u-cuenta">${gente.length}</span>
+          </button>
+          <div class="u-cuerpo" id="${id}">
+            ${gente.sort(abc).map(u => fila(u, rot)).join('')}
+          </div>
+        </div>`;
+    };
+
+    const html = grupo('Pagando', d.pagan, 'paga')
+               + grupo('Probando', d.probando, 'prueba')
+               + grupo('Sin pagar', d.no_pagan, 'nada');
+
     document.getElementById('lista-usuarios').innerHTML =
       html || '<div class="progreso-txt">Todavía no hay cuentas.</div>';
   }catch(e){}
+}
+
+function abrirGrupo(id){
+  const cuerpo = document.getElementById(id);
+  const flecha = document.getElementById(id + '-f');
+  if (!cuerpo) return;
+  const abierto = cuerpo.classList.toggle('abierto');
+  if (flecha) flecha.textContent = abierto ? '▾' : '▸';
 }
 
 // ---------- Prueba gratis ----------
