@@ -166,6 +166,38 @@
     gap:12px; padding:11px 0; border-bottom:1px solid var(--pergamino-2);
   }
   .u-fila:last-child{ border-bottom:none; }
+  .campo-sug{ position:relative; }
+  .sugerencias{
+    display:none; position:absolute; left:0; right:0; top:100%;
+    background:var(--hueso); border:1.5px solid var(--pergamino-2);
+    border-radius:8px; margin-top:5px; z-index:30;
+    max-height:300px; overflow-y:auto;
+    box-shadow:0 8px 22px rgba(21,56,50,.16);
+  }
+  .sugerencias.abierta{ display:block; }
+  .sug-item{
+    display:flex; justify-content:space-between; align-items:center;
+    gap:10px; padding:13px 14px; cursor:pointer; min-height:48px;
+    border-bottom:1px solid var(--pergamino-2);
+  }
+  .sug-item:last-child{ border-bottom:none; }
+  .sug-item:hover{ background:var(--pergamino); }
+  .sug-nom{ font-family:'Fraunces',serif; font-size:16px; font-weight:600; }
+  .sug-est{
+    font-family:'Space Mono',monospace; font-size:10.5px;
+    padding:3px 8px; border-radius:5px; white-space:nowrap;
+  }
+  .sug-est.si{ background:#e8f4ef; color:#1f6b52; }
+  .sug-est.no{ background:var(--pergamino-2); opacity:.7; }
+  .sug-nada{
+    padding:13px 14px; font-family:'Space Mono',monospace;
+    font-size:12px; opacity:.6;
+  }
+  #acc-usuario.resaltado{
+    border-color:var(--bronce); background:#fff8e8;
+  }
+  .u-fila{ cursor:pointer; }
+  .u-fila:hover{ background:var(--pergamino); }
   .u-datos{ min-width:0; flex:1; }
   .u-nom{ font-family:'Fraunces',serif; font-size:16px; font-weight:600; }
   .u-tel{ font-family:'Space Mono',monospace; font-size:11px;
@@ -490,9 +522,12 @@
 
   <div class="caja-recolector">
     <div class="campos">
-      <div class="campo">
+      <div class="campo campo-sug">
         <label>Usuario</label>
-        <input type="text" id="acc-usuario" placeholder="Como se llama en la app">
+        <input type="text" id="acc-usuario" autocomplete="off"
+               placeholder="Escribí y elegí de la lista"
+               oninput="sugerirUsuarios()" onfocus="sugerirUsuarios()">
+        <div class="sugerencias" id="acc-sugerencias"></div>
       </div>
       <div class="campo">
         <label>Días</label>
@@ -980,6 +1015,9 @@ async function verUsuarios(){
       <div class="chip-dato"><b>${d.resumen.probando}</b>probando</div>
       <div class="chip-dato"><b>${d.resumen.no_pagan}</b>sin pagar</div>`;
 
+    // Se guardan para las sugerencias del campo de abajo.
+    todosLosUsuarios = [...d.pagan, ...d.probando, ...d.no_pagan];
+
     const base = '/api/admin/exportar-usuarios?clave=' + encodeURIComponent(clave);
     document.getElementById('exp-csv').href = base + '&formato=csv';
     document.getElementById('exp-json').href = base + '&formato=json';
@@ -1001,7 +1039,9 @@ async function verUsuarios(){
       }
       abajo += ' · ' + (u.telefono || 'sin teléfono');
       return `
-      <div class="u-fila">
+      <div class="u-fila" onclick="usarEsteUsuario('${
+        (u.usuario_visible || '').replace(/'/g, "\\'")}')"
+        title="Tocá para usarlo abajo">
         <div class="u-datos">
           <div class="u-nom">${u.usuario_visible}</div>
           <div class="u-tel">${abajo}</div>
@@ -1113,6 +1153,53 @@ async function darAcceso(){
     e.textContent = d.mensaje || d.error;
     if (d.ok){ document.getElementById('acc-usuario').value = ''; verUsuarios(); }
   }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
+}
+
+// Los nombres que hay, para sugerirlos y no escribir a ciegas.
+let todosLosUsuarios = [];
+
+function sugerirUsuarios(){
+  const campo = document.getElementById('acc-usuario');
+  const caja = document.getElementById('acc-sugerencias');
+  const escrito = campo.value.trim().toLowerCase();
+
+  let cuales = todosLosUsuarios;
+  if (escrito){
+    cuales = todosLosUsuarios.filter(
+      u => u.usuario_visible.toLowerCase().includes(escrito));
+  }
+  cuales = cuales.slice(0, 8);
+
+  if (!cuales.length){
+    caja.innerHTML = escrito
+      ? '<div class="sug-nada">No hay ningún usuario con ese nombre.</div>'
+      : '';
+    caja.classList.toggle('abierta', !!escrito);
+    return;
+  }
+
+  caja.innerHTML = cuales.map(u => `
+    <div class="sug-item" onclick="elegirUsuario('${u.usuario_visible.replace(/'/g, "\\'")}')">
+      <span class="sug-nom">${u.usuario_visible}</span>
+      <span class="sug-est ${u.al_dia ? 'si' : 'no'}">${
+        u.al_dia ? 'con acceso' : 'sin acceso'}</span>
+    </div>`).join('');
+  caja.classList.add('abierta');
+}
+
+function elegirUsuario(nombre){
+  document.getElementById('acc-usuario').value = nombre;
+  document.getElementById('acc-sugerencias').classList.remove('abierta');
+  document.getElementById('acc-estado').textContent = '';
+}
+
+// Al tocar a alguien de la lista de arriba, se completa el campo.
+function usarEsteUsuario(nombre){
+  elegirUsuario(nombre);
+  const campo = document.getElementById('acc-usuario');
+  campo.scrollIntoView({behavior:'smooth', block:'center'});
+  campo.classList.add('resaltado');
+  setTimeout(() => campo.classList.remove('resaltado'), 1400);
 }
 
 async function quitarAcceso(){
