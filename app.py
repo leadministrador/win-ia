@@ -3475,6 +3475,20 @@ def api_registro():
         return jsonify(ok=False,
                        error="Ese nombre de usuario ya está tomado."), 409
 
+    # Un telefono, una sola cuenta. Sin esto una misma persona podria
+    # hacerse diez cuentas y usar diez veces la prueba gratis.
+    otro = con.execute(
+        "SELECT usuario_visible FROM usuarios WHERE telefono=?",
+        (telefono,)).fetchone()
+    if otro:
+        con.close()
+        return jsonify(
+            ok=False, telefono_repetido=True,
+            usuario_existente=otro["usuario_visible"],
+            error=(f"Ese celular ya tiene una cuenta: «{otro['usuario_visible']}». "
+                   "Entrá con esa, o usá otro número."),
+        ), 409
+
     ahora = datetime.now().isoformat(timespec="seconds")
     cur = con.execute("""
         INSERT INTO usuarios(usuario, usuario_visible, clave_hash, telefono,
@@ -6567,6 +6581,104 @@ def pantalla_suscripcion():
                            cobro_prendido=hay_cobro())
 
 
+@app.post("/api/admin/quitar-acceso")
+def admin_quitar_acceso():
+    """
+    Le saca la suscripcion a alguien. La cuenta queda: puede entrar,
+    pero vuelve a ver solo la carrera que esta por correrse.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    f = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+
+    s = con.execute("SELECT id_mercadopago FROM suscripciones_pago WHERE usuario_id=?",
+                    (f["id"],)).fetchone()
+    con.close()
+
+    # Si estaba pagando por Mercado Pago, tambien se corta alla.
+    if s and s["id_mercadopago"]:
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}", {"status": "cancelled"})
+
+    con = db()
+    con.execute("""UPDATE suscripciones_pago
+                   SET estado='cancelada', paga_hasta=NULL, actualizada_en=?
+                   WHERE usuario_id=?""",
+                (datetime.now().isoformat(timespec="seconds"), f["id"]))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True,
+                   mensaje=(f"{f['usuario_visible']} ya no tiene acceso. "
+                            "Su cuenta sigue existiendo."))
+
+
+@app.post("/api/admin/borrar-cuenta")
+def admin_borrar_cuenta():
+    """
+    Borra una cuenta del todo y deja libre su telefono.
+    Hace falta porque un telefono = una cuenta: sin esto, un numero
+    quedaria tomado para siempre.
+    Las carreras y pronosticos NO se tocan: no son datos de la persona.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    f = con.execute("""SELECT id, usuario_visible, telefono, es_admin
+                       FROM usuarios WHERE usuario=?""",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    if f["es_admin"]:
+        con.close()
+        return jsonify(ok=False,
+                       error="No se puede borrar una cuenta de admin."), 403
+
+    uid = f["id"]
+    # Todo lo que es de esa persona.
+    for tabla in ("sesiones", "suscripciones", "seguidos", "datos_caballo",
+                  "avisos_enviados", "pedidos_clave", "suscripciones_pago"):
+        try:
+            con.execute(f"DELETE FROM {tabla} WHERE usuario_id=?", (uid,))
+        except Exception:
+            pass
+    # El telefono queda libre para otra cuenta.
+    try:
+        con.execute("DELETE FROM pruebas_usadas WHERE usuario_id=?", (uid,))
+    except Exception:
+        pass
+    # Los pagos quedan, pero sin quedar ligados a nadie: hacen falta
+    # para la contabilidad.
+    try:
+        con.execute("UPDATE pagos SET usuario_id=NULL WHERE usuario_id=?", (uid,))
+    except Exception:
+        pass
+    con.execute("DELETE FROM usuarios WHERE id=?", (uid,))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, telefono_liberado=f["telefono"] or "",
+                   mensaje=(f"Se borró la cuenta de {f['usuario_visible']}. "
+                            "Su celular quedó libre para otra cuenta."))
+
+
 @app.post("/api/admin/dar-acceso")
 def admin_dar_acceso():
     """
@@ -6803,11 +6915,38 @@ def admin_lista_usuarios():
     """).fetchall()
     con.close()
 
+    hoy = hoy_argentina()
+
+    def dias_desde(fecha):
+        """Cuantos dias pasaron desde esa fecha."""
+        if not fecha:
+            return None
+        try:
+            f = datetime.strptime(str(fecha)[:10], "%Y-%m-%d")
+            return (datetime.strptime(hoy, "%Y-%m-%d") - f).days
+        except ValueError:
+            return None
+
     pagan, no_pagan, probando = [], [], []
     for f in filas:
         d = dict(f)
         d["al_dia"] = esta_al_dia(d["id"])
         d["estado"] = d.get("estado") or "sin_suscripcion"
+
+        # Desde cuando esta registrado, y desde cuando sin suscripcion.
+        d["dias_registrado"] = dias_desde(d.get("creado_en"))
+        if d["al_dia"]:
+            d["sin_suscripcion_desde"] = ""
+            d["dias_sin_suscripcion"] = None
+        elif d.get("paga_hasta"):
+            # Se le vencio: sin suscripcion desde el dia siguiente.
+            d["sin_suscripcion_desde"] = d["paga_hasta"]
+            d["dias_sin_suscripcion"] = dias_desde(d["paga_hasta"])
+        else:
+            # Nunca tuvo: desde que se registro.
+            d["sin_suscripcion_desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias_sin_suscripcion"] = d["dias_registrado"]
+
         if d["estado"] == "prueba" and d["al_dia"]:
             probando.append(d)
         elif d["al_dia"]:
@@ -6848,11 +6987,33 @@ def admin_exportar_usuarios():
     """).fetchall()
     con.close()
 
+    hoy = hoy_argentina()
+
+    def dias_desde(fecha):
+        if not fecha:
+            return ""
+        try:
+            f = datetime.strptime(str(fecha)[:10], "%Y-%m-%d")
+            return (datetime.strptime(hoy, "%Y-%m-%d") - f).days
+        except ValueError:
+            return ""
+
     datos = []
     for f in filas:
         d = dict(f)
         d["estado"] = d.get("estado") or "sin_suscripcion"
-        d["al_dia"] = "si" if esta_al_dia(d["id"]) else "no"
+        al_dia = esta_al_dia(d["id"])
+        d["al_dia"] = "si" if al_dia else "no"
+        d["dias_registrado"] = dias_desde(d.get("creado_en"))
+        if al_dia:
+            d["sin_suscripcion_desde"] = ""
+            d["dias_sin_suscripcion"] = ""
+        elif d.get("paga_hasta"):
+            d["sin_suscripcion_desde"] = d["paga_hasta"]
+            d["dias_sin_suscripcion"] = dias_desde(d["paga_hasta"])
+        else:
+            d["sin_suscripcion_desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias_sin_suscripcion"] = d["dias_registrado"]
         datos.append(d)
 
     nombre = f"usuarios-lea-win-ia-{hoy_argentina()}"
@@ -6866,12 +7027,29 @@ def admin_exportar_usuarios():
         )
 
     # Planilla, con punto y coma: asi Excel en español la abre bien.
-    columnas = ["id", "usuario_visible", "telefono", "al_dia", "estado",
-                "paga_hasta", "ultimo_pago", "monto", "creado_en",
-                "ultimo_ingreso", "acepto_en", "bloqueado", "es_admin"]
-    titulos = ["Nº", "Usuario", "Teléfono", "Al día", "Estado",
-               "Paga hasta", "Último pago", "Monto", "Se registró",
-               "Último ingreso", "Aceptó términos", "Bloqueado", "Es admin"]
+    # Lo que mas se mira va primero: nombre, telefono, desde cuando y
+    # cuantos dias. El resto queda despues, por si hace falta.
+    for d in datos:
+        # Desde cuando esta en su situacion actual.
+        if d["al_dia"] == "no":
+            d["desde"] = d.get("sin_suscripcion_desde", "")
+            d["dias"] = d.get("dias_sin_suscripcion", "")
+        else:
+            d["desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias"] = d.get("dias_registrado", "")
+
+    # De mayor a menor: primero los que hace mas tiempo estan asi.
+    datos.sort(key=lambda x: x["dias"] if isinstance(x["dias"], int) else -1,
+               reverse=True)
+
+    columnas = ["usuario_visible", "telefono", "desde", "dias",
+                "al_dia", "estado", "paga_hasta", "ultimo_pago", "monto",
+                "creado_en", "ultimo_ingreso", "acepto_en",
+                "bloqueado", "es_admin", "id"]
+    titulos = ["Nombre", "Teléfono", "Fecha de inicio", "Días transcurridos",
+               "Al día", "Estado", "Paga hasta", "Último pago", "Monto",
+               "Se registró", "Último ingreso", "Aceptó términos",
+               "Bloqueado", "Es admin", "Nº"]
 
     def limpiar(v):
         t = "" if v is None else str(v)
