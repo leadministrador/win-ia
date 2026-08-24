@@ -1517,7 +1517,11 @@
     <div class="eyebrow">San Isidro · Palermo · La Plata</div>
     <h1>Lea la carrera<br><em>antes</em> de la carrera</h1>
     <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
-    <div class="hero-usuario" id="hero-usuario"></div>
+    <div class="hero-usuario" id="hero-usuario">
+      <button class="btn-entrar" onclick="abrirLogin()">
+        👤 Entrar o crear cuenta
+      </button>
+    </div>
     <div class="hero-actions">
       <button class="btn btn-primary" onclick="document.getElementById('buscar').scrollIntoView({behavior:'smooth'}); abrirPaso('paso-fecha');">Buscar carrera</button>
       <button class="btn btn-ghost" onclick="abrirBuscadorCaballo()">🔍 Buscar caballo</button>
@@ -3396,14 +3400,18 @@ async function verQuienSoy(){
 function pintarUsuario(){
   const el = document.getElementById('hero-usuario');
   if (!el) return;
-  el.innerHTML = miUsuario
-    ? `<div class="caja-saludo">
+  // El botón de entrar ya viene puesto en la página, así aparece al
+  // instante. Acá solo se reemplaza si resulta que hay alguien adentro.
+  if (miUsuario){
+    el.innerHTML = `<div class="caja-saludo">
          <div><span class="rot">Tu cuenta</span><span class="nom">${miUsuario}</span></div>
          <button class="link-salir" onclick="salir()">Salir</button>
-       </div>`
-    : `<button class="btn-entrar" onclick="abrirLogin()">
+       </div>`;
+  } else if (!el.querySelector('.btn-entrar')){
+    el.innerHTML = `<button class="btn-entrar" onclick="abrirLogin()">
          👤 Entrar o crear cuenta
        </button>`;
+  }
 }
 
 function abrirLogin(registro){
