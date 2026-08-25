@@ -135,6 +135,9 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .u-grupo.vacio{ opacity:.5; }
+  .u-grupo.vacio .u-cab{ cursor:default; }
+  .u-grupo.vacio .u-cuenta{ background:var(--pergamino-2); color:var(--tinta); }
   .u-grupo{
     border:1.5px solid var(--pergamino-2); border-radius:8px;
     margin-bottom:9px; overflow:hidden;
@@ -1062,13 +1065,16 @@ async function verUsuarios(){
 
     // Cada grupo en su desplegable: así la lista no empuja el resto
     // del panel hacia abajo cuando hay muchos.
+    // Los tres grupos se muestran SIEMPRE, aunque estén vacíos: así se
+    // ve de un vistazo que no hay nadie en esa situación.
     const grupo = (titulo, gente, rot) => {
-      if (!gente.length) return '';
       const id = 'grp-' + rot;
+      const vacio = !gente.length;
       return `
-        <div class="u-grupo">
-          <button class="u-cab" onclick="abrirGrupo('${id}')">
-            <span class="u-flecha" id="${id}-f">▸</span>
+        <div class="u-grupo${vacio ? ' vacio' : ''}">
+          <button class="u-cab" onclick="abrirGrupo('${id}')"
+                  ${vacio ? 'disabled' : ''}>
+            <span class="u-flecha" id="${id}-f">${vacio ? '·' : '▸'}</span>
             <span class="u-tit">${titulo}</span>
             <span class="u-cuenta">${gente.length}</span>
           </button>
@@ -1082,8 +1088,9 @@ async function verUsuarios(){
                + grupo('Probando', d.probando, 'prueba')
                + grupo('Sin pagar', d.no_pagan, 'nada');
 
-    document.getElementById('lista-usuarios').innerHTML =
-      html || '<div class="progreso-txt">Todavía no hay cuentas.</div>';
+    document.getElementById('lista-usuarios').innerHTML = d.total
+      ? html
+      : '<div class="progreso-txt">Todavía no hay cuentas.</div>';
   }catch(e){}
 }
 
