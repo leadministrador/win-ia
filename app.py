@@ -6947,9 +6947,15 @@ def admin_lista_usuarios():
             d["sin_suscripcion_desde"] = str(d.get("creado_en", ""))[:10]
             d["dias_sin_suscripcion"] = d["dias_registrado"]
 
-        if d["estado"] == "prueba" and d["al_dia"]:
+        # IMPORTANTE: se separa por lo que DE VERDAD tiene cada uno, no
+        # por si puede ver la app. Con el cobro apagado todos pueden ver,
+        # y antes eso los contaba a todos como "pagando".
+        vence = d.get("paga_hasta") or ""
+        vigente = bool(vence) and vence >= hoy and d["estado"] != "cancelada"
+
+        if d["estado"] == "prueba" and vigente:
             probando.append(d)
-        elif d["al_dia"]:
+        elif vigente and d["estado"] in ("al_dia", "pendiente"):
             pagan.append(d)
         else:
             no_pagan.append(d)
