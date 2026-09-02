@@ -186,6 +186,7 @@ def init_db():
       paga_hasta TEXT,                -- AAAA-MM-DD: hasta cuando tiene acceso
       ultimo_pago TEXT,
       monto REAL,
+      plan TEXT DEFAULT 'normal',     -- normal | premium
       creada_en TEXT NOT NULL,
       actualizada_en TEXT
     );
@@ -247,6 +248,11 @@ def init_db():
         cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
         if cols_cola and "fecha" not in cols_cola:
             con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
+        cols_sus = [f[1] for f in con.execute(
+            "PRAGMA table_info(suscripciones_pago)").fetchall()]
+        if cols_sus and "plan" not in cols_sus:
+            con.execute("ALTER TABLE suscripciones_pago "
+                        "ADD COLUMN plan TEXT DEFAULT 'normal'")
     except Exception:
         pass
 
@@ -6246,18 +6252,85 @@ MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
 MP_PUBLIC_KEY = os.getenv("MP_PUBLIC_KEY", "")
 MP_API = "https://api.mercadopago.com"
 
-PRECIO_MENSUAL = float(os.getenv("PRECIO_MENSUAL", "2400"))
 DIAS_DE_GRACIA = int(os.getenv("DIAS_DE_GRACIA", "3"))
 
-# Lo que gana el que paga. Se muestra en la pantalla de suscripcion.
-LO_QUE_INCLUYE = [
-    "Todas las carreras, de todas las fechas",
-    "Buscador de caballos con su campaña completa",
-    "Avisos al celular cuando tu caballo corre",
-    "Cargar tus propios datos del paddock",
-    "Videos y tabuladas de cada carrera",
-    "Participar en los torneos de pronóstico",
+# ---------- LOS PLANES ----------
+# Los precios se cambian desde Render, sin tocar el codigo:
+#   PRECIO_MENSUAL   el plan normal
+#   PRECIO_PREMIUM   el plan a medida
+PRECIO_MENSUAL = float(os.getenv("PRECIO_MENSUAL", "2400"))
+PRECIO_PREMIUM = float(os.getenv("PRECIO_PREMIUM", "24000"))
+
+# El WhatsApp al que se manda al premium. Se cambia desde Render.
+WHATSAPP_PREMIUM = os.getenv("LEGAL_WHATSAPP", "+54 9 3584 181338")
+
+
+def _solo_numeros(t):
+    return re.sub(r"\D", "", t or "")
+
+
+PLANES = [
+    {
+        "clave": "gratis",
+        "nombre": "Gratis",
+        "precio": 0,
+        "resumen": "Para probar cómo trabaja la app",
+        "incluye": [
+            "La carrera que está por correrse",
+            "El pronóstico de esa carrera, con sus motivos",
+        ],
+        "no_incluye": [
+            "El resto de las carreras del día",
+            "Las fechas anteriores y las que vienen",
+        ],
+    },
+    {
+        "clave": "normal",
+        "nombre": "Normal",
+        "precio": PRECIO_MENSUAL,
+        "resumen": "Todo lo que la app sabe hacer",
+        "incluye": [
+            "Todas las carreras, de todas las fechas",
+            "Buscador de caballos con su campaña completa",
+            "Avisos al celular cuando tu caballo corre",
+            "Cargar tus propios datos del paddock",
+            "Videos y tabuladas de cada carrera",
+            "Participar en los torneos de pronóstico",
+        ],
+        "no_incluye": [],
+    },
+    {
+        "clave": "premium",
+        "nombre": "Premium",
+        "precio": PRECIO_PREMIUM,
+        "resumen": "Una app armada para vos",
+        "incluye": [
+            "Todo lo del plan Normal",
+            "Tu propio panel, con tus números",
+            "Pronósticos armados a tu medida",
+            "Datos de caballos para comprar",
+            "Atención directa por WhatsApp",
+        ],
+        "no_incluye": [],
+        "destacado": True,
+    },
 ]
+
+# Lo que gana el que paga el plan normal. Se sigue usando en el aviso
+# que aparece cuando alguien quiere ver algo que no le corresponde.
+LO_QUE_INCLUYE = PLANES[1]["incluye"]
+
+
+def plan_por_clave(clave):
+    for p in PLANES:
+        if p["clave"] == clave:
+            return p
+    return None
+
+
+def precio_de(clave):
+    p = plan_por_clave(clave)
+    return float(p["precio"]) if p else PRECIO_MENSUAL
 
 
 def hay_cobro():
@@ -6339,17 +6412,25 @@ def api_mi_suscripcion():
     if not u:
         return jsonify(ok=True, ingresado=False, al_dia=False,
                        cobro_prendido=hay_cobro(),
+                       planes=PLANES, mi_plan="gratis",
                        precio=PRECIO_MENSUAL, incluye=LO_QUE_INCLUYE)
 
     s = suscripcion_de(u["id"]) or {}
+    al_dia = esta_al_dia(u["id"])
+    # Que plan tiene hoy: si no paga, el gratis.
+    mi_plan = (s.get("plan") or "normal") if al_dia else "gratis"
+
     return jsonify(
         ok=True, ingresado=True,
-        al_dia=esta_al_dia(u["id"]),
+        al_dia=al_dia,
         cobro_prendido=hay_cobro(),
         es_admin=es_admin(),
         estado=s.get("estado", "sin_suscripcion"),
         paga_hasta=s.get("paga_hasta", ""),
         ultimo_pago=s.get("ultimo_pago", ""),
+        mi_plan=mi_plan,
+        planes=PLANES,
+        whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
         precio=PRECIO_MENSUAL,
         incluye=LO_QUE_INCLUYE,
     )
@@ -6368,20 +6449,30 @@ def api_suscribirme():
     if not hay_cobro():
         return jsonify(ok=False,
                        error="El cobro todavía no está habilitado."), 503
-    if esta_al_dia(u["id"]):
+
+    # Que plan quiere. Si no dice nada, el normal.
+    d = request.get_json(silent=True) or {}
+    clave_plan = clean(d.get("plan", "")) or "normal"
+    plan = plan_por_clave(clave_plan)
+    if not plan or plan["precio"] <= 0:
+        return jsonify(ok=False, error="Ese plan no se puede pagar."), 400
+
+    # Si ya tiene el MISMO plan al dia, no tiene sentido pagar de nuevo.
+    s_actual = suscripcion_de(u["id"]) or {}
+    if esta_al_dia(u["id"]) and (s_actual.get("plan") or "normal") == clave_plan:
         return jsonify(ok=False, ya_al_dia=True,
-                       error="Ya tenés la suscripción al día."), 400
+                       error=f"Ya tenés el plan {plan['nombre']} al día."), 400
 
     sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
     datos = {
-        "reason": "LEA WIN IA — suscripción mensual",
-        "external_reference": f"usuario-{u['id']}",
+        "reason": f"LEA WIN IA — plan {plan['nombre']}",
+        "external_reference": f"usuario-{u['id']}-{clave_plan}",
         "payer_email": f"usuario{u['id']}@win-ia.com.ar",
         "back_url": f"{sitio}/suscripcion",
         "auto_recurring": {
             "frequency": 1,
             "frequency_type": "months",
-            "transaction_amount": PRECIO_MENSUAL,
+            "transaction_amount": float(plan["precio"]),
             "currency_id": "ARS",
         },
         "status": "pending",
@@ -6401,16 +6492,19 @@ def api_suscribirme():
     con = db()
     con.execute("""
         INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
-                                       monto, creada_en, actualizada_en)
-        VALUES(?,?,?,?,?,?)
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(usuario_id) DO UPDATE SET
           estado='pendiente', id_mercadopago=excluded.id_mercadopago,
+          monto=excluded.monto, plan=excluded.plan,
           actualizada_en=excluded.actualizada_en
-    """, (u["id"], "pendiente", r.get("id", ""), PRECIO_MENSUAL, ahora, ahora))
+    """, (u["id"], "pendiente", r.get("id", ""), float(plan["precio"]),
+          clave_plan, ahora, ahora))
     con.commit()
     con.close()
 
-    return jsonify(ok=True, pagar_en=donde_pagar, id=r.get("id", ""))
+    return jsonify(ok=True, pagar_en=donde_pagar, id=r.get("id", ""),
+                   plan=clave_plan)
 
 
 @app.post("/api/cancelar-suscripcion")
@@ -6476,11 +6570,16 @@ def api_pago_aviso():
 
 
 def _usuario_de_referencia(ref):
-    """De 'usuario-7' saca el 7."""
-    try:
-        return int(str(ref or "").replace("usuario-", ""))
-    except (ValueError, TypeError):
-        return None
+    """De 'usuario-7' o 'usuario-7-premium' saca el 7."""
+    m = re.match(r"usuario-(\d+)", str(ref or ""))
+    return int(m.group(1)) if m else None
+
+
+def _plan_de_referencia(ref):
+    """De 'usuario-7-premium' saca 'premium'. Si no dice, el normal."""
+    m = re.match(r"usuario-\d+-(\w+)", str(ref or ""))
+    clave = m.group(1) if m else "normal"
+    return clave if plan_por_clave(clave) else "normal"
 
 
 def _anotar_pago(pago):
@@ -6508,12 +6607,14 @@ def _anotar_pago(pago):
         pass
 
     if estado == "approved" and uid:
-        _dar_un_mes(uid, pago.get("transaction_amount"))
+        _dar_un_mes(uid, pago.get("transaction_amount"),
+                    _plan_de_referencia(pago.get("external_reference")))
 
 
-def _dar_un_mes(usuario_id, monto=None):
+def _dar_un_mes(usuario_id, monto=None, plan=None):
     """Suma un mes de acceso desde hoy, o desde cuando vencia."""
     s = suscripcion_de(usuario_id) or {}
+    plan = plan or s.get("plan") or "normal"
     hoy = hoy_argentina()
     desde = hoy
     if s.get("paga_hasta") and s["paga_hasta"] > hoy:
@@ -6529,20 +6630,31 @@ def _dar_un_mes(usuario_id, monto=None):
     con = db()
     con.execute("""
         INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
-                                       ultimo_pago, monto, creada_en, actualizada_en)
-        VALUES(?,?,?,?,?,?,?)
+                                       ultimo_pago, monto, plan,
+                                       creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?,?)
         ON CONFLICT(usuario_id) DO UPDATE SET
           estado='al_dia', paga_hasta=excluded.paga_hasta,
-          ultimo_pago=excluded.ultimo_pago, actualizada_en=excluded.actualizada_en
-    """, (usuario_id, "al_dia", hasta, hoy, monto or PRECIO_MENSUAL, ahora, ahora))
+          ultimo_pago=excluded.ultimo_pago, plan=excluded.plan,
+          actualizada_en=excluded.actualizada_en
+    """, (usuario_id, "al_dia", hasta, hoy,
+          monto or precio_de(plan), plan, ahora, ahora))
     con.commit()
     con.close()
 
     # Avisarle al celular que quedo al dia.
+    p = plan_por_clave(plan) or {}
     try:
-        avisar_a_usuario(usuario_id, "Suscripción al día",
-                         f"Tenés acceso completo hasta el {hasta}.",
-                         "/suscripcion", "pago")
+        if plan == "premium":
+            avisar_a_usuario(
+                usuario_id, "Bienvenido al plan Premium",
+                ("Ya tenés tu acceso. Escribinos por WhatsApp para armar "
+                 "tu app a medida."),
+                "/suscripcion", "pago")
+        else:
+            avisar_a_usuario(usuario_id, "Suscripción al día",
+                             f"Tenés acceso completo hasta el {hasta}.",
+                             "/suscripcion", "pago")
     except Exception:
         pass
     return hasta
@@ -6557,15 +6669,16 @@ def _actualizar_suscripcion(sus):
     estado = {"authorized": "al_dia", "paused": "vencida",
               "cancelled": "cancelada", "pending": "pendiente"}.get(estado_mp, estado_mp)
 
+    plan = _plan_de_referencia(sus.get("external_reference"))
     con = db()
     con.execute("""
         INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
-                                       creada_en, actualizada_en)
-        VALUES(?,?,?,?,?)
+                                       plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
         ON CONFLICT(usuario_id) DO UPDATE SET
           estado=excluded.estado, id_mercadopago=excluded.id_mercadopago,
-          actualizada_en=excluded.actualizada_en
-    """, (uid, estado, str(sus.get("id", "")),
+          plan=excluded.plan, actualizada_en=excluded.actualizada_en
+    """, (uid, estado, str(sus.get("id", "")), plan,
           datetime.now().isoformat(timespec="seconds"),
           datetime.now().isoformat(timespec="seconds")))
     con.commit()
@@ -6576,8 +6689,8 @@ def _actualizar_suscripcion(sus):
 def pantalla_suscripcion():
     """La pantalla donde se ve qué incluye y se paga."""
     return render_template("suscripcion.html",
-                           precio=int(PRECIO_MENSUAL),
-                           incluye=LO_QUE_INCLUYE,
+                           planes=PLANES,
+                           whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
                            cobro_prendido=hay_cobro())
 
 
@@ -6690,6 +6803,9 @@ def admin_dar_acceso():
 
     d = request.get_json(silent=True) or {}
     usuario = clean(d.get("usuario", ""))
+    plan = clean(d.get("plan", "")) or "normal"
+    if not plan_por_clave(plan) or plan == "gratis":
+        plan = "normal"
     try:
         dias = int(d.get("dias", 30))
     except (TypeError, ValueError):
@@ -6707,17 +6823,19 @@ def admin_dar_acceso():
     ahora = datetime.now().isoformat(timespec="seconds")
     con.execute("""
         INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
-                                       monto, creada_en, actualizada_en)
-        VALUES(?,?,?,?,?,?)
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(usuario_id) DO UPDATE SET
           estado='al_dia', paga_hasta=excluded.paga_hasta,
-          actualizada_en=excluded.actualizada_en
-    """, (f["id"], "al_dia", hasta, 0, ahora, ahora))
+          plan=excluded.plan, actualizada_en=excluded.actualizada_en
+    """, (f["id"], "al_dia", hasta, 0, plan, ahora, ahora))
     con.commit()
     con.close()
 
-    return jsonify(ok=True, hasta=hasta,
-                   mensaje=f"{f['usuario_visible']} tiene acceso hasta el {hasta}.")
+    nombre_plan = (plan_por_clave(plan) or {}).get("nombre", plan)
+    return jsonify(ok=True, hasta=hasta, plan=plan,
+                   mensaje=(f"{f['usuario_visible']} tiene el plan "
+                            f"{nombre_plan} hasta el {hasta}."))
 
 
 # ============================================================
@@ -6908,7 +7026,7 @@ def admin_lista_usuarios():
     filas = con.execute("""
         SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
                u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
-               s.estado, s.paga_hasta, s.ultimo_pago, s.monto
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan
         FROM usuarios u
         LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
         ORDER BY u.id DESC
@@ -6927,7 +7045,7 @@ def admin_lista_usuarios():
         except ValueError:
             return None
 
-    pagan, no_pagan, probando = [], [], []
+    pagan, no_pagan, probando, premium = [], [], [], []
     for f in filas:
         d = dict(f)
         d["al_dia"] = esta_al_dia(d["id"])
@@ -6953,19 +7071,24 @@ def admin_lista_usuarios():
         vence = d.get("paga_hasta") or ""
         vigente = bool(vence) and vence >= hoy and d["estado"] != "cancelada"
 
+        d["plan"] = d.get("plan") or "normal"
+
         if d["estado"] == "prueba" and vigente:
             probando.append(d)
         elif vigente and d["estado"] in ("al_dia", "pendiente"):
-            pagan.append(d)
+            if d["plan"] == "premium":
+                premium.append(d)
+            else:
+                pagan.append(d)
         else:
             no_pagan.append(d)
 
     return jsonify(
         ok=True,
         total=len(filas),
-        pagan=pagan, no_pagan=no_pagan, probando=probando,
-        resumen={"pagan": len(pagan), "probando": len(probando),
-                 "no_pagan": len(no_pagan)},
+        premium=premium, pagan=pagan, no_pagan=no_pagan, probando=probando,
+        resumen={"premium": len(premium), "pagan": len(pagan),
+                 "probando": len(probando), "no_pagan": len(no_pagan)},
     )
 
 
@@ -6986,7 +7109,7 @@ def admin_exportar_usuarios():
     filas = con.execute("""
         SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
                u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
-               s.estado, s.paga_hasta, s.ultimo_pago, s.monto
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan
         FROM usuarios u
         LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
         ORDER BY u.id
@@ -7010,6 +7133,7 @@ def admin_exportar_usuarios():
         d["estado"] = d.get("estado") or "sin_suscripcion"
         al_dia = esta_al_dia(d["id"])
         d["al_dia"] = "si" if al_dia else "no"
+        d["plan"] = (d.get("plan") or "normal") if al_dia else "gratis"
         d["dias_registrado"] = dias_desde(d.get("creado_en"))
         if al_dia:
             d["sin_suscripcion_desde"] = ""
@@ -7049,12 +7173,12 @@ def admin_exportar_usuarios():
                reverse=True)
 
     columnas = ["usuario_visible", "telefono", "desde", "dias",
-                "al_dia", "estado", "paga_hasta", "ultimo_pago", "monto",
-                "creado_en", "ultimo_ingreso", "acepto_en",
+                "plan", "al_dia", "estado", "paga_hasta", "ultimo_pago",
+                "monto", "creado_en", "ultimo_ingreso", "acepto_en",
                 "bloqueado", "es_admin", "id"]
     titulos = ["Nombre", "Teléfono", "Fecha de inicio", "Días transcurridos",
-               "Al día", "Estado", "Paga hasta", "Último pago", "Monto",
-               "Se registró", "Último ingreso", "Aceptó términos",
+               "Plan", "Al día", "Estado", "Paga hasta", "Último pago",
+               "Monto", "Se registró", "Último ingreso", "Aceptó términos",
                "Bloqueado", "Es admin", "Nº"]
 
     def limpiar(v):
