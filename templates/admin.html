@@ -135,6 +135,17 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .plan-caja{
+    border:1.5px solid var(--pergamino-2); border-radius:8px;
+    margin-bottom:9px; overflow:hidden;
+  }
+  .plan-caja .u-cuerpo{ padding:0 14px 16px; max-height:none; }
+  .plan-caja textarea{
+    width:100%; font-family:'Archivo',sans-serif; font-size:15px;
+    padding:11px 12px; border:1.5px solid var(--pergamino-2);
+    border-radius:7px; background:var(--hueso); color:var(--tinta);
+    line-height:1.5; resize:vertical;
+  }
   .u-grupo.vacio{ opacity:.5; }
   .u-grupo.vacio .u-cab{ cursor:default; }
   .u-grupo.vacio .u-cuenta{ background:var(--pergamino-2); color:var(--tinta); }
@@ -490,6 +501,21 @@
     <div class="lista-usuarios" id="lista-usuarios"></div>
   </div>
 
+
+  <h2>Los planes</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Lo que ve el usuario en la pantalla de suscripción. Podés cambiar el
+    precio y los textos sin publicar nada: se aplica al instante.
+  </p>
+
+  <div class="caja-recolector">
+    <a class="btn btn-run" style="width:100%; text-align:center;
+       text-decoration:none; display:block; margin-bottom:16px;"
+       href="/suscripcion" target="_blank">Ver la pantalla de suscripción</a>
+
+    <div id="lista-planes"></div>
+    <div class="progreso-txt" id="planes-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Prueba gratis</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Elegí entre qué días el que crea una cuenta puede probar todo gratis
@@ -1113,6 +1139,96 @@ function abrirGrupo(id){
   if (flecha) flecha.textContent = abierto ? '▾' : '▸';
 }
 
+
+// ---------- Los planes ----------
+async function verPlanes(){
+  try{
+    const r = await fetch('/api/admin/planes?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    document.getElementById('lista-planes').innerHTML = d.planes.map(p => `
+      <div class="plan-caja">
+        <button class="u-cab" onclick="abrirGrupo('pl-${p.clave}')">
+          <span class="u-flecha" id="pl-${p.clave}-f">▸</span>
+          <span class="u-tit">${p.nombre}</span>
+          <span class="u-cuenta">${p.precio > 0
+            ? '$' + Number(p.precio).toLocaleString('es-AR') : 'gratis'}</span>
+        </button>
+        <div class="u-cuerpo" id="pl-${p.clave}">
+          <div class="campos" style="margin-top:14px;">
+            <div class="campo">
+              <label>Nombre</label>
+              <input type="text" id="pn-${p.clave}" value="${p.nombre}">
+            </div>
+            <div class="campo">
+              <label>Precio por mes</label>
+              <input type="number" id="pp-${p.clave}" value="${p.precio}"
+                     min="0" step="100">
+            </div>
+          </div>
+
+          <div class="campo" style="margin-top:12px;">
+            <label>Resumen (la frase de abajo del nombre)</label>
+            <input type="text" id="pr-${p.clave}" value="${p.resumen || ''}">
+          </div>
+
+          <div class="campo" style="margin-top:12px;">
+            <label>Qué incluye — uno por línea</label>
+            <textarea id="pi-${p.clave}" rows="6">${(p.incluye || []).join('\n')}</textarea>
+          </div>
+
+          <div class="campo" style="margin-top:12px;">
+            <label>Qué NO incluye — uno por línea (podés dejarlo vacío)</label>
+            <textarea id="px-${p.clave}" rows="3">${(p.no_incluye || []).join('\n')}</textarea>
+          </div>
+
+          <div class="fila-exportar">
+            <button class="btn btn-run" onclick="guardarPlan('${p.clave}')">
+              Guardar</button>
+            <button class="btn btn-ghost" onclick="planDeFabrica('${p.clave}')">
+              Volver a como estaba</button>
+          </div>
+        </div>
+      </div>`).join('');
+  }catch(e){}
+}
+
+async function guardarPlan(cl){
+  const e = document.getElementById('planes-estado');
+  e.textContent = 'Guardando…';
+  try{
+    const r = await fetch('/api/admin/planes?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        clave: cl,
+        nombre: document.getElementById('pn-' + cl).value,
+        precio: document.getElementById('pp-' + cl).value,
+        resumen: document.getElementById('pr-' + cl).value,
+        incluye: document.getElementById('pi-' + cl).value,
+        no_incluye: document.getElementById('px-' + cl).value,
+      })});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    if (d.ok) verPlanes();
+  }catch(err){ e.textContent = 'No se pudo guardar: ' + err.message; }
+}
+
+async function planDeFabrica(cl){
+  if (!confirm('¿Volver este plan a como estaba al principio?\n\n' +
+               'Se pierden los cambios que le hiciste.')) return;
+  const e = document.getElementById('planes-estado');
+  e.textContent = 'Volviendo…';
+  try{
+    const r = await fetch('/api/admin/plan-de-fabrica?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({clave: cl})});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    if (d.ok) verPlanes();
+  }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
+}
+
 // ---------- Prueba gratis ----------
 async function verPromocion(){
   try{
@@ -1285,6 +1401,7 @@ async function cambiarAjuste(claveAjuste, encendido){
     });
     verAjustes();
 verUsuarios();
+verPlanes();
 verPromocion();
 verHistorico();
 seguirAjuste();
@@ -1477,6 +1594,7 @@ verEstadoAvisos();
 verAnuncios();
 verAjustes();
 verUsuarios();
+verPlanes();
 verPromocion();
 verHistorico();
 seguirAjuste();
