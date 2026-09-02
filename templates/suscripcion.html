@@ -61,54 +61,78 @@
   .est-txt{ font-family:'Fraunces',serif; font-size:21px; font-weight:600; }
   .est-sub{ font-size:15px; opacity:.8; margin-top:6px; }
 
-  /* ===== EL PRECIO ===== */
-  .caja{
-    background:var(--hueso); border-radius:12px; padding:26px 22px 24px;
-    box-shadow:0 8px 26px rgba(21,56,50,.15);
+  /* ===== LOS TRES CUADROS ===== */
+  .plan{
+    background:var(--hueso); border-radius:12px; padding:24px 20px 22px;
+    margin-bottom:16px; box-shadow:0 6px 20px rgba(21,56,50,.13);
+    border:2px solid transparent; position:relative;
   }
-  .precio{
-    text-align:center; padding-bottom:20px; margin-bottom:20px;
-    border-bottom:1px solid var(--pergamino-2);
+  .plan.destacado{ border-color:var(--bronce); }
+  .plan.actual{ border-color:var(--verde-vivo); }
+  .cinta{
+    position:absolute; top:-11px; left:20px;
+    font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em;
+    padding:4px 11px; border-radius:11px;
   }
-  .precio-n{
-    font-family:'Fraunces',serif; font-size:46px; font-weight:700;
-    color:var(--verde-turf); line-height:1;
+  .cinta.reco{ background:var(--bronce); color:var(--tinta); }
+  .cinta.tuyo{ background:var(--verde-vivo); color:#fff; }
+
+  .p-nombre{
+    font-family:'Fraunces',serif; font-size:25px; font-weight:600;
+    line-height:1.1;
   }
-  .precio-x{
-    font-family:'Space Mono',monospace; font-size:13px; opacity:.65;
-    margin-top:8px;
+  .p-resumen{ font-size:15px; opacity:.75; margin-top:4px; }
+  .p-precio{
+    font-family:'Fraunces',serif; font-size:38px; font-weight:700;
+    color:var(--verde-turf); line-height:1; margin:14px 0 3px;
+  }
+  .p-precio.cero{ color:var(--bronce); }
+  .p-por{
+    font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
+    margin-bottom:16px;
   }
 
-  .incluye-rot{
-    font-family:'Space Mono',monospace; font-size:10px;
-    text-transform:uppercase; letter-spacing:.1em; opacity:.6;
-    margin-bottom:14px;
-  }
   .item{
-    display:flex; gap:12px; align-items:flex-start;
-    padding:11px 0; border-bottom:1px solid var(--pergamino-2);
+    display:flex; gap:11px; align-items:flex-start;
+    padding:9px 0; border-bottom:1px solid var(--pergamino-2);
   }
   .item:last-of-type{ border-bottom:none; }
   .tic{
-    width:24px; height:24px; border-radius:50%; flex-shrink:0;
-    background:#e8f4ef; color:var(--verde-vivo);
+    width:22px; height:22px; border-radius:50%; flex-shrink:0;
     display:flex; align-items:center; justify-content:center;
-    font-size:14px; font-weight:700; margin-top:1px;
+    font-size:13px; font-weight:700; margin-top:1px;
   }
-  .item span{ font-size:16px; line-height:1.5; }
+  .tic.si{ background:#e8f4ef; color:var(--verde-vivo); }
+  .tic.no{ background:var(--pergamino-2); color:#8a8070; }
+  .item span{ font-size:15.5px; line-height:1.45; }
+  .item.falta span{ opacity:.55; }
 
-  .btn-pagar{
-    display:block; width:100%; margin-top:24px; text-align:center;
-    font-family:'Archivo',sans-serif; font-weight:600; font-size:17px;
+  .btn-plan{
+    display:block; width:100%; margin-top:18px; text-align:center;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:16.5px;
     background:var(--verde-vivo); color:#fff; border:none;
-    padding:18px; border-radius:9px; cursor:pointer; min-height:58px;
+    padding:16px; border-radius:9px; cursor:pointer; min-height:56px;
     text-decoration:none;
   }
-  .btn-pagar:hover{ background:#25795c; }
-  .btn-pagar:disabled{ opacity:.5; cursor:not-allowed; }
+  .btn-plan:hover{ background:#25795c; }
+  .btn-plan:disabled{ opacity:.5; cursor:not-allowed; }
+  .btn-plan.oro{ background:var(--bronce); color:var(--tinta); }
+  .btn-plan.oro:hover{ background:#a37f42; }
+  .btn-plan.tenue{
+    background:transparent; color:var(--verde-turf);
+    border:1.5px solid var(--pergamino-2);
+  }
+
+  .wsp{
+    display:block; width:100%; margin-top:10px; text-align:center;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+    background:#e8f4ef; color:#1f6b52; border:1.5px solid #c9e6db;
+    padding:14px; border-radius:9px; text-decoration:none; min-height:50px;
+  }
 
   .btn-volver{
-    display:block; width:100%; margin-top:11px; text-align:center;
+    display:block; width:100%; margin-top:6px; text-align:center;
     font-family:'Archivo',sans-serif; font-weight:600; font-size:16px;
     background:transparent; color:var(--verde-turf);
     border:1.5px solid var(--pergamino-2);
@@ -116,7 +140,7 @@
     text-decoration:none;
   }
   .btn-cancelar{
-    display:block; width:100%; margin-top:11px; text-align:center;
+    display:block; width:100%; margin-top:14px; text-align:center;
     font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
     background:transparent; color:var(--carmin);
     border:1.5px solid var(--pergamino-2);
@@ -125,7 +149,7 @@
 
   .medios{
     font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
-    text-align:center; margin-top:16px; line-height:1.7;
+    text-align:center; margin-top:18px; line-height:1.7;
   }
   .aviso{
     font-size:14px; line-height:1.6; margin-top:16px;
@@ -134,6 +158,7 @@
   }
   .msg{
     font-size:15px; line-height:1.6; margin-top:14px; min-height:20px;
+    text-align:center;
   }
   .msg.mal{ color:var(--carmin); }
   .msg.bien{ color:var(--verde-vivo); }
@@ -151,52 +176,78 @@
 <div class="cab">
   <div class="marca">LEA WIN <span>IA</span></div>
   <h1>Leé la carrera antes de la carrera</h1>
-  <p>Suscribite y accedé a todo</p>
+  <p>Elegí cómo querés usarla</p>
 </div>
 
 <div class="wrap">
 
   <div class="estado" id="estado" style="display:none;">
-    <div class="est-rot" id="est-rot">Tu suscripción</div>
+    <div class="est-rot" id="est-rot">Tu plan</div>
     <div class="est-txt" id="est-txt">—</div>
     <div class="est-sub" id="est-sub"></div>
-  </div>
-
-  <div class="caja">
-    <div class="precio">
-      <div class="precio-n">${{ "{:,.0f}".format(precio).replace(",", ".") }}</div>
-      <div class="precio-x">por mes · se renueva solo · cancelás cuando querés</div>
-    </div>
-
-    <div class="incluye-rot">Qué incluye</div>
-    {% for x in incluye %}
-    <div class="item"><div class="tic">✓</div><span>{{ x }}</span></div>
-    {% endfor %}
-
-    <button class="btn-pagar" id="btn-pagar" onclick="suscribirme()">
-      Suscribirme
-    </button>
-    <a class="btn-volver" href="/">Volver a la aplicación</a>
     <button class="btn-cancelar" id="btn-cancelar"
             style="display:none;" onclick="cancelar()">
       Cancelar la suscripción
     </button>
+  </div>
 
-    <div class="msg" id="msg"></div>
+  {% for p in planes %}
+  <div class="plan{% if p.destacado %} destacado{% endif %}" id="plan-{{ p.clave }}">
+    {% if p.destacado %}
+    <div class="cinta reco" id="reco-{{ p.clave }}">Lo más completo</div>
+    {% endif %}
+    <div class="cinta tuyo" id="tuyo-{{ p.clave }}" style="display:none;">Tu plan</div>
 
-    <div class="medios">
-      Pagás con Mercado Pago: tarjeta, dinero en cuenta,<br>
-      transferencia o efectivo en Rapipago.<br>
-      No hace falta tener cuenta de Mercado Pago.
-    </div>
+    <div class="p-nombre">{{ p.nombre }}</div>
+    <div class="p-resumen">{{ p.resumen }}</div>
 
-    {% if not cobro_prendido %}
-    <div class="aviso">
-      <b>El cobro todavía no está habilitado.</b> Por ahora la aplicación
-      funciona completa y sin costo.
-    </div>
+    {% if p.precio > 0 %}
+      <div class="p-precio">${{ "{:,.0f}".format(p.precio).replace(",", ".") }}</div>
+      <div class="p-por">por mes · se renueva solo · cancelás cuando querés</div>
+    {% else %}
+      <div class="p-precio cero">Sin costo</div>
+      <div class="p-por">no hace falta pagar nada</div>
+    {% endif %}
+
+    {% for x in p.incluye %}
+    <div class="item"><div class="tic si">✓</div><span>{{ x }}</span></div>
+    {% endfor %}
+    {% for x in p.no_incluye %}
+    <div class="item falta"><div class="tic no">−</div><span>{{ x }}</span></div>
+    {% endfor %}
+
+    {% if p.precio > 0 %}
+    <button class="btn-plan{% if p.destacado %} oro{% endif %}"
+            id="btn-{{ p.clave }}" onclick="suscribirme('{{ p.clave }}')">
+      Elegir {{ p.nombre }}
+    </button>
+    {% if p.clave == 'premium' %}
+    <a class="wsp" id="wsp-premium" style="display:none;"
+       href="https://wa.me/{{ whatsapp }}" target="_blank" rel="noopener">
+      Escribinos por WhatsApp
+    </a>
+    {% endif %}
+    {% else %}
+    <a class="btn-plan tenue" href="/">Seguir así</a>
     {% endif %}
   </div>
+  {% endfor %}
+
+  <div class="msg" id="msg"></div>
+  <a class="btn-volver" href="/">Volver a la aplicación</a>
+
+  <div class="medios">
+    Pagás con Mercado Pago: tarjeta, dinero en cuenta,<br>
+    transferencia o efectivo en Rapipago.<br>
+    No hace falta tener cuenta de Mercado Pago.
+  </div>
+
+  {% if not cobro_prendido %}
+  <div class="aviso">
+    <b>El cobro todavía no está habilitado.</b> Por ahora la aplicación
+    funciona completa y sin costo.
+  </div>
+  {% endif %}
 
   <div class="pie">
     <a href="/terminos">Términos y condiciones</a> ·
@@ -215,6 +266,11 @@ function cabeceras(){
   return h;
 }
 
+function alFecha(f){
+  const p = (f || '').split('-');
+  return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : f;
+}
+
 async function verEstado(){
   try{
     const r = await fetch('/api/mi-suscripcion', {headers: cabeceras()});
@@ -225,73 +281,106 @@ async function verEstado(){
     const rot = document.getElementById('est-rot');
     const txt = document.getElementById('est-txt');
     const sub = document.getElementById('est-sub');
-    const btn = document.getElementById('btn-pagar');
     const btnCan = document.getElementById('btn-cancelar');
 
+    // Limpiar las marcas de "tu plan" antes de volver a ponerlas.
+    ['gratis','normal','premium'].forEach(c => {
+      const t = document.getElementById('tuyo-' + c);
+      const p = document.getElementById('plan-' + c);
+      const b = document.getElementById('btn-' + c);
+      const rc = document.getElementById('reco-' + c);
+      if (t) t.style.display = 'none';
+      if (rc) rc.style.display = 'block';
+      if (p) p.classList.remove('actual');
+      if (b){ b.disabled = false; b.textContent = 'Elegir ' + nombreDe(c); }
+    });
+
+    caja.style.display = 'block';
+    btnCan.style.display = 'none';
+
     if (!d.ingresado){
-      caja.style.display = 'block';
       caja.className = 'estado sin-pagar';
       rot.textContent = 'Todavía no entraste';
       txt.textContent = 'Creá tu cuenta gratis';
       sub.textContent = 'Es rápido: un nombre, una contraseña y tu celular.';
-      btn.textContent = 'Crear mi cuenta';
-      btn.onclick = () => { location.href = '/'; };
       return;
     }
-
-    caja.style.display = 'block';
 
     if (d.es_admin){
       caja.className = 'estado al-dia';
       rot.textContent = 'Tu cuenta';
       txt.textContent = 'Sos el administrador';
       sub.textContent = 'Tenés acceso a todo, sin suscripción.';
-      btn.style.display = 'none';
+      ['normal','premium'].forEach(c => {
+        const b = document.getElementById('btn-' + c);
+        if (b) b.style.display = 'none';
+      });
       return;
     }
 
+    // Marcar el plan que tiene hoy.
+    marcarPlan(d.mi_plan || 'gratis');
+
     if (d.al_dia){
+      const p = (d.planes || []).find(x => x.clave === d.mi_plan);
       caja.className = 'estado al-dia';
-      rot.textContent = 'Tu suscripción';
-      txt.textContent = 'Al día';
+      rot.textContent = 'Tu plan';
+      txt.textContent = p ? p.nombre : 'Al día';
       sub.textContent = d.paga_hasta
-        ? 'Tenés acceso completo hasta el ' + alFecha(d.paga_hasta) + '.'
+        ? 'Tenés acceso hasta el ' + alFecha(d.paga_hasta) + '.'
         : 'Tenés acceso completo.';
-      btn.style.display = 'none';
       if (d.estado !== 'cancelada') btnCan.style.display = 'block';
-      else sub.textContent += ' Ya la cancelaste: no se te va a cobrar más.';
+      else sub.textContent += ' Ya lo cancelaste: no se te va a cobrar más.';
+
+      // Al premium se le muestra el WhatsApp.
+      if (d.mi_plan === 'premium'){
+        const w = document.getElementById('wsp-premium');
+        if (w) w.style.display = 'block';
+      }
     } else {
       caja.className = 'estado sin-pagar';
-      rot.textContent = 'Tu suscripción';
-      txt.textContent = 'Sin suscripción';
+      rot.textContent = 'Tu plan';
+      txt.textContent = 'Gratis';
       sub.textContent = 'Por ahora ves solo la carrera que está por correrse.';
-      btn.style.display = 'block';
-      btn.textContent = 'Suscribirme';
-      btn.onclick = suscribirme;
-      btnCan.style.display = 'none';
     }
   }catch(e){ /* si falla, queda la pantalla como está */ }
 }
 
-function alFecha(f){
-  const p = (f || '').split('-');
-  return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : f;
+function nombreDe(clave){
+  const p = ((miEstado || {}).planes || []).find(x => x.clave === clave);
+  return p ? p.nombre : clave;
 }
 
-async function suscribirme(){
-  const btn = document.getElementById('btn-pagar');
+function marcarPlan(clave){
+  const t = document.getElementById('tuyo-' + clave);
+  const p = document.getElementById('plan-' + clave);
+  // Si ya es su plan, se esconde la otra cinta: si no, se pisan.
+  const rc = document.getElementById('reco-' + clave);
+  if (rc) rc.style.display = 'none';
+  if (t) t.style.display = 'block';
+  if (p) p.classList.add('actual');
+  // Al plan que ya tiene, no tiene sentido ofrecérselo de nuevo.
+  const b = document.getElementById('btn-' + clave);
+  if (b){ b.disabled = true; b.textContent = 'Es tu plan actual'; }
+}
+
+async function suscribirme(plan){
+  const btn = document.getElementById('btn-' + plan);
   const msg = document.getElementById('msg');
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   msg.className = 'msg';
   msg.textContent = 'Preparando el pago…';
   try{
-    const r = await fetch('/api/suscribirme', {method:'POST', headers: cabeceras()});
+    const r = await fetch('/api/suscribirme', {
+      method:'POST', headers: cabeceras(),
+      body: JSON.stringify({plan: plan})
+    });
     const d = await r.json();
     if (d.ok === false){
       msg.className = 'msg mal';
       msg.textContent = d.error;
       if (d.necesita_cuenta) setTimeout(() => location.href = '/', 1800);
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
       return;
     }
     msg.className = 'msg bien';
@@ -300,7 +389,7 @@ async function suscribirme(){
   }catch(e){
     msg.className = 'msg mal';
     msg.textContent = 'No se pudo preparar el pago. ' + e.message;
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
 }
 
