@@ -199,6 +199,15 @@ def init_db():
       detalle TEXT,
       guardado_en TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS planes(
+      clave TEXT PRIMARY KEY,     -- gratis | normal | premium
+      nombre TEXT,
+      precio REAL,
+      resumen TEXT,
+      incluye TEXT,               -- una linea por punto
+      no_incluye TEXT,
+      cambiado_en TEXT
+    );
     CREATE TABLE IF NOT EXISTS promocion(
       id INTEGER PRIMARY KEY CHECK (id = 1),   -- una sola fila
       desde TEXT,                 -- AAAA-MM-DD: desde cuando hay prueba
@@ -6269,7 +6278,7 @@ def _solo_numeros(t):
     return re.sub(r"\D", "", t or "")
 
 
-PLANES = [
+PLANES_DE_FABRICA = [
     {
         "clave": "gratis",
         "nombre": "Gratis",
@@ -6316,13 +6325,40 @@ PLANES = [
     },
 ]
 
-# Lo que gana el que paga el plan normal. Se sigue usando en el aviso
-# que aparece cuando alguien quiere ver algo que no le corresponde.
-LO_QUE_INCLUYE = PLANES[1]["incluye"]
+def planes_actuales():
+    """
+    Los planes tal como se ven hoy. Se parte de los de fabrica y se
+    aplica encima lo que el admin haya cambiado desde el panel.
+    Asi se pueden tocar precios y textos sin publicar nada.
+    """
+    planes = [dict(p) for p in PLANES_DE_FABRICA]
+    try:
+        con = db()
+        filas = con.execute("SELECT * FROM planes").fetchall()
+        con.close()
+    except Exception:
+        return planes
+
+    cambios = {f["clave"]: dict(f) for f in filas}
+    for p in planes:
+        ch = cambios.get(p["clave"])
+        if not ch:
+            continue
+        if ch.get("nombre"):
+            p["nombre"] = ch["nombre"]
+        if ch.get("resumen"):
+            p["resumen"] = ch["resumen"]
+        if ch.get("precio") is not None:
+            p["precio"] = float(ch["precio"])
+        for campo in ("incluye", "no_incluye"):
+            if ch.get(campo) is not None:
+                p[campo] = [l.strip() for l in str(ch[campo]).split("\n")
+                            if l.strip()]
+    return planes
 
 
 def plan_por_clave(clave):
-    for p in PLANES:
+    for p in planes_actuales():
         if p["clave"] == clave:
             return p
     return None
@@ -6331,6 +6367,12 @@ def plan_por_clave(clave):
 def precio_de(clave):
     p = plan_por_clave(clave)
     return float(p["precio"]) if p else PRECIO_MENSUAL
+
+
+def _lo_que_incluye():
+    """Lo del plan normal, para el aviso de cuando falta suscripcion."""
+    p = plan_por_clave("normal")
+    return p["incluye"] if p else []
 
 
 def hay_cobro():
@@ -6412,8 +6454,9 @@ def api_mi_suscripcion():
     if not u:
         return jsonify(ok=True, ingresado=False, al_dia=False,
                        cobro_prendido=hay_cobro(),
-                       planes=PLANES, mi_plan="gratis",
-                       precio=PRECIO_MENSUAL, incluye=LO_QUE_INCLUYE)
+                       planes=planes_actuales(), mi_plan="gratis",
+                       precio=precio_de("normal"),
+                       incluye=_lo_que_incluye())
 
     s = suscripcion_de(u["id"]) or {}
     al_dia = esta_al_dia(u["id"])
@@ -6429,10 +6472,10 @@ def api_mi_suscripcion():
         paga_hasta=s.get("paga_hasta", ""),
         ultimo_pago=s.get("ultimo_pago", ""),
         mi_plan=mi_plan,
-        planes=PLANES,
+        planes=planes_actuales(),
         whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
-        precio=PRECIO_MENSUAL,
-        incluye=LO_QUE_INCLUYE,
+        precio=precio_de("normal"),
+        incluye=_lo_que_incluye(),
     )
 
 
@@ -6689,7 +6732,7 @@ def _actualizar_suscripcion(sus):
 def pantalla_suscripcion():
     """La pantalla donde se ve qué incluye y se paga."""
     return render_template("suscripcion.html",
-                           planes=PLANES,
+                           planes=planes_actuales(),
                            whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
                            cobro_prendido=hay_cobro())
 
@@ -6951,6 +6994,85 @@ def api_probar_gratis():
     return jsonify(ok=True, hasta=hasta,
                    mensaje=("Listo. Tenés acceso completo a todo hasta las "
                             "23:59 de hoy. Después, suscribite para seguir."))
+
+
+@app.get("/api/admin/planes")
+def admin_ver_planes():
+    """Los planes como estan hoy, para editarlos en el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    planes = planes_actuales()
+    # Se manda tambien como estan de fabrica, para poder volver atras.
+    return jsonify(ok=True, planes=planes,
+                   de_fabrica=[dict(p) for p in PLANES_DE_FABRICA])
+
+
+@app.post("/api/admin/planes")
+def admin_guardar_plan():
+    """El admin cambia el precio y los textos de un plan."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [p["clave"] for p in PLANES_DE_FABRICA]:
+        return jsonify(ok=False, error="Ese plan no existe."), 400
+
+    nombre = clean(d.get("nombre", ""))[:40]
+    resumen = clean(d.get("resumen", ""))[:120]
+
+    precio = None
+    bruto = clean(str(d.get("precio", "")))
+    if bruto != "":
+        n = _to_float(bruto)
+        if n is None or n < 0 or n > 10_000_000:
+            return jsonify(ok=False,
+                           error="El precio tiene que ser un número entre 0 y 10 millones."), 400
+        precio = float(n)
+
+    def lineas(t):
+        if t is None:
+            return None
+        return "\n".join(clean(l)[:120] for l in str(t).split("\n") if clean(l))[:2000]
+
+    incluye = lineas(d.get("incluye"))
+    no_incluye = lineas(d.get("no_incluye"))
+
+    con = db()
+    con.execute("""
+        INSERT INTO planes(clave, nombre, precio, resumen, incluye,
+                           no_incluye, cambiado_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(clave) DO UPDATE SET
+          nombre=excluded.nombre, precio=excluded.precio,
+          resumen=excluded.resumen, incluye=excluded.incluye,
+          no_incluye=excluded.no_incluye, cambiado_en=excluded.cambiado_en
+    """, (clave, nombre, precio, resumen, incluye, no_incluye,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+    p = plan_por_clave(clave)
+    return jsonify(ok=True, plan=p,
+                   mensaje=f"Guardado el plan {p['nombre']}.")
+
+
+@app.post("/api/admin/plan-de-fabrica")
+def admin_plan_de_fabrica():
+    """Vuelve un plan a como estaba al principio."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [p["clave"] for p in PLANES_DE_FABRICA]:
+        return jsonify(ok=False, error="Ese plan no existe."), 400
+    con = db()
+    con.execute("DELETE FROM planes WHERE clave=?", (clave,))
+    con.commit()
+    con.close()
+    p = plan_por_clave(clave)
+    return jsonify(ok=True, plan=p,
+                   mensaje=f"El plan {p['nombre']} volvió a como estaba.")
 
 
 @app.get("/api/admin/promocion")
