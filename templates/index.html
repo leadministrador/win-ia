@@ -1026,6 +1026,46 @@
     font-family:'Space Mono',monospace; font-size:11px; opacity:.55;
     line-height:1.6;
   }
+  .instalar-caja{
+    position:fixed; left:12px; right:12px; bottom:12px; z-index:80;
+    background:var(--hueso); border-radius:12px; padding:20px 18px 18px;
+    box-shadow:0 -6px 30px rgba(21,56,50,.28);
+    border:2px solid var(--bronce); text-align:center;
+    max-width:440px; margin:0 auto;
+  }
+  .inst-x{
+    position:absolute; top:8px; right:8px; width:36px; height:36px;
+    background:none; border:none; font-size:17px; color:var(--tinta);
+    opacity:.5; cursor:pointer;
+  }
+  .inst-icono{ font-size:30px; margin-bottom:6px; }
+  .inst-tit{
+    font-family:'Fraunces',serif; font-size:20px; font-weight:600;
+  }
+  .inst-txt{ font-size:14.5px; line-height:1.55; opacity:.8; margin-top:7px; }
+  .inst-btn{
+    width:100%; margin-top:14px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:16px; background:var(--bronce);
+    color:var(--tinta); border:none; padding:15px; border-radius:8px;
+    cursor:pointer; min-height:52px;
+  }
+  .aviso-lento{
+    background:var(--pergamino); border-left:4px solid var(--bronce);
+    border-radius:0 9px 9px 0; padding:20px 18px; margin-top:12px;
+    text-align:center;
+  }
+  .al-icono{ font-size:32px; margin-bottom:10px; }
+  .al-txt{
+    font-family:'Fraunces',serif; font-size:18px; font-weight:600;
+    line-height:1.35;
+  }
+  .al-sub{ font-size:14.5px; line-height:1.55; opacity:.78; margin-top:8px; }
+  .al-btn{
+    width:100%; margin-top:16px; font-family:'Archivo',sans-serif;
+    font-weight:600; font-size:16px; background:var(--verde-turf);
+    color:var(--hueso); border:none; padding:15px; border-radius:8px;
+    cursor:pointer; min-height:52px;
+  }
   .solo-usuarios{
     background:var(--pergamino); border-left:3px solid var(--bronce);
     padding:16px 16px; border-radius:0 6px 6px 0; margin:14px 0;
@@ -1916,6 +1956,16 @@
   </div>
 </div>
 
+<div class="instalar-caja" id="instalar-app" style="display:none;">
+  <button class="inst-x" onclick="cerrarInstalar()">✕</button>
+  <div class="inst-icono">📲</div>
+  <div class="inst-tit">Tenela en tu celular</div>
+  <div class="inst-txt" id="inst-pasos"></div>
+  <button class="inst-btn" id="inst-btn" onclick="instalarAhora()">
+    Instalar
+  </button>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1950,6 +2000,16 @@ function abrirAvisoCuenta(){
 }
 function cerrarAvisoCuenta(){
   document.getElementById('aviso-cuenta').classList.remove('visible');
+}
+
+// Cuando los datos oficiales tardan: se le explica y se le da el botón.
+function avisoLento(mensaje, queHacer){
+  return `<div class="aviso-lento">
+    <div class="al-icono">⏱</div>
+    <div class="al-txt">${mensaje}</div>
+    ${queHacer ? `<div class="al-sub">${queHacer}</div>` : ''}
+    <button class="al-btn" onclick="location.reload()">Actualizar</button>
+  </div>`;
 }
 
 function invitacionPagar(mensaje){
@@ -1995,6 +2055,8 @@ async function apiGet(url){
     err.necesitaPagar = !!data.necesita_pagar;
     err.noExiste = !!data.no_existe;
     err.sinCelular = !!data.sin_celular;
+    err.reintentar = !!data.reintentar;
+    err.queHacer = data.que_hacer || '';
     throw err;
   }
   return data;
@@ -2239,6 +2301,11 @@ async function elegirCarrera(c, itemEl){
       const caja = document.getElementById('caja-condiciones');
       if (caja) caja.style.display = 'none';
       if (e.necesitaPagar) abrirAvisoPagar(); else abrirAvisoCuenta();
+    } else if (e.reintentar){
+      list.innerHTML = avisoLento(e.message, e.queHacer);
+      document.getElementById('pronostico').innerHTML = '';
+      const caja = document.getElementById('caja-condiciones');
+      if (caja) caja.style.display = 'none';
     } else {
       list.innerHTML = estadoMsg('No se pudo cargar la carrera. ' + e.message, true);
     }
@@ -4249,6 +4316,84 @@ function abrirAvisoVencido(estado){
 
 function cerrarAvisoVencido(){
   document.getElementById('aviso-vencido').classList.remove('visible');
+}
+
+
+// ============================================================
+// INSTALAR LA APP EN EL CELULAR
+// Android avisa solo que se puede instalar; iPhone no, así que ahí
+// hay que explicarle los pasos. Se muestra una sola vez cada tanto,
+// para no molestar.
+// ============================================================
+
+let guardarInstalacion = null;
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  guardarInstalacion = e;
+  mostrarInvitacionInstalar('android');
+});
+
+function yaEstaInstalada(){
+  return window.matchMedia('(display-mode: standalone)').matches
+      || window.navigator.standalone === true;
+}
+
+function esIphone(){
+  return /iphone|ipad|ipod/i.test(navigator.userAgent);
+}
+
+function cuandoSeOculto(){
+  try{ return parseInt(localStorage.getItem('lea_instalar_no') || '0', 10); }
+  catch(e){ return 0; }
+}
+
+function ocultarInstalarUnosDias(){
+  try{ localStorage.setItem('lea_instalar_no', String(Date.now())); }catch(e){}
+}
+
+function mostrarInvitacionInstalar(tipo){
+  if (yaEstaInstalada()) return;
+  // Si la escondió hace menos de 15 días, no insistir.
+  const dias = (Date.now() - cuandoSeOculto()) / 86400000;
+  if (cuandoSeOculto() && dias < 15) return;
+
+  const caja = document.getElementById('instalar-app');
+  if (!caja) return;
+  const pasos = document.getElementById('inst-pasos');
+
+  if (tipo === 'iphone'){
+    pasos.innerHTML =
+      'Tocá el botón de compartir <b>⬆</b> abajo en la pantalla, ' +
+      'y después <b>Agregar a inicio</b>.';
+    document.getElementById('inst-btn').style.display = 'none';
+  } else {
+    pasos.textContent =
+      'Queda con su ícono, se abre a pantalla completa y recibe los avisos.';
+    document.getElementById('inst-btn').style.display = 'block';
+  }
+  caja.style.display = 'block';
+}
+
+async function instalarAhora(){
+  if (!guardarInstalacion) return;
+  guardarInstalacion.prompt();
+  try{
+    await guardarInstalacion.userChoice;
+  }catch(e){}
+  guardarInstalacion = null;
+  cerrarInstalar();
+}
+
+function cerrarInstalar(){
+  const caja = document.getElementById('instalar-app');
+  if (caja) caja.style.display = 'none';
+  ocultarInstalarUnosDias();
+}
+
+// En iPhone el navegador no avisa, así que se propone a mano.
+if (esIphone() && !yaEstaInstalada()){
+  setTimeout(() => mostrarInvitacionInstalar('iphone'), 4000);
 }
 
 // ---------- Arranque ----------
