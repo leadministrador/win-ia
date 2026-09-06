@@ -34,8 +34,15 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
 
-def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=(4, 8))
+# Cuanto se espera al sitio oficial antes de darse por vencido.
+# Estaba en 8 segundos y se cortaba cuando el sitio andaba lento.
+ESPERA_CONECTAR = float(os.getenv("ESPERA_CONECTAR", "8"))
+ESPERA_RESPUESTA = float(os.getenv("ESPERA_RESPUESTA", "25"))
+
+
+def fetch(url, espera=None):
+    r = requests.get(url, headers=HEADERS,
+                     timeout=(ESPERA_CONECTAR, espera or ESPERA_RESPUESTA))
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
@@ -1741,7 +1748,8 @@ def calendario():
                 "jornada_terminada": jornada_terminada,
             }
             if origen == "cache_vencido":
-                resp["aviso"] = "La fuente oficial no respondió. Se muestra el último calendario guardado."
+                resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                                 "Te mostramos la última versión que guardamos.")
             return jsonify(**resp)
     except Exception:
         pass
@@ -1752,18 +1760,16 @@ def calendario():
             ok=True,
             reuniones=saved,
             fuente="Carreras guardadas",
-            aviso=(
-                "La fuente oficial no respondió. "
-                "Se muestran fechas guardadas."
-            ),
+            aviso=("Los datos oficiales están tardando en llegar. "
+                   "Te mostramos las fechas que teníamos guardadas."),
         )
 
     return jsonify(
         ok=False,
-        error=(
-            "El calendario oficial no está disponible "
-            "en este momento."
-        ),
+        error=("Los datos oficiales están tardando en llegar."),
+        que_hacer=("Deslizá la pantalla hacia abajo o tocá Actualizar "
+                   "para volver a intentar."),
+        reintentar=True,
         reuniones=[],
     ), 503
 
@@ -1830,7 +1836,8 @@ def reuniones():
             "ahora": hora_argentina(),
         }
         if origen == "cache_vencido":
-            resp["aviso"] = "La fuente oficial no respondió. Se muestra la última versión guardada."
+            resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                             "Te mostramos la última versión que guardamos.")
         return jsonify(**resp)
     except Exception:
         return jsonify(
@@ -1944,10 +1951,23 @@ def carrera():
         data, origen = con_cache(clave, TTL_CARRERA, forzar, traer)
         resp = {"ok": True, **data}
         if origen == "cache_vencido":
-            resp["aviso"] = "La fuente oficial no respondió. Se muestra la última versión guardada."
+            resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                             "Te mostramos la última versión que guardamos.")
+            resp["reintentar"] = True
         return jsonify(**resp)
     except Exception as e:
-        return jsonify(ok=False,error="No se pudo cargar la carrera.",detalle=str(e)),502
+        # Si tardo demasiado, se le explica y se le dice que hacer.
+        lento = "timed out" in str(e).lower() or "timeout" in str(e).lower()
+        return jsonify(
+            ok=False,
+            error=("Los datos oficiales están tardando en llegar y no los "
+                   "tenemos guardados todavía." if lento else
+                   "No se pudo cargar la carrera."),
+            que_hacer=("Deslizá la pantalla hacia abajo o tocá Actualizar "
+                       "para volver a intentar."),
+            reintentar=True,
+            detalle=str(e),
+        ), 502
 
 TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
 
