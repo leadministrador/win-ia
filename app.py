@@ -35,9 +35,11 @@ def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
 
 # Cuanto se espera al sitio oficial antes de darse por vencido.
-# Estaba en 8 segundos y se cortaba cuando el sitio andaba lento.
-ESPERA_CONECTAR = float(os.getenv("ESPERA_CONECTAR", "8"))
-ESPERA_RESPUESTA = float(os.getenv("ESPERA_RESPUESTA", "25"))
+# Poco a proposito: las carreras se traen de madrugada y quedan
+# guardadas, asi que si el sitio tarda se usa lo guardado enseguida
+# en vez de hacer esperar al usuario.
+ESPERA_CONECTAR = float(os.getenv("ESPERA_CONECTAR", "4"))
+ESPERA_RESPUESTA = float(os.getenv("ESPERA_RESPUESTA", "5"))
 
 
 def fetch(url, espera=None):
@@ -287,8 +289,11 @@ def init_db():
 
 # --- Cache genérico con TTL, para no depender de scrapear en cada request ---
 TTL_CALENDARIO = 2 * 60 * 60      # 2hs: el calendario cambia poco
-TTL_REUNION = 15 * 60              # 15 min: carreras/participantes del día
-TTL_CARRERA = 15 * 60
+# Las carreras se traen de madrugada y se refrescan una hora antes de
+# correrse. Por eso lo guardado vale todo el dia: si algo cambio, la
+# app lo trae en ese refresco, no cada vez que alguien entra.
+TTL_REUNION = int(os.getenv("TTL_REUNION", str(12 * 60 * 60)))
+TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
 
 def cache_get(clave, ttl_seg):
     con = db()
@@ -4229,6 +4234,218 @@ def avisar_a_los_que_vencieron():
     return enviados
 
 
+# ============================================================
+# TRAER LAS CARRERAS POR ADELANTADO
+# El sitio oficial publica las carreras hasta tres dias antes, con
+# todos sus competidores. Si se traen de noche y se guardan, el
+# usuario las encuentra listas y la app no depende de que el sitio
+# responda rapido en el momento.
+# Ademas, una hora antes de cada carrera se vuelve a pedir: ahi
+# aparecen los retiros de ultimo momento.
+# ============================================================
+
+ADELANTO = {
+    "trabajando": False,
+    "ultima_vez": "",
+    "carreras": 0,
+    "reuniones": 0,
+    "refrescadas": 0,
+    "ultimo": "",
+}
+
+
+def _guardar_una_carrera(url, numero, forzar=False):
+    """Trae una carrera y la deja guardada. True si salio bien."""
+    clave = f"carrera:{url}:{numero}"
+    if not forzar:
+        guardada, fresca = cache_get(clave, TTL_CARRERA)
+        if guardada is not None and fresca:
+            return True
+    try:
+        data = parse_race(fetch(url), int(numero))
+        if not data:
+            return False
+        cache_set(clave, data)
+        return True
+    except Exception:
+        return False
+
+
+def traer_las_que_vienen(forzar=False):
+    """
+    Recorre las reuniones publicadas y guarda todas sus carreras.
+    Se hace de madrugada, cuando no molesta a nadie.
+    """
+    if ADELANTO["trabajando"]:
+        return {"ok": False, "motivo": "ya se está trayendo"}
+
+    ADELANTO["trabajando"] = True
+    ADELANTO["carreras"] = 0
+    ADELANTO["reuniones"] = 0
+    hoy = hoy_argentina()
+
+    try:
+        try:
+            calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+        except Exception as e:
+            ADELANTO["ultimo"] = f"no se pudo abrir el calendario: {str(e)[:60]}"
+            return {"ok": False, "motivo": ADELANTO["ultimo"]}
+
+        # Solo de hoy en adelante: lo viejo ya no cambia.
+        proximas = [r for r in calendario if r["fecha"] >= hoy]
+        proximas.sort(key=lambda r: r["fecha"])
+
+        for reunion in proximas:
+            try:
+                clave_reunion = f"reuniones:{reunion['fecha']}:{normalize_text(reunion['hipodromo'])}"
+                soup = fetch(reunion["url"])
+                carreras = extract_races_from_meeting(soup)
+                if not carreras:
+                    continue
+
+                # La lista de carreras de esa reunion.
+                cache_set(clave_reunion, [{
+                    "hipodromo": _limpiar_nombre_hipodromo(reunion["hipodromo"]),
+                    "url": reunion["url"],
+                    "carreras": carreras,
+                }])
+
+                # Y cada carrera con sus competidores.
+                for c in carreras:
+                    clave = f"carrera:{reunion['url']}:{c['numero']}"
+                    guardada, fresca = cache_get(clave, TTL_CARRERA)
+                    if guardada is not None and fresca and not forzar:
+                        continue
+                    try:
+                        data = parse_race(soup, c["numero"])
+                        if data:
+                            cache_set(clave, data)
+                            ADELANTO["carreras"] += 1
+                    except Exception:
+                        continue
+                    time.sleep(float(os.getenv("PAUSA_ADELANTO", "1.0")))
+
+                ADELANTO["reuniones"] += 1
+                ADELANTO["ultimo"] = (f"{reunion['fecha']} "
+                                      f"{_limpiar_nombre_hipodromo(reunion['hipodromo'])}")
+            except Exception:
+                continue
+
+        ADELANTO["ultima_vez"] = ahora_argentina().strftime("%Y-%m-%d %H:%M")
+        return {"ok": True, "reuniones": ADELANTO["reuniones"],
+                "carreras": ADELANTO["carreras"]}
+    finally:
+        ADELANTO["trabajando"] = False
+
+
+def refrescar_las_que_estan_por_correrse():
+    """
+    Vuelve a pedir las carreras que salen en la proxima hora y media.
+    Ahi es cuando aparecen los retiros de ultimo momento.
+    Devuelve los retiros nuevos que encontro.
+    """
+    hoy = hoy_argentina()
+    ahora = ahora_argentina()
+    retiros = []
+
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return retiros
+
+    for reunion in [r for r in calendario if r["fecha"] == hoy]:
+        try:
+            soup = fetch(reunion["url"])
+            carreras = extract_races_from_meeting(soup)
+        except Exception:
+            continue
+
+        for c in carreras:
+            if not c.get("hora"):
+                continue
+            try:
+                h, m = [int(x) for x in c["hora"].split(":")]
+                largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+                faltan = (largada - ahora).total_seconds() / 60
+            except Exception:
+                continue
+
+            # Solo las que salen en la proxima hora y media.
+            if not (0 < faltan <= 90):
+                continue
+
+            clave = f"carrera:{reunion['url']}:{c['numero']}"
+            antes, _ = cache_get(clave, TTL_CARRERA)
+
+            try:
+                data = parse_race(soup, c["numero"])
+            except Exception:
+                continue
+            if not data:
+                continue
+
+            cache_set(clave, data)
+            ADELANTO["refrescadas"] += 1
+
+            # ¿Se retiro alguno que antes corria?
+            if antes:
+                corrian = {normalize_text(p.get("nombre", ""))
+                           for p in antes.get("participantes", [])
+                           if not p.get("retirado")}
+                ahora_corren = {normalize_text(p.get("nombre", ""))
+                                for p in data.get("participantes", [])
+                                if not p.get("retirado")}
+                for p in data.get("participantes", []):
+                    n = normalize_text(p.get("nombre", ""))
+                    if n in corrian and n not in ahora_corren:
+                        retiros.append({
+                            "caballo": n,
+                            "visible": p.get("nombre", ""),
+                            "fecha": reunion["fecha"],
+                            "hipodromo": _limpiar_nombre_hipodromo(reunion["hipodromo"]),
+                            "numero": c["numero"],
+                        })
+    return retiros
+
+
+def avisar_los_retiros(retiros):
+    """Le avisa al que sigue a un caballo que se retiro."""
+    if not retiros or not hay_notificaciones():
+        return 0
+    enviados = 0
+    for r in retiros:
+        try:
+            con = db()
+            quienes = con.execute("""
+                SELECT s.usuario_id FROM seguidos s
+                JOIN suscripciones u ON u.usuario_id = s.usuario_id
+                WHERE s.caballo = ?
+                GROUP BY s.usuario_id
+            """, (r["caballo"],)).fetchall()
+            con.close()
+        except Exception:
+            continue
+
+        for q in quienes:
+            uid = q["usuario_id"]
+            if _ya_se_aviso(uid, r["caballo"], "retiro", r["fecha"], r["hipodromo"]):
+                continue
+            titulo = f"{r['visible']} no corre"
+            cuerpo = (f"Se retiró de la {r['numero']}ª carrera "
+                      f"de {r['hipodromo']}.")
+            n = avisar_a_usuario(
+                uid, titulo, cuerpo,
+                ("/aviso?r=" + quote_plus("Retiro")
+                 + "&t=" + quote_plus(titulo)
+                 + "&d=" + quote_plus(cuerpo)),
+                "retiro")
+            if n:
+                _marcar_avisado(uid, r["caballo"], "retiro",
+                                r["fecha"], r["hipodromo"])
+                enviados += n
+    return enviados
+
+
 def revision_de_avisos():
     """
     Tarea de fondo: revisa cada 15 minutos si hay que avisarle a alguien.
@@ -4244,6 +4461,23 @@ def revision_de_avisos():
             avisar_a_los_que_vencieron()
         except Exception:
             pass
+
+        # Refrescar las que salen en la proxima hora y media, y avisar
+        # si se retiro un caballo que alguien sigue.
+        try:
+            avisar_los_retiros(refrescar_las_que_estan_por_correrse())
+        except Exception:
+            pass
+
+        # De madrugada, traer todas las que vienen y dejarlas guardadas.
+        try:
+            h = ahora_argentina().hour
+            hoy = hoy_argentina()
+            if h == 2 and ADELANTO.get("ultima_vez", "")[:10] != hoy:
+                traer_las_que_vienen()
+        except Exception:
+            pass
+
         time.sleep(15 * 60)
 
 
@@ -5918,6 +6152,67 @@ def admin_diag_historico():
         else "Falla en alguno de los pasos de arriba."
     )
     return jsonify(ok=True, **informe)
+
+
+@app.route("/api/admin/traer-carreras", methods=["GET", "POST"])
+def admin_traer_carreras():
+    """
+    Trae ahora todas las carreras publicadas y las deja guardadas.
+    Lo mismo que hace sola de madrugada.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if ADELANTO["trabajando"]:
+        return jsonify(ok=True, trabajando=True,
+                       mensaje="Ya se están trayendo. Esperá un momento.")
+
+    forzar = request.args.get("forzar") == "1"
+    threading.Thread(target=traer_las_que_vienen,
+                     kwargs={"forzar": forzar}, daemon=True).start()
+    return jsonify(ok=True, trabajando=True,
+                   mensaje=("Trayendo las carreras que vienen. "
+                            "Podés cerrar esta página."))
+
+
+@app.get("/api/admin/carreras-guardadas")
+def admin_carreras_guardadas():
+    """Cuantas carreras hay guardadas y listas para el usuario."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    hoy = hoy_argentina()
+    try:
+        calendario, _ = con_cache("calendario", TTL_CALENDARIO, False,
+                                  lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+    except Exception:
+        calendario = []
+
+    proximas = [r for r in (calendario or []) if r["fecha"] >= hoy]
+    por_fecha = {}
+    for r in proximas:
+        f = r["fecha"]
+        clave = f"reuniones:{f}:{normalize_text(r['hipodromo'])}"
+        guardado, fresco = cache_get(clave, TTL_REUNION)
+        cuantas, listas = 0, 0
+        if guardado:
+            for x in guardado:
+                for c in x.get("carreras", []):
+                    cuantas += 1
+                    cc = f"carrera:{r['url']}:{c['numero']}"
+                    g, fr = cache_get(cc, TTL_CARRERA)
+                    if g is not None and fr:
+                        listas += 1
+        por_fecha.setdefault(f, {"fecha": f, "reuniones": [], "carreras": 0,
+                                 "listas": 0})
+        por_fecha[f]["reuniones"].append(_limpiar_nombre_hipodromo(r["hipodromo"]))
+        por_fecha[f]["carreras"] += cuantas
+        por_fecha[f]["listas"] += listas
+
+    fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"])
+    return jsonify(ok=True, hoy=hoy, fechas=fechas,
+                   dias_publicados=len(fechas),
+                   estado=ADELANTO,
+                   espera_segundos=ESPERA_RESPUESTA)
 
 
 @app.get("/api/admin/historico")
