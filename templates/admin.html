@@ -135,6 +135,19 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .dia-fila{
+    display:flex; justify-content:space-between; align-items:center;
+    gap:12px; padding:11px 0; border-bottom:1px solid var(--pergamino-2);
+  }
+  .dia-fila:last-child{ border-bottom:none; }
+  .dia-f{ font-family:'Fraunces',serif; font-size:16px; font-weight:600; }
+  .dia-h{ font-family:'Space Mono',monospace; font-size:11px; opacity:.6; }
+  .dia-est{
+    font-family:'Space Mono',monospace; font-size:12px; padding:4px 10px;
+    border-radius:5px; white-space:nowrap; flex-shrink:0;
+  }
+  .dia-est.ok{ background:#e8f4ef; color:#1f6b52; }
+  .dia-est.falta{ background:#fff4d6; color:#8a6a1f; }
   .plan-caja{
     border:1.5px solid var(--pergamino-2); border-radius:8px;
     margin-bottom:9px; overflow:hidden;
@@ -339,6 +352,25 @@
 
 <div class="wrap">
 
+
+  <h2>Carreras listas</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Las carreras se traen de madrugada y quedan guardadas, así el usuario
+    las abre al instante. Una hora antes de cada una se vuelven a pedir,
+    por si hubo retiros.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-listas"></div>
+    <div id="dias-listos" style="margin-top:16px;"></div>
+
+    <button class="btn btn-run" style="width:100%; margin-top:14px;"
+            onclick="traerCarreras()">Traer las que faltan</button>
+    <button class="btn btn-ghost" style="width:100%; margin-top:10px;"
+            onclick="traerCarreras(true)">Traer todas de nuevo</button>
+
+    <div class="progreso-txt" id="listas-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Histórico de años anteriores</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     El Stud Book no deja listar meses viejos, pero sí abrir una carrera si se
@@ -1140,6 +1172,68 @@ function abrirGrupo(id){
 }
 
 
+
+// ---------- Carreras listas ----------
+async function verCarrerasListas(){
+  try{
+    const r = await fetch('/api/admin/carreras-guardadas?clave='
+                          + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    const total = d.fechas.reduce((s,f) => s + f.carreras, 0);
+    const listas = d.fechas.reduce((s,f) => s + f.listas, 0);
+    const e = d.estado || {};
+
+    document.getElementById('chips-listas').innerHTML = `
+      <div class="chip-dato"><b>${listas} de ${total}</b>carreras listas</div>
+      <div class="chip-dato"><b>${d.dias_publicados}</b>días publicados</div>
+      <div class="chip-dato"><b>${d.espera_segundos}s</b>espera al sitio</div>
+      ${e.ultima_vez ? `<div class="chip-dato"><b>${e.ultima_vez.slice(11)}</b>última vez</div>` : ''}`;
+
+    document.getElementById('dias-listos').innerHTML = d.fechas.length
+      ? '<div class="previa-rot">Por día</div>' + d.fechas.map(f => {
+          const ok = f.carreras > 0 && f.listas === f.carreras;
+          const pct = f.carreras ? Math.round(f.listas / f.carreras * 100) : 0;
+          return `
+            <div class="dia-fila">
+              <div>
+                <div class="dia-f">${alFechaCorta(f.fecha)}${
+                  f.fecha === d.hoy ? ' · hoy' : ''}</div>
+                <div class="dia-h">${f.reuniones.join(' · ')}</div>
+              </div>
+              <div class="dia-est ${ok ? 'ok' : 'falta'}">${
+                f.carreras ? f.listas + '/' + f.carreras : 'sin datos'}</div>
+            </div>`;
+        }).join('')
+      : '<div class="progreso-txt">No hay carreras publicadas.</div>';
+
+    if (e.trabajando){
+      document.getElementById('listas-estado').textContent =
+        'Trayendo… ' + (e.ultimo || '');
+      setTimeout(verCarrerasListas, 4000);
+    }
+  }catch(e){}
+}
+
+function alFechaCorta(f){
+  const p = String(f || '').split('-');
+  return p.length === 3 ? `${p[2]}/${p[1]}` : f;
+}
+
+async function traerCarreras(todas){
+  const e = document.getElementById('listas-estado');
+  e.textContent = 'Arrancando…';
+  try{
+    const r = await fetch('/api/admin/traer-carreras?clave='
+                          + encodeURIComponent(clave)
+                          + (todas ? '&forzar=1' : ''), {method:'POST'});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    setTimeout(verCarrerasListas, 3000);
+  }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
+}
+
 // ---------- Los planes ----------
 async function verPlanes(){
   try{
@@ -1401,6 +1495,7 @@ async function cambiarAjuste(claveAjuste, encendido){
     });
     verAjustes();
 verUsuarios();
+verCarrerasListas();
 verPlanes();
 verPromocion();
 verHistorico();
@@ -1594,6 +1689,7 @@ verEstadoAvisos();
 verAnuncios();
 verAjustes();
 verUsuarios();
+verCarrerasListas();
 verPlanes();
 verPromocion();
 verHistorico();
