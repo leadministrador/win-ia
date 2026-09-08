@@ -289,11 +289,26 @@ def init_db():
 
 # --- Cache genérico con TTL, para no depender de scrapear en cada request ---
 TTL_CALENDARIO = 2 * 60 * 60      # 2hs: el calendario cambia poco
-# Las carreras se traen de madrugada y se refrescan una hora antes de
-# correrse. Por eso lo guardado vale todo el dia: si algo cambio, la
-# app lo trae en ese refresco, no cada vez que alguien entra.
+# Cuanto vale lo guardado de una carrera.
+# Si YA SE CORRIO, mucho: el resultado no cambia mas.
+# Si TODAVIA NO, poco: hay que volver a pedirla para que aparezcan los
+# retiros y despues el resultado.
 TTL_REUNION = int(os.getenv("TTL_REUNION", str(12 * 60 * 60)))
 TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
+TTL_CARRERA_SIN_CORRER = int(os.getenv("TTL_SIN_CORRER", str(40 * 60)))
+
+
+def _cuanto_vale_guardada(data):
+    """
+    Cuanto tiempo sirve lo guardado de esta carrera.
+    Con resultado, todo el dia. Sin resultado, 40 minutos.
+    """
+    try:
+        if any(p.get("puesto") for p in (data or {}).get("participantes", [])):
+            return TTL_CARRERA
+    except Exception:
+        pass
+    return TTL_CARRERA_SIN_CORRER
 
 def cache_get(clave, ttl_seg):
     con = db()
@@ -1952,8 +1967,13 @@ def carrera():
             raise ValueError("carrera no encontrada")
         return data
 
+    # Cuanto vale lo guardado depende de si ya se corrio: con resultado
+    # sirve todo el dia, sin resultado hay que volver a pedirla.
+    guardada, _ = cache_get(clave, TTL_CARRERA)
+    cuanto = _cuanto_vale_guardada(guardada)
+
     try:
-        data, origen = con_cache(clave, TTL_CARRERA, forzar, traer)
+        data, origen = con_cache(clave, cuanto, forzar, traer)
         resp = {"ok": True, **data}
         if origen == "cache_vencido":
             resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
@@ -4258,7 +4278,8 @@ def _guardar_una_carrera(url, numero, forzar=False):
     """Trae una carrera y la deja guardada. True si salio bien."""
     clave = f"carrera:{url}:{numero}"
     if not forzar:
-        guardada, fresca = cache_get(clave, TTL_CARRERA)
+        guardada, _ = cache_get(clave, TTL_CARRERA)
+        _, fresca = cache_get(clave, _cuanto_vale_guardada(guardada))
         if guardada is not None and fresca:
             return True
     try:
@@ -4313,7 +4334,8 @@ def traer_las_que_vienen(forzar=False):
                 # Y cada carrera con sus competidores.
                 for c in carreras:
                     clave = f"carrera:{reunion['url']}:{c['numero']}"
-                    guardada, fresca = cache_get(clave, TTL_CARRERA)
+                    guardada, _ = cache_get(clave, TTL_CARRERA)
+                    _, fresca = cache_get(clave, _cuanto_vale_guardada(guardada))
                     if guardada is not None and fresca and not forzar:
                         continue
                     try:
