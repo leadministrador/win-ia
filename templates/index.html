@@ -742,6 +742,13 @@
     width:22px; height:22px; border-radius:50%; color:#fff;
     font-family:'Space Mono',monospace; font-size:10px; font-weight:700;
   }
+  .ir-caballo{
+    background:none; border:none; padding:0; cursor:pointer;
+    font-family:inherit; font-size:inherit; font-weight:inherit;
+    color:var(--verde-turf); text-align:left;
+    border-bottom:1px dotted var(--bronce);
+  }
+  .ir-caballo:hover{ color:var(--carmin); }
   .nombre-cab{ font-family:'Fraunces',serif; font-weight:600; }
   .cpos{ font-family:'Space Mono',monospace; font-size:11px; color:var(--carmin); white-space:nowrap; }
   .acame{
@@ -2391,10 +2398,29 @@ async function alternarRetirado(nombre){
 function renderCompetidores(participantes){
   const list = document.getElementById('comp-list');
   list.innerHTML = '';
-  participantes.forEach((cp,idx)=>{
+
+  // Si la carrera ya se corrió, se ordenan por cómo llegaron: el ganador
+  // primero. Si todavía no corrió, por su número, como los publica el
+  // boletín. Esto es SOLO para mostrar: el pronóstico se calcula aparte
+  // y siempre ordenando por número, para que el resultado no lo influya.
+  const yaSeCorrio = participantes.some(p => p.puesto != null);
+  const enOrden = yaSeCorrio
+    ? [...participantes].sort((a, b) => {
+        // Los que no llegaron (retirados o sin puesto) van al final.
+        const pa = a.puesto == null ? 9999 : a.puesto;
+        const pb = b.puesto == null ? 9999 : b.puesto;
+        if (pa !== pb) return pa - pb;
+        return (a.numero || 0) - (b.numero || 0);
+      })
+    : participantes;
+
+  enOrden.forEach((cp,idx)=>{
     const bloque = document.createElement('div');
     bloque.className = 'comp-bloque';
-    bloque.id = 'comp-bloque-' + idx;
+    // El número guarda a QUÉ caballo corresponde, aunque en
+    // pantalla estén en otro orden.
+    const iReal = participantes.indexOf(cp);
+    bloque.id = 'comp-bloque-' + iReal;
 
     const numDisplay = cp.numero != null ? cp.numero : (idx+1);
     const subtitulo = cp.retirado
@@ -2425,7 +2451,7 @@ function renderCompetidores(participantes){
 
     bloque.innerHTML = `
       <div class="comp-item" style="opacity:${cp.retirado ? '0.45' : '1'}"
-           onclick="abrirFicha(participantesActuales[${idx}], ${idx})">
+           onclick="abrirFicha(participantesActuales[${iReal}], ${iReal})">
         <div class="silk" style="background:${cp.retirado ? '#999' : silks[idx % silks.length]}">${numDisplay}</div>
         <div style="min-width:0;">
           <div class="comp-nombre">${cp.nombre}</div>
@@ -2440,13 +2466,13 @@ function renderCompetidores(participantes){
           ${(soyAdmin && !cp.retirado && !yaCorrio)
             ? `<button class="btn-oficial ${oficial ? 'cargado' : ''}"
                   title="Cargar peso y herraje (oficial)"
-                  onclick="event.stopPropagation(); abrirOficial(${idx})"
+                  onclick="event.stopPropagation(); abrirOficial(${iReal})"
                >⚙</button>`
             : ''}
           ${(!cp.retirado && !yaCorrio)
             ? `<button class="btn-datos-cab ${tieneDatos?'cargado':''}"
                   title="Cargar lo que ves en el paddock"
-                  onclick="event.stopPropagation(); abrirDatosCaballo(${idx})"
+                  onclick="event.stopPropagation(); abrirDatosCaballo(${iReal})"
                >${tieneDatos ? '✓' : '+'}</button>
                <button class="btn-retirar ${marcadoRetirado(cp.nombre)?'activo':''}"
                   title="Marcar como retirado"
@@ -2455,7 +2481,7 @@ function renderCompetidores(participantes){
             : ''}
         </div>
       </div>
-      <div class="panel-datos" id="panel-datos-${idx}"></div>`;
+      <div class="panel-datos" id="panel-datos-${iReal}"></div>`;
 
     if (marcadoRetirado(cp.nombre)) bloque.classList.add('retirado-por-mi');
     list.appendChild(bloque);
@@ -2995,6 +3021,13 @@ function limpiarBuscador(){
   inp.focus();
 }
 
+// Al tocar un caballo de la tabulada, se abre su campaña.
+// Antes se cierra la tabulada, para no dejar dos ventanas encimadas.
+function verCaballoDeTabulada(nombre, perfil){
+  cerrarTabulada();
+  setTimeout(() => abrirFichaPorNombre(perfil), 250);
+}
+
 async function abrirFichaPorNombre(perfil){
   mostrarBarra('Trayendo la campaña completa', 'Abriendo la ficha');
   try{
@@ -3298,7 +3331,11 @@ async function abrirTabulada(i, c){
     return `<tr class="${esYo?'fila-yo':''}">
       <td class="p-num ${cls}">${pos}º</td>
       <td><span class="n-bola" style="background:${COLORES_TAB[idx%8]}">${f.numero||'-'}</span></td>
-      <td class="nombre-cab">${f.nombre}${esYo?'<span class="acame">acá</span>':''}</td>
+      <td class="nombre-cab">${f.perfil
+        ? `<button class="ir-caballo" onclick="verCaballoDeTabulada('${
+            (f.nombre||'').replace(/'/g,"\\'")}','${f.perfil}')"
+            title="Ver su campaña">${f.nombre}</button>`
+        : f.nombre}${esYo?'<span class="acame">acá</span>':''}</td>
       <td class="cpos">${f.cuerpos||''}</td>
       <td class="cpos">${f.acumulado||''}</td>
       <td class="pago-cel">${f.pago ? '$'+f.pago : ''}</td>
