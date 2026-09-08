@@ -1038,6 +1038,22 @@ PESOS_INICIALES = {
     "horario_favorable": 4.0,
     # Distancia: no es lo mismo un caballo de 1000 que uno de 2000 metros.
     "distancia_favorable": 6.0,
+
+    # ---------- LAS NUEVAS ----------
+    # Arrancan TODAS EN CERO a proposito: no se sabe todavia si sirven.
+    # El afinamiento las prueba contra las carreras reales y las sube
+    # solo si de verdad hacen acertar mas. Si no, quedan en cero y no
+    # molestan. Asi ninguna puede empeorar el pronostico.
+    "tiempo_bueno": 0.0,        # tardo menos que los demas en esa distancia
+    "edad_favorable": 0.0,      # como le fue a la edad que tiene hoy
+    "padre_ganador": 0.0,       # como andan los hijos de su padre
+    "madre_ganadora": 0.0,      # lo mismo por el lado de la madre
+    "categoria_alta": 0.0,      # viene de correr contra mejores
+    "condicion_conocida": 0.0,  # ya corrio este tipo de carrera
+    "sexo_favorable": 0.0,      # en carreras mixtas
+    "kilos_conocidos": 0.0,     # como le fue con este peso encima
+    "pago_bajo": 0.0,           # el publico lo daba favorito
+    "importe_ganado": 0.0,      # cuanta plata junto en su campaña
 }
 
 def cargar_pesos():
@@ -1099,8 +1115,26 @@ def score_horse(h, context, pesos=None):
         # Premia la experiencia, con tope.
         score += min(8, corridas * 0.7)
         reasons.append(f"{corridas} carreras corridas")
-    if any(x in campaign for x in ["palermo","san isidro","la plata"]):
-        score += P["hipodromos_principales"]
+    # Como le fue EN ESTE hipodromo, no solo si corrio en uno grande.
+    # Antes sumaba puntos por haber corrido en Palermo o San Isidro,
+    # sin mirar el resultado. Eso no distinguia a nadie.
+    hip_hoy = normalize_text(context.get("hipodromo", ""))
+    if hip_hoy and h.get("carreras"):
+        aca = [c for c in h.get("carreras", [])
+               if c.get("puesto")
+               and normalize_text(c.get("hipodromo", "")) == hip_hoy]
+        if len(aca) >= 2:
+            entro = sum(1 for c in aca if c["puesto"] <= 3)
+            if entro >= len(aca) * 0.5:
+                score += P["hipodromos_principales"]
+                reasons.append(
+                    f"en esta pista entró {entro} de {len(aca)} veces")
+            elif entro == 0:
+                score -= P["hipodromos_principales"] * 0.7
+                reasons.append("en esta pista todavía no entró entre los tres")
+    elif any(x in campaign for x in ["palermo","san isidro","la plata"]):
+        # Respaldo: si no hay campaña cargada, lo de antes.
+        score += P["hipodromos_principales"] * 0.4
         reasons.append("experiencia en hipódromos principales")
     # Peso relativo al resto de la carrera (no un umbral fijo).
     peso_propio = _to_float(h.get("peso"))
@@ -1406,6 +1440,188 @@ def score_horse(h, context, pesos=None):
             # Nunca corrio esa distancia: es una incognita.
             score -= P["distancia_favorable"] * 0.4
             reasons.append(f"nunca corrió en {int(dist_hoy)} metros")
+
+    # ============================================================
+    # LAS VARIABLES NUEVAS
+    # Todas arrancan en cero. Si el peso es cero, no suman ni restan
+    # ni aparecen como motivo: es como si no existieran. El
+    # afinamiento las sube solo si miden que sirven.
+    # ============================================================
+
+    def _seg(t):
+        """Pasa un tiempo del tipo 1'24\"35 a segundos."""
+        if not t:
+            return None
+        m = re.match(r"(?:(\d+)['´])?\s*(\d+)[\"”]?\s*(\d+)?", str(t).strip())
+        if not m:
+            return None
+        try:
+            mins = int(m.group(1) or 0)
+            segs = int(m.group(2) or 0)
+            cent = int((m.group(3) or "0")[:2])
+            return mins * 60 + segs + cent / 100
+        except (ValueError, TypeError):
+            return None
+
+    # --- 1) EL TIEMPO ---
+    # Lo mas directo que hay: cuanto tardo de verdad en esta distancia.
+    if P["tiempo_bueno"] and dist_hoy and h.get("carreras"):
+        mios = []
+        for c in h.get("carreras", []):
+            d = _to_float(c.get("distancia"))
+            s = _seg(c.get("tiempo"))
+            if d and s and abs(d - dist_hoy) <= 100:
+                mios.append(s / d * 1000)   # segundos cada mil metros
+        if mios:
+            mi_ritmo = min(mios)
+            # Contra el resto de la carrera.
+            otros = []
+            for x in context.get("participantes", []):
+                for c in (x.get("carreras") or []):
+                    d = _to_float(c.get("distancia"))
+                    s = _seg(c.get("tiempo"))
+                    if d and s and abs(d - dist_hoy) <= 100:
+                        otros.append(s / d * 1000)
+            if len(otros) >= 5:
+                promedio = sum(otros) / len(otros)
+                if mi_ritmo < promedio - 0.5:
+                    score += P["tiempo_bueno"]
+                    reasons.append("corrió esta distancia más rápido que el promedio")
+                elif mi_ritmo > promedio + 0.5:
+                    score -= P["tiempo_bueno"] * 0.7
+                    reasons.append("sus tiempos en esta distancia son flojos")
+
+    # --- 2) LA EDAD ---
+    edad = _to_float(h.get("edad"))
+    if P["edad_favorable"] and edad:
+        # Los de 4 y 5 suelen estar en su mejor momento.
+        if 4 <= edad <= 6:
+            score += P["edad_favorable"]
+            reasons.append(f"{int(edad)} años, en su mejor momento")
+        elif edad >= 9:
+            score -= P["edad_favorable"] * 0.8
+            reasons.append(f"ya tiene {int(edad)} años")
+        elif edad <= 2:
+            score -= P["edad_favorable"] * 0.4
+            reasons.append("todavía es muy joven")
+
+    # --- 3 y 4) PADRE Y MADRE ---
+    # Como andan los otros hijos de esa sangre. Sirve sobre todo con
+    # los que casi no corrieron.
+    for quien, peso_clave in (("padre", "padre_ganador"),
+                              ("madre", "madre_ganadora")):
+        if not P[peso_clave]:
+            continue
+        sangre = normalize_text(h.get(quien, ""))
+        if not sangre or len(sangre) < 3:
+            continue
+        # Los hermanos que corren hoy en esta misma carrera.
+        hermanos = [
+            x for x in context.get("participantes", [])
+            if normalize_text(x.get(quien, "")) == sangre
+            and x.get("nombre") != h.get("nombre")
+        ]
+        if hermanos:
+            gana = sum(x.get("victorias", 0) or 0 for x in hermanos)
+            corre = sum(x.get("corridas", 0) or 0 for x in hermanos)
+            if corre >= 10 and gana / corre >= 0.15:
+                score += P[peso_clave]
+                reasons.append(f"su {quien} da ganadores")
+
+    # --- 5) LA CATEGORIA ---
+    # No es lo mismo venir de un clasico que de un condicional.
+    ESCALA = {"grupo": 5, "clasico": 4, "especial": 3,
+              "condicional": 2, "handicap": 2, "invitacion": 1}
+
+    def _nivel(txt):
+        t = normalize_text(txt or "")
+        for nombre, n in ESCALA.items():
+            if nombre in t:
+                return n
+        return 0
+
+    if P["categoria_alta"] and h.get("carreras"):
+        niveles = [_nivel(c.get("categoria_txt") or c.get("categoria"))
+                   for c in h.get("carreras", [])[:8]]
+        niveles = [n for n in niveles if n]
+        if niveles:
+            mi_nivel = max(niveles)
+            hoy_nivel = _nivel(context.get("categoria", ""))
+            if hoy_nivel and mi_nivel > hoy_nivel:
+                score += P["categoria_alta"]
+                reasons.append("viene de correr en categorías más altas")
+            elif hoy_nivel and mi_nivel < hoy_nivel:
+                score -= P["categoria_alta"] * 0.6
+                reasons.append("sube de categoría")
+
+    # --- 6) LA CONDICION ---
+    if P["condicion_conocida"] and h.get("carreras"):
+        cond_hoy = normalize_text(context.get("condicion", ""))[:30]
+        if cond_hoy:
+            iguales = [c for c in h.get("carreras", [])
+                       if cond_hoy in normalize_text(c.get("condicion", ""))
+                       and c.get("puesto")]
+            if len(iguales) >= 2:
+                entro = sum(1 for c in iguales if c["puesto"] <= 3)
+                if entro >= len(iguales) * 0.5:
+                    score += P["condicion_conocida"]
+                    reasons.append("anduvo bien en carreras de esta condición")
+
+    # --- 7) EL SEXO ---
+    if P["sexo_favorable"]:
+        mio = normalize_text(h.get("sexo") or h.get("sexo_tabla", ""))
+        if mio:
+            sexos = [normalize_text(x.get("sexo") or x.get("sexo_tabla", ""))
+                     for x in context.get("participantes", [])]
+            sexos = [s for s in sexos if s]
+            # En carreras mixtas, ver si es de los pocos de su sexo.
+            if len(set(sexos)) > 1 and len(sexos) >= 5:
+                cuantos = sexos.count(mio)
+                if cuantos <= len(sexos) * 0.3:
+                    score += P["sexo_favorable"]
+                    reasons.append("corre contra caballos de otro sexo")
+
+    # --- 8) LOS KILOS ---
+    peso_hoy = _to_float(h.get("peso"))
+    if P["kilos_conocidos"] and peso_hoy and h.get("carreras"):
+        parecidos = [c for c in h.get("carreras", [])
+                     if c.get("puesto") and _to_float(c.get("kilos"))
+                     and abs(_to_float(c.get("kilos")) - peso_hoy) <= 1.5]
+        if len(parecidos) >= 2:
+            entro = sum(1 for c in parecidos if c["puesto"] <= 3)
+            if entro >= len(parecidos) * 0.5:
+                score += P["kilos_conocidos"]
+                reasons.append(f"con {peso_hoy:.0f} kilos encima anduvo bien")
+
+    # --- 9) LO QUE PAGO ---
+    # Si pagaba poco, el publico lo daba favorito. Y muchas veces acierta.
+    if P["pago_bajo"] and h.get("carreras"):
+        pagos = [_to_float(str(c.get("pago", "")).replace("$", ""))
+                 for c in h.get("carreras", [])[:6]]
+        pagos = [p for p in pagos if p and p > 0]
+        if len(pagos) >= 3:
+            promedio = sum(pagos) / len(pagos)
+            if promedio <= 4:
+                score += P["pago_bajo"]
+                reasons.append("suele salir entre los favoritos")
+            elif promedio >= 20:
+                score -= P["pago_bajo"] * 0.6
+                reasons.append("casi siempre sale muy pagador")
+
+    # --- 10) LA PLATA GANADA ---
+    if P["importe_ganado"]:
+        def _plata(t):
+            n = re.sub(r"[^\d]", "", str(t or ""))
+            return float(n) if n else 0.0
+        mia = _plata(h.get("ganado"))
+        if mia:
+            otras = [_plata(x.get("ganado")) for x in context.get("participantes", [])]
+            otras = [x for x in otras if x]
+            if len(otras) >= 3:
+                promedio = sum(otras) / len(otras)
+                if mia >= promedio * 1.8:
+                    score += P["importe_ganado"]
+                    reasons.append("ganó bastante más plata que el resto")
 
     # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
     # Sin esto, los genericos tapan a los que de verdad explican el puesto.
@@ -2316,6 +2532,9 @@ def analizar():
         "pista_dia": data.get("pista_dia", ""),
         "hora": data.get("hora", ""),
         "distancia": data.get("distancia", ""),
+        "hipodromo": hipodromo,
+        "categoria": data.get("categoria", ""),
+        "condicion": data.get("condicion", ""),
     }
     for campo in OPCIONES_CONDICIONES:
         contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
@@ -2638,6 +2857,7 @@ def _carreras_para_aprender(limite=None):
             "pista": f["pista"] or "",
             "fecha": f["fecha"] or "",
             "distancia": f["distancia"] or "",
+            "hipodromo": f["hipodromo"] or "",
         })
 
     APRENDIZAJE["carreras_sin_campana"] = sin_campana
@@ -2662,7 +2882,8 @@ def _cuanto_acierta(carreras, pesos):
                 corredores,
                 {"participantes": corredores,
                  "pista_dia": c["estado"], "pista": c["pista"],
-                 "distancia": c.get("distancia", "")},
+                 "distancia": c.get("distancia", ""),
+                 "hipodromo": c.get("hipodromo", "")},
                 pesos,
             )
         except Exception:
@@ -5647,7 +5868,10 @@ def guardar_carrera_historica(url):
                 {"participantes": con_campana,
                  "pista_dia": detalle.get("estado_txt") or data.get("estado", ""),
                  "hora": detalle.get("hora", ""),
-                 "distancia": data.get("distancia", "")},
+                 "distancia": data.get("distancia", ""),
+                 "hipodromo": hip,
+                 "categoria": detalle.get("categoria_txt") or data.get("categoria", ""),
+                 "condicion": detalle.get("condicion_txt") or data.get("condicion", "")},
                 pesos,
             )
             registrar_pronostico(
