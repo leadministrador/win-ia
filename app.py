@@ -2785,7 +2785,7 @@ def rankear(participantes, contexto, pesos):
 
 # Para saber por que el afinamiento sirve o no, sin adivinar.
 APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0,
-               "ultima_vez_con": 0}
+               "ultima_vez_con": 0, "ultima_vez_fichas": 0}
 
 
 def _carreras_para_aprender(limite=None):
@@ -2919,11 +2919,20 @@ def ajustar_algoritmo():
 
     # Si no hay carreras nuevas desde la ultima vez, no tiene sentido
     # hacer todo el calculo otra vez: daria exactamente lo mismo.
-    if todas and len(todas) == APRENDIZAJE.get("ultima_vez_con", 0):
+    # Si no hay nada nuevo, no tiene sentido hacer todo el calculo de
+    # nuevo: daria lo mismo.
+    # OJO: hay que mirar las FICHAS tambien, no solo las carreras. Cada
+    # ficha nueva trae el tiempo, la edad, el padre de ese caballo, y eso
+    # cambia el resultado aunque las carreras sean las mismas.
+    fichas_ahora = APRENDIZAJE.get("fichas_disponibles", 0)
+    if (todas
+            and len(todas) == APRENDIZAJE.get("ultima_vez_con", 0)
+            and fichas_ahora == APRENDIZAJE.get("ultima_vez_fichas", 0)):
         return {"ok": False, "sin_novedades": True,
-                "motivo": (f"No hay carreras nuevas desde la última vez "
-                           f"(las mismas {len(todas)}). Afinar de nuevo "
-                           "daría el mismo resultado.")}
+                "motivo": (f"No hay nada nuevo desde la última vez: "
+                           f"las mismas {len(todas)} carreras y "
+                           f"{fichas_ahora} fichas de caballos. "
+                           "Afinar de nuevo daría el mismo resultado.")}
 
     if len(todas) < 60:
         sin = APRENDIZAJE.get("carreras_sin_campana", 0)
@@ -3008,6 +3017,7 @@ def ajustar_algoritmo():
         guardar_pesos(pesos)
 
     APRENDIZAJE["ultima_vez_con"] = len(todas)
+    APRENDIZAJE["ultima_vez_fichas"] = APRENDIZAJE.get("fichas_disponibles", 0)
 
     # El acierto final, medido contra TODAS las carreras.
     fin_g, fin_t = _cuanto_acierta(todas, pesos)
