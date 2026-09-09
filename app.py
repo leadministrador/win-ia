@@ -5622,19 +5622,23 @@ def _marcar_hecho(url):
 
 def _siguiente_de_la_cola():
     """
-    Lo proximo a visitar. Va de lo MAS NUEVO a lo mas viejo: primero se
-    completa 2026, despues 2025, despues 2024. Asi el historico crece en
-    orden y siempre se tiene lo mas reciente, que es lo que mas se parece
-    a las carreras de hoy.
-    Las carreras van antes que los caballos: una carrera guarda datos
-    enseguida, un caballo solo abre camino.
+    Lo proximo a visitar.
+
+    Primero los CABALLOS, despues las carreras. Es al reves de como
+    estaba, y por un motivo: habia 10.957 carreras guardadas pero solo
+    904 fichas de caballos. Y en la ficha esta el tiempo, la edad, el
+    padre, la categoria... o sea todo lo que el algoritmo necesita para
+    medir si esas variables sirven. Sin ficha, esas variables no se
+    pueden usar.
+
+    Dentro de cada tipo, de lo mas nuevo a lo mas viejo.
     """
     try:
         con = db()
         fila = con.execute("""
             SELECT url, tipo FROM por_explorar
             WHERE hecho=0 AND intentos < 3
-            ORDER BY (tipo='carrera') DESC,
+            ORDER BY (tipo='caballo') DESC,
                      (fecha IS NULL OR fecha='') ASC,
                      fecha DESC,
                      rowid ASC
@@ -5961,6 +5965,58 @@ def _contar_pendientes():
         return 0
 
 
+def _fichas_que_faltan(tope=3000):
+    """
+    Busca los caballos que aparecen en carreras YA GUARDADAS pero que
+    todavia no tienen su ficha, y los pone en la cola.
+
+    Es lo que desbloquea las variables nuevas: el tiempo, la edad, el
+    padre, la categoria y las demas salen de la ficha, no de la carrera.
+    Sin ficha, el algoritmo no las puede medir y quedan en cero.
+
+    No pide nada al sitio: solo mira lo que ya esta en la base.
+    """
+    try:
+        con = db()
+        # Los que ya tienen ficha.
+        tengo = {f["perfil"] for f in
+                 con.execute("SELECT perfil FROM fichas").fetchall()}
+        # Los que ya estan anotados para visitar.
+        en_cola = {f["url"] for f in
+                   con.execute("SELECT url FROM por_explorar "
+                               "WHERE tipo='caballo'").fetchall()}
+        # Los que aparecen en las carreras guardadas.
+        filas = con.execute(
+            "SELECT participantes FROM historico "
+            "WHERE participantes IS NOT NULL"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return 0
+
+    faltan = []
+    vistos = set()
+    for f in filas:
+        try:
+            for p in json.loads(f["participantes"]):
+                perfil = p.get("perfil", "")
+                if (perfil and perfil not in tengo and perfil not in en_cola
+                        and perfil not in vistos):
+                    vistos.add(perfil)
+                    faltan.append(perfil)
+                    if len(faltan) >= tope:
+                        break
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(faltan) >= tope:
+            break
+
+    for perfil in faltan:
+        _sumar_a_la_cola(perfil, "caballo")
+
+    return len(faltan)
+
+
 def _completar_lo_que_falta():
     """
     Las carreras guardadas antes de tener la tabla de fichas quedaron
@@ -6065,6 +6121,15 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
 
     try:
         # Si no hay nada por hacer, se busca por donde empezar.
+        # Antes de nada, sumar las fichas que faltan de lo que ya hay.
+        # Es lo que le da al algoritmo el tiempo, la edad, el padre.
+        try:
+            nuevas = _fichas_que_faltan()
+            if nuevas:
+                HISTORICO["ultimo"] = f"Anotadas {nuevas} fichas que faltaban."
+        except Exception:
+            pass
+
         if _contar_pendientes() == 0:
             try:
                 rehacer = _completar_lo_que_falta()
