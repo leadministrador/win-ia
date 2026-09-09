@@ -3095,7 +3095,7 @@ def admin_rendimiento():
         SELECT fecha, hipodromo, numero, ranking, resultado,
                acierto_ganador, aciertos_top4, comparado_en
         FROM pronosticos WHERE resultado IS NOT NULL
-        ORDER BY id DESC LIMIT 40
+        ORDER BY id DESC LIMIT 20
     """).fetchall()
     pesos_actuales = con.execute(
         "SELECT clave, valor, actualizado_en FROM algoritmo ORDER BY clave"
