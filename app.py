@@ -243,6 +243,7 @@ def init_db():
       perfil TEXT PRIMARY KEY,        -- la direccion de su ficha
       nombre TEXT,
       carreras TEXT,                  -- toda su campaña, en JSON
+      datos TEXT,                     -- edad, sexo, padre, madre... en JSON
       actualizada_en TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS por_explorar(
@@ -266,6 +267,10 @@ def init_db():
         cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
         if cols_cola and "fecha" not in cols_cola:
             con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
+        cols_fic = [f[1] for f in con.execute(
+            "PRAGMA table_info(fichas)").fetchall()]
+        if cols_fic and "datos" not in cols_fic:
+            con.execute("ALTER TABLE fichas ADD COLUMN datos TEXT")
         cols_sus = [f[1] for f in con.execute(
             "PRAGMA table_info(suscripciones_pago)").fetchall()]
         if cols_sus and "plan" not in cols_sus:
@@ -2785,7 +2790,8 @@ def rankear(participantes, contexto, pesos):
 
 # Para saber por que el afinamiento sirve o no, sin adivinar.
 APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0,
-               "ultima_vez_con": 0, "ultima_vez_fichas": 0}
+               "fichas_completas": 0,
+               "ultima_vez_con": 0, "ultima_vez_fichas": (0, 0)}
 
 
 def _carreras_para_aprender(limite=None):
@@ -2811,14 +2817,20 @@ def _carreras_para_aprender(limite=None):
 
     # Las campañas se leen UNA vez y quedan en memoria: un caballo aparece
     # en muchas carreras y seria absurdo buscarlo cada vez.
-    fichas = {}
+    fichas, datos_caballo = {}, {}
     try:
         con = db()
-        for f in con.execute("SELECT perfil, carreras FROM fichas").fetchall():
+        for f in con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall():
             try:
                 fichas[f["perfil"]] = json.loads(f["carreras"])
             except (json.JSONDecodeError, TypeError):
                 pass
+            # Edad, sexo, padre y madre de ese caballo.
+            if f["datos"]:
+                try:
+                    datos_caballo[f["perfil"]] = json.loads(f["datos"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
         con.close()
     except Exception:
         pass
@@ -2838,6 +2850,13 @@ def _carreras_para_aprender(limite=None):
         completos, con_datos = [], 0
         for p in ps:
             h = dict(p)
+            # Sus datos propios: edad, sexo, padre, madre.
+            propios = datos_caballo.get(p.get("perfil", ""))
+            if propios:
+                for k, v in propios.items():
+                    if v and not h.get(k):
+                        h[k] = v
+
             camp = fichas.get(p.get("perfil", ""))
             if camp:
                 h["carreras"] = camp
@@ -2862,6 +2881,9 @@ def _carreras_para_aprender(limite=None):
 
     APRENDIZAJE["carreras_sin_campana"] = sin_campana
     APRENDIZAJE["fichas_disponibles"] = len(fichas)
+    # Cuantas fichas tienen ya los datos completos: si esto cambia, hay
+    # que volver a afinar aunque la cantidad de fichas sea la misma.
+    APRENDIZAJE["fichas_completas"] = len(datos_caballo)
     return carreras
 
 
@@ -2924,14 +2946,15 @@ def ajustar_algoritmo():
     # OJO: hay que mirar las FICHAS tambien, no solo las carreras. Cada
     # ficha nueva trae el tiempo, la edad, el padre de ese caballo, y eso
     # cambia el resultado aunque las carreras sean las mismas.
-    fichas_ahora = APRENDIZAJE.get("fichas_disponibles", 0)
+    fichas_ahora = (APRENDIZAJE.get("fichas_disponibles", 0),
+                    APRENDIZAJE.get("fichas_completas", 0))
     if (todas
             and len(todas) == APRENDIZAJE.get("ultima_vez_con", 0)
             and fichas_ahora == APRENDIZAJE.get("ultima_vez_fichas", 0)):
         return {"ok": False, "sin_novedades": True,
                 "motivo": (f"No hay nada nuevo desde la última vez: "
                            f"las mismas {len(todas)} carreras y "
-                           f"{fichas_ahora} fichas de caballos. "
+                           f"{fichas_ahora[0]} fichas de caballos. "
                            "Afinar de nuevo daría el mismo resultado.")}
 
     if len(todas) < 60:
@@ -3017,7 +3040,9 @@ def ajustar_algoritmo():
         guardar_pesos(pesos)
 
     APRENDIZAJE["ultima_vez_con"] = len(todas)
-    APRENDIZAJE["ultima_vez_fichas"] = APRENDIZAJE.get("fichas_disponibles", 0)
+    APRENDIZAJE["ultima_vez_fichas"] = (
+        APRENDIZAJE.get("fichas_disponibles", 0),
+        APRENDIZAJE.get("fichas_completas", 0))
 
     # El acierto final, medido contra TODAS las carreras.
     fin_g, fin_t = _cuanto_acierta(todas, pesos)
@@ -5805,6 +5830,9 @@ def guardar_carrera_historica(url):
         if m:
             hip = nombre_hipodromo(m.group(1))
 
+    # TODO lo que se leyo de cada caballo. Antes se guardaba solo una
+    # parte y se perdian datos que el algoritmo necesita para medir:
+    # la edad, la forma, los dias sin correr, la efectividad.
     participantes = [{
         "nombre": p.get("nombre"),
         "numero": p.get("numero"),
@@ -5815,6 +5843,7 @@ def guardar_carrera_historica(url):
         "entrenador": p.get("entrenador"),
         "caballeriza": p.get("caballeriza"),
         "cuerpos": p.get("cuerpos"),
+        "acumulado": p.get("acumulado"),
         "pago": p.get("pago"),
         # La direccion de su ficha: con esto se busca su campaña guardada
         # a la hora de afinar. Sin esto no hay con que medir.
@@ -5822,6 +5851,16 @@ def guardar_carrera_historica(url):
         "rend_jockey": p.get("rend_jockey"),
         "rend_entrenador": p.get("rend_entrenador"),
         "rend_caballeriza": p.get("rend_caballeriza"),
+        # Lo que antes se perdia:
+        "edad": p.get("edad"),
+        "sexo_tabla": p.get("sexo_tabla"),
+        "forma": p.get("forma"),
+        "dias_sin_correr": p.get("dias_sin_correr"),
+        "campana_nums": p.get("campana_nums"),
+        "efectividad": p.get("efectividad"),
+        "ganado": p.get("ganado"),
+        "detalle": p.get("detalle"),
+        "retirado": p.get("retirado", False),
     } for p in data["participantes"] if not p.get("retirado")]
 
     detalle = {}
@@ -5924,6 +5963,10 @@ def explorar_caballo(url_perfil):
             if h and clean(h.get_text(" ")):
                 nombre = clean(h.get_text(" "))
                 break
+        # TODO lo que trae cada carrera de su campaña. Antes se guardaban
+        # solo 8 de los 20 datos, y se perdian el tiempo, la categoria,
+        # la condicion y el pago: justo lo que el algoritmo necesita para
+        # medir esas variables. Por eso quedaban en cero.
         livianas = [{
             "fecha": x.get("fecha", ""),
             "puesto": x.get("puesto"),
@@ -5933,12 +5976,32 @@ def explorar_caballo(url_perfil):
             "numero": x.get("numero", ""),
             "kilos": x.get("kilos", ""),
             "hipodromo": x.get("hipodromo", ""),
+            # Lo que antes se perdia:
+            "tiempo": x.get("tiempo", ""),
+            "categoria": x.get("categoria", ""),
+            "condicion": x.get("condicion", ""),
+            "pago": x.get("pago", ""),
+            "importe": x.get("importe", ""),
+            "premio": x.get("premio", ""),
+            "jockey": x.get("jockey", ""),
+            "caballeriza": x.get("caballeriza", ""),
+            "video": x.get("video", ""),
+            "enlace": x.get("enlace", ""),
+            "reunion": x.get("reunion", ""),
+            "hipodromo_codigo": x.get("hipodromo_codigo", ""),
         } for x in carreras]
+        # Los datos del caballo: edad, sexo, padre, madre. Antes no se
+        # guardaban, y por eso esas variables no se podian medir.
+        texto = clean(soup.get_text(" "))
+        propios = _resumen_del_perfil(soup, texto)
+
         con = db()
         con.execute("""
-            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, actualizada_en)
-            VALUES(?,?,?,?)
+            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, datos,
+                                          actualizada_en)
+            VALUES(?,?,?,?,?)
         """, (url_perfil, nombre, json.dumps(livianas, ensure_ascii=False),
+              json.dumps(propios, ensure_ascii=False),
               datetime.now().isoformat(timespec="seconds")))
         con.commit()
         con.close()
@@ -5973,6 +6036,58 @@ def _contar_pendientes():
         return n
     except Exception:
         return 0
+
+
+def _fichas_incompletas(tope=3000):
+    """
+    Las fichas guardadas antes de este cambio no tienen el tiempo, la
+    categoria, el pago ni los datos del caballo (edad, sexo, padre).
+    Sin eso, el algoritmo no puede medir esas variables.
+    Esto las vuelve a poner en la cola para completarlas.
+    No pide nada al sitio: solo mira la base.
+    """
+    try:
+        con = db()
+        filas = con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall()
+        en_cola = {f["url"] for f in
+                   con.execute("SELECT url FROM por_explorar "
+                               "WHERE tipo='caballo' AND hecho=0").fetchall()}
+        con.close()
+    except Exception:
+        return 0
+
+    rehacer = []
+    for f in filas:
+        if f["perfil"] in en_cola:
+            continue
+        # Sin los datos del caballo, o sin el tiempo en sus carreras.
+        falta = not f["datos"]
+        if not falta:
+            try:
+                cs = json.loads(f["carreras"] or "[]")
+                falta = bool(cs) and "tiempo" not in (cs[0] or {})
+            except (json.JSONDecodeError, TypeError, IndexError):
+                falta = True
+        if falta:
+            rehacer.append(f["perfil"])
+            if len(rehacer) >= tope:
+                break
+
+    if not rehacer:
+        return 0
+    try:
+        con = db()
+        for perfil in rehacer:
+            con.execute("""
+                INSERT INTO por_explorar(url, tipo, hecho, intentos, agregado_en)
+                VALUES(?,'caballo',0,0,?)
+                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0
+            """, (perfil, datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        return 0
+    return len(rehacer)
 
 
 def _fichas_que_faltan(tope=3000):
@@ -6134,9 +6249,13 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
         # Antes de nada, sumar las fichas que faltan de lo que ya hay.
         # Es lo que le da al algoritmo el tiempo, la edad, el padre.
         try:
+            # Primero completar las que quedaron a medias, despues las
+            # que faltan del todo.
+            viejas = _fichas_incompletas()
             nuevas = _fichas_que_faltan()
-            if nuevas:
-                HISTORICO["ultimo"] = f"Anotadas {nuevas} fichas que faltaban."
+            if viejas or nuevas:
+                HISTORICO["ultimo"] = (
+                    f"Anotadas {nuevas} fichas nuevas y {viejas} para completar.")
         except Exception:
             pass
 
