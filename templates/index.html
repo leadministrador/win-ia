@@ -1841,9 +1841,8 @@
         <input type="radio" name="plan" value="pago"
                onchange="elegirPlan('pago')">
         <div class="ep-txt">
-          <div class="ep-tit" id="ep-precio">Suscribirme</div>
-          <div class="ep-sub">Todo, todos los días. Se renueva solo,
-            cancelás cuando quieras.</div>
+          <div class="ep-tit">Suscribirme</div>
+          <div class="ep-sub">Elegís el plan después de crear la cuenta.</div>
         </div>
       </label>
 
@@ -4267,26 +4266,7 @@ function elegirPlan(cual){
   planElegido = cual;
 }
 
-async function ponerElPrecio(){
-  // El precio se toma del panel, no escrito a mano acá: si no, al
-  // cambiarlo en el panel esta pantalla seguía mostrando el viejo.
-  try{
-    const d = await apiGet('/api/mi-suscripcion');
-    const plan = (d.planes || []).find(p => p.clave === 'normal');
-    const precio = plan ? plan.precio : d.precio;
-    const el = document.getElementById('ep-precio');
-    if (el && precio){
-      el.textContent = 'Suscribirme · $'
-        + Number(precio).toLocaleString('es-AR') + ' por mes';
-    }
-  }catch(e){
-    const el = document.getElementById('ep-precio');
-    if (el) el.textContent = 'Suscribirme';
-  }
-}
-
 async function ajustarOpcionPrueba(){
-  ponerElPrecio();
   try{
     const d = await apiGet('/api/promocion');
     hayPromocionHoy = !!d.hay && !d.ya_la_use;
