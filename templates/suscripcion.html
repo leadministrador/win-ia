@@ -62,6 +62,26 @@
   .est-sub{ font-size:15px; opacity:.8; margin-top:6px; }
 
   /* ===== LOS TRES CUADROS ===== */
+  .caja-correo{
+    background:var(--hueso); border-radius:12px; padding:18px 18px 16px;
+    margin-bottom:16px; box-shadow:0 6px 20px rgba(21,56,50,.13);
+    border-left:5px solid var(--bronce);
+  }
+  .cor-rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6;
+    margin-bottom:9px;
+  }
+  .caja-correo input{
+    width:100%; font-family:'Archivo',sans-serif; font-size:16px;
+    padding:14px 15px; border:1.5px solid var(--pergamino-2);
+    border-radius:8px; background:var(--pergamino); color:var(--tinta);
+  }
+  .caja-correo input:focus{ outline:2px solid var(--bronce); outline-offset:-1px; }
+  .cor-ayuda{
+    font-size:13.5px; line-height:1.6; opacity:.8; margin-top:11px;
+  }
+  .cor-ayuda b{ color:var(--verde-turf); }
   .plan{
     background:var(--hueso); border-radius:12px; padding:24px 20px 22px;
     margin-bottom:16px; box-shadow:0 6px 20px rgba(21,56,50,.13);
@@ -191,6 +211,16 @@
     </button>
   </div>
 
+  <div class="caja-correo" id="caja-correo" style="display:none;">
+    <div class="cor-rot">Tu correo — no es obligatorio</div>
+    <input type="email" id="correo" autocomplete="email"
+           placeholder="tucorreo@ejemplo.com">
+    <div class="cor-ayuda" id="cor-ayuda">
+      <b>Con correo:</b> se te cobra solo cada mes, no tenés que acordarte.<br>
+      <b>Sin correo:</b> pagás un mes y después volvés a pagar cuando quieras.
+    </div>
+  </div>
+
   {% for p in planes %}
   <div class="plan{% if p.destacado %} destacado{% endif %}" id="plan-{{ p.clave }}">
     {% if p.destacado %}
@@ -298,6 +328,13 @@ async function verEstado(){
     caja.style.display = 'block';
     btnCan.style.display = 'none';
 
+    // El correo solo se pide al que va a pagar.
+    const cajaCorreo = document.getElementById('caja-correo');
+    if (cajaCorreo){
+      cajaCorreo.style.display =
+        (d.ingresado && !d.al_dia && !d.es_admin) ? 'block' : 'none';
+    }
+
     if (!d.ingresado){
       caja.className = 'estado sin-pagar';
       rot.textContent = 'Todavía no entraste';
@@ -346,6 +383,11 @@ async function verEstado(){
   }catch(e){ /* si falla, queda la pantalla como está */ }
 }
 
+function elCorreo(){
+  const c = document.getElementById('correo');
+  return c ? c.value.trim() : '';
+}
+
 function nombreDe(clave){
   const p = ((miEstado || {}).planes || []).find(x => x.clave === clave);
   return p ? p.nombre : clave;
@@ -373,7 +415,7 @@ async function suscribirme(plan){
   try{
     const r = await fetch('/api/suscribirme', {
       method:'POST', headers: cabeceras(),
-      body: JSON.stringify({plan: plan})
+      body: JSON.stringify({plan: plan, correo: elCorreo()})
     });
     const d = await r.json();
     if (d.ok === false){
