@@ -3012,15 +3012,33 @@ def ajustar_algoritmo():
     for clave in sorted(pesos.keys()):
         inicial = PESOS_INICIALES[clave]
         actual = pesos[clave]
-        piso, techo = abs(inicial) * 0.3, abs(inicial) * 2.5
-        if inicial < 0:
-            piso, techo = -techo, -piso
+
+        # Hasta donde puede moverse cada peso.
+        #
+        # OJO con las que arrancan en CERO: antes el limite era el 30% y
+        # el 250% del valor de fabrica, o sea CERO y CERO. Subian a 0.5 y
+        # el limite las recortaba de vuelta a 0. Nunca podian salir de
+        # cero, por mas que la variable sirviera. Once variables quedaron
+        # muertas asi.
+        #
+        # Las que arrancan en cero se mueven entre 0 y 12: el afinamiento
+        # decide si valen algo o se quedan en cero.
+        if inicial == 0:
+            piso, techo = 0.0, float(os.getenv("TECHO_NUEVAS", "12"))
+        else:
+            piso, techo = abs(inicial) * 0.3, abs(inicial) * 2.5
+            if inicial < 0:
+                piso, techo = -techo, -piso
 
         # Se prueban tres valores: mas alto, mas bajo, y en cero.
         candidatos = []
         paso = max(abs(inicial) * 0.35, 0.5)
+        # Las que arrancan en cero necesitan un paso mas grande: con 0.5
+        # casi no se nota el efecto y el afinamiento lo descarta.
+        if inicial == 0:
+            paso = float(os.getenv("PASO_NUEVAS", "2.5"))
         for nuevo in (actual + paso, actual - paso, 0.0):
-            if inicial >= 0:
+            if techo >= piso:
                 nuevo = max(piso, min(techo, nuevo))
             else:
                 nuevo = min(piso, max(techo, nuevo))
@@ -3073,6 +3091,9 @@ def ajustar_algoritmo():
         "carreras_usadas": len(todas),
         "carreras_sin_campana": APRENDIZAJE.get("carreras_sin_campana", 0),
         "fichas_guardadas": APRENDIZAJE.get("fichas_disponibles", 0),
+        # Cuantas de esas fichas tienen ya los datos nuevos: edad, sexo,
+        # padre, madre. Sin eso, 7 de las variables no se pueden medir.
+        "fichas_completas": APRENDIZAJE.get("fichas_completas", 0),
         "grupo_prueba": len(grupo_a),
         "grupo_verificacion": len(grupo_b),
         # Lo que importa: acertar el ganador.
@@ -6435,7 +6456,9 @@ def admin_ajuste_estado():
     d.pop("ok", None)
     return jsonify(ok=True, corriendo=False, **d,
                    mensaje=(f"Listo. Probado contra {d['carreras_usadas']} "
-                            f"carreras. Acierto del GANADOR: "
+                            f"carreras y {d.get('fichas_completas', 0)} de "
+                            f"{d.get('fichas_guardadas', 0)} fichas completas. "
+                            f"Acierto del GANADOR: "
                             f"{d['ganador_antes']}% → {d['ganador_ahora']}%. "
                             f"Entre los cuatro: {d['top4_antes']}% → "
                             f"{d['top4_ahora']}%. "
