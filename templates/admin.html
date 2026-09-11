@@ -135,6 +135,41 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .peso-rot{
+    font-family:'Space Mono',monospace; font-size:10px;
+    text-transform:uppercase; letter-spacing:.09em; opacity:.6;
+    margin-bottom:9px;
+  }
+  .peso-fila{
+    display:flex; align-items:center; gap:10px; padding:4px 0;
+  }
+  .peso-nom{
+    flex:0 0 44%; font-size:14px; line-height:1.3;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .peso-barra{
+    flex:1; height:7px; background:var(--pergamino-2);
+    border-radius:4px; overflow:hidden;
+  }
+  .peso-barra i{
+    display:block; height:100%; background:var(--verde-turf);
+    border-radius:4px;
+  }
+  .peso-barra.neg i{ background:var(--carmin); }
+  .peso-val{
+    flex:0 0 46px; text-align:right;
+    font-family:'Space Mono',monospace; font-size:12.5px;
+  }
+  .peso-val.neg{ color:var(--carmin); }
+  .peso-cero{
+    font-family:'Space Mono',monospace; font-size:11.5px;
+    line-height:1.8; opacity:.55;
+  }
+  .peso-pie{
+    font-family:'Space Mono',monospace; font-size:10.5px;
+    opacity:.5; margin-top:14px; padding-top:11px;
+    border-top:1px solid var(--pergamino-2);
+  }
   .dia-fila{
     display:flex; justify-content:space-between; align-items:center;
     gap:12px; padding:11px 0; border-bottom:1px solid var(--pergamino-2);
@@ -399,6 +434,15 @@
     <div class="progreso-txt" id="ajuste-estado" style="margin-top:10px;"></div>
     <div id="hist-anios" style="margin-top:14px;"></div>
   </div>
+  <h2>Los pesos del algoritmo</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Cuánto vale cada cosa al pronosticar. Se ajustan solos con los
+    resultados. Los que están en cero todavía no se pudieron medir.
+  </p>
+  <div class="caja-recolector">
+    <div id="tabla-pesos"></div>
+  </div>
+
   <h2>Recolección automática</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Recorre las carreras del Stud Book sola y las compara contra el resultado.
@@ -681,11 +725,6 @@
   <h2>Últimas carreras comparadas</h2>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
 
-  <h2>Estado del algoritmo</h2>
-  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
-    Estos valores se ajustan solos a medida que se acumulan resultados.
-  </p>
-  <div id="tabla-pesos"></div>
 </div>
 
 <script>
@@ -752,19 +791,40 @@ function pintarUltimas(lista){
 function pintarPesos(pesos){
   const cont = document.getElementById('tabla-pesos');
   if (!pesos.length){ cont.innerHTML = '<div class="estado">Sin datos.</div>'; return; }
-  const max = Math.max(...pesos.map(p=>Math.abs(p.valor))) || 1;
-  let html = '<table><tr><th>Factor</th><th>Peso actual</th><th></th><th>Actualizado</th></tr>';
-  pesos.forEach(p=>{
-    const nombre = p.clave.replace(/_/g,' ');
-    const ancho = Math.abs(p.valor)/max*100;
-    html += `<tr>
-      <td>${nombre}</td>
-      <td class="mono">${Number(p.valor).toFixed(2)}</td>
-      <td><div class="barra-peso"><div style="width:${ancho}%"></div></div></td>
-      <td class="mono" style="font-size:11px; opacity:.6;">${p.actualizado_en || ''}</td>
-    </tr>`;
-  });
-  cont.innerHTML = html + '</table>';
+
+  // Compacto y ordenado por lo que más pesa: así se ve de un vistazo
+  // qué está moviendo el pronóstico. Antes era una tabla larga con la
+  // fecha repetida en cada fila, que ocupaba media pantalla.
+  const orden = [...pesos].sort(
+    (a, b) => Math.abs(b.valor) - Math.abs(a.valor));
+  const max = Math.max(...pesos.map(p => Math.abs(p.valor))) || 1;
+  const usados = orden.filter(p => Number(p.valor) !== 0);
+  const enCero = orden.filter(p => Number(p.valor) === 0);
+  const cuando = (pesos[0] || {}).actualizado_en || '';
+
+  const fila = p => {
+    const nombre = p.clave.replace(/_/g, ' ');
+    const v = Number(p.valor);
+    const ancho = Math.abs(v) / max * 100;
+    return `<div class="peso-fila">
+      <span class="peso-nom">${nombre}</span>
+      <span class="peso-barra ${v < 0 ? 'neg' : ''}">
+        <i style="width:${ancho}%"></i></span>
+      <span class="peso-val ${v < 0 ? 'neg' : ''}">${v.toFixed(2)}</span>
+    </div>`;
+  };
+
+  cont.innerHTML =
+    `<div class="peso-rot">Los que están pesando · ${usados.length}</div>`
+    + usados.map(fila).join('')
+    + (enCero.length
+        ? `<div class="peso-rot" style="margin-top:14px;">
+             En cero · ${enCero.length}</div>
+           <div class="peso-cero">${
+             enCero.map(p => p.clave.replace(/_/g,' ')).join(' · ')}</div>`
+        : '')
+    + (cuando ? `<div class="peso-pie">Última vez: ${
+        cuando.replace('T', ' a las ').slice(0, 19)}</div>` : '');
 }
 
 // ---------- Recolector automatico ----------
