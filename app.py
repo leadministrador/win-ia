@@ -219,6 +219,14 @@ def init_db():
       creada_en TEXT NOT NULL,
       actualizada_en TEXT
     );
+    CREATE TABLE IF NOT EXISTS contactos(
+      usuario_id INTEGER PRIMARY KEY,
+      correo TEXT,
+      telefono TEXT,
+      quiere_avisos INTEGER DEFAULT 1,   -- si acepta que le escribamos
+      guardado_en TEXT NOT NULL,
+      actualizado_en TEXT
+    );
     CREATE TABLE IF NOT EXISTS pagos(
       id TEXT PRIMARY KEY,            -- el numero del pago en Mercado Pago
       usuario_id INTEGER,
@@ -3823,8 +3831,8 @@ def _validar_registro(usuario, clave, telefono=""):
         return "El usuario no puede tener más de 24 letras."
     if not re.fullmatch(r"[A-Za-z0-9_.\- ]+", usuario):
         return "El usuario solo puede tener letras, números, guiones y puntos."
-    if len(clave) < 4:
-        return "La contraseña tiene que tener al menos 4 caracteres."
+    if len(clave) < 6:
+        return "La contraseña tiene que tener al menos 6 caracteres."
     error_tel = _validar_telefono(telefono)
     if error_tel:
         return error_tel
@@ -4036,7 +4044,7 @@ def admin_resetear_clave():
     d = request.get_json(silent=True) or {}
     usuario = clean(d.get("usuario", ""))
     nueva = d.get("clave", "")
-    if not usuario or len(nueva) < 4:
+    if not usuario or len(nueva) < 6:
         return jsonify(ok=False,
                        error="Falta el usuario o la clave es muy corta."), 400
 
@@ -5029,9 +5037,9 @@ def api_clave_nueva():
     if not pedido:
         return jsonify(ok=False,
                        error="Este enlace ya venció o se usó. Pedí uno nuevo."), 410
-    if len(nueva) < 4:
+    if len(nueva) < 6:
         return jsonify(ok=False,
-                       error="La contraseña tiene que tener al menos 4 caracteres."), 400
+                       error="La contraseña tiene que tener al menos 6 caracteres."), 400
 
     con = db()
     con.execute("UPDATE usuarios SET clave_hash=? WHERE id=?",
@@ -7334,6 +7342,98 @@ def api_mi_suscripcion():
     )
 
 
+def _guardar_contacto(usuario_id, correo="", quiere_avisos=True):
+    """
+    Guarda el correo de quien se suscribe, junto a su telefono.
+    Sirve para poder avisarle de novedades o de un problema con el pago.
+    """
+    try:
+        con = db()
+        f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                        (usuario_id,)).fetchone()
+        tel = f["telefono"] if f else ""
+        ahora = datetime.now().isoformat(timespec="seconds")
+        con.execute("""
+            INSERT INTO contactos(usuario_id, correo, telefono, quiere_avisos,
+                                  guardado_en, actualizado_en)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(usuario_id) DO UPDATE SET
+              correo=COALESCE(NULLIF(excluded.correo,''), contactos.correo),
+              telefono=excluded.telefono,
+              actualizado_en=excluded.actualizado_en
+        """, (usuario_id, correo, tel, 1 if quiere_avisos else 0, ahora, ahora))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _cobro_de_una_vez(u, plan, clave_plan, sitio):
+    """
+    Cobro por unica vez, para el que no quiso dar su correo.
+
+    Mercado Pago no permite la suscripcion automatica sin un correo de
+    verdad. Asi que en ese caso se cobra un mes suelto: paga, tiene
+    acceso 30 dias, y despues vuelve a pagar cuando quiera.
+    """
+    datos = {
+        "items": [{
+            "title": f"LEA WIN IA — plan {plan['nombre']} (1 mes)",
+            "quantity": 1,
+            "unit_price": float(plan["precio"]),
+            "currency_id": "ARS",
+        }],
+        "external_reference": f"usuario-{u['id']}-{clave_plan}",
+        "back_urls": {
+            "success": f"{sitio}/suscripcion?pago=listo",
+            "pending": f"{sitio}/suscripcion?pago=pendiente",
+            "failure": f"{sitio}/suscripcion?pago=fallo",
+        },
+        "auto_return": "approved",
+        "notification_url": f"{sitio}/api/pago-aviso",
+        "statement_descriptor": "LEA WIN IA",
+    }
+
+    ok, r = _mp("POST", "/checkout/preferences", datos)
+    if not ok:
+        try:
+            print("=" * 60, flush=True)
+            print("MERCADO PAGO RECHAZO EL PAGO DE UNA VEZ", flush=True)
+            print(f"  se mando : {json.dumps(datos, ensure_ascii=False)}", flush=True)
+            print(f"  contesto : {json.dumps(r, ensure_ascii=False)}", flush=True)
+            print("=" * 60, flush=True)
+        except Exception:
+            pass
+        return jsonify(ok=False, error="No se pudo armar el cobro.",
+                       detalle=str(r)[:400]), 502
+
+    donde = r.get("init_point") or r.get("sandbox_init_point", "")
+    if not donde:
+        return jsonify(ok=False,
+                       error="Mercado Pago no devolvió la dirección de pago."), 502
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='pendiente', id_mercadopago=excluded.id_mercadopago,
+          monto=excluded.monto, plan=excluded.plan,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "pendiente", r.get("id", ""), float(plan["precio"]),
+          clave_plan, ahora, ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, pagar_en=donde, id=r.get("id", ""),
+                   plan=clave_plan, de_una_vez=True,
+                   aviso=("Vas a pagar un mes. Para que se te cobre solo "
+                          "cada mes, dejanos tu correo."))
+
+
 @app.post("/api/suscribirme")
 def api_suscribirme():
     """
@@ -7348,7 +7448,7 @@ def api_suscribirme():
         return jsonify(ok=False,
                        error="El cobro todavía no está habilitado."), 503
 
-    # Que plan quiere. Si no dice nada, el normal.
+    # Que plan quiere y con que correo. Si no dice nada, el normal.
     d = request.get_json(silent=True) or {}
     clave_plan = clean(d.get("plan", "")) or "normal"
     plan = plan_por_clave(clave_plan)
@@ -7362,10 +7462,29 @@ def api_suscribirme():
                        error=f"Ya tenés el plan {plan['nombre']} al día."), 400
 
     sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
+
+    # El correo decide COMO se cobra.
+    #
+    # Mercado Pago exige un correo de verdad para armar la suscripcion
+    # automatica: con uno inventado la rechaza ("guest_site_mismatch").
+    # Por eso:
+    #   - con correo  -> suscripcion, se le cobra solo cada mes
+    #   - sin correo  -> pago suelto, tiene que volver a pagar cada mes
+    correo = clean(d.get("correo", ""))[:120]
+    if correo and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", correo):
+        return jsonify(ok=False, error="Ese correo no parece válido."), 400
+
+    # Se guarda para el contacto, lo use o no para el cobro.
+    if correo:
+        _guardar_contacto(u["id"], correo)
+
+    if not correo:
+        return _cobro_de_una_vez(u, plan, clave_plan, sitio)
+
     datos = {
         "reason": f"LEA WIN IA — plan {plan['nombre']}",
         "external_reference": f"usuario-{u['id']}-{clave_plan}",
-        "payer_email": f"usuario{u['id']}@win-ia.com.ar",
+        "payer_email": correo,
         "back_url": f"{sitio}/suscripcion",
         "auto_recurring": {
             "frequency": 1,
