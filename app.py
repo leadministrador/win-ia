@@ -1065,24 +1065,35 @@ PESOS_INICIALES = {
     "distancia_favorable": 6.0,
 
     # ---------- LAS NUEVAS ----------
-    # Arrancan TODAS EN CERO a proposito: no se sabe todavia si sirven.
-    # El afinamiento las prueba contra las carreras reales y las sube
-    # solo si de verdad hacen acertar mas. Si no, quedan en cero y no
-    # molestan. Asi ninguna puede empeorar el pronostico.
-    "tiempo_bueno": 0.0,        # tardo menos que los demas en esa distancia
-    "edad_favorable": 0.0,      # como le fue a la edad que tiene hoy
-    "padre_ganador": 0.0,       # como andan los hijos de su padre
-    "madre_ganadora": 0.0,      # lo mismo por el lado de la madre
-    "categoria_alta": 0.0,      # viene de correr contra mejores
-    "condicion_conocida": 0.0,  # ya corrio este tipo de carrera
-    "sexo_favorable": 0.0,      # en carreras mixtas
-    "kilos_conocidos": 0.0,     # como le fue con este peso encima
-    "pago_bajo": 0.0,           # el publico lo daba favorito
-    "importe_ganado": 0.0,      # cuanta plata junto en su campaña
+    # Arrancan PRENDIDAS en 4, no en cero.
+    #
+    # Por que: en cero no se usaban para nada, y habia que esperar a que
+    # el afinamiento las midiera para que sirvieran. Asi arrancan
+    # trabajando desde el primer dia, con lo poco que haya, y el
+    # afinamiento las sube o las baja con el tiempo segun lo que midan.
+    #
+    # Si una no sirve, el afinamiento la va a bajar sola.
+    "tiempo_bueno": 4.0,        # tardo menos que los demas en esa distancia
+    "edad_favorable": 4.0,      # como le fue a la edad que tiene hoy
+    "padre_ganador": 4.0,       # como andan los hijos de su padre
+    "madre_ganadora": 4.0,      # lo mismo por el lado de la madre
+    "categoria_alta": 4.0,      # viene de correr contra mejores
+    "condicion_conocida": 4.0,  # ya corrio este tipo de carrera
+    "sexo_favorable": 4.0,      # en carreras mixtas
+    "kilos_conocidos": 4.0,     # como le fue con este peso encima
+    "pago_bajo": 4.0,           # el publico lo daba favorito
+    "importe_ganado": 4.0,      # cuanta plata junto en su campaña
 }
 
 def cargar_pesos():
-    """Lee los pesos del algoritmo. Si no existen todavia, usa los iniciales."""
+    """
+    Lee los pesos del algoritmo. Si no existen todavia, usa los iniciales.
+
+    OJO con las variables nuevas: si en la base quedaron en CERO porque
+    antes arrancaban asi, se prenden con su valor de fabrica. Si no,
+    seguirian apagadas para siempre y no se usarian nunca.
+    Una vez que el afinamiento las toque, manda lo que diga la base.
+    """
     try:
         con = db()
         filas = con.execute("SELECT clave, valor FROM algoritmo").fetchall()
@@ -1091,7 +1102,13 @@ def cargar_pesos():
     except Exception:
         guardados = {}
     pesos = dict(PESOS_INICIALES)
-    pesos.update({k: v for k, v in guardados.items() if k in PESOS_INICIALES})
+    for k, v in guardados.items():
+        if k not in PESOS_INICIALES:
+            continue
+        # Si quedo en cero pero de fabrica vale algo, se prende.
+        if v == 0 and PESOS_INICIALES[k] != 0:
+            continue
+        pesos[k] = v
     return pesos
 
 def guardar_pesos(pesos):
@@ -3009,7 +3026,15 @@ def ajustar_algoritmo():
     mejor_b = puntaje(base_gb, base_tb)
     cambios, descartados = [], []
 
-    for clave in sorted(pesos.keys()):
+    # Para ver como va desde el panel, y para no perder el avance si
+    # Render corta la tarea a la mitad.
+    orden = sorted(pesos.keys())
+    AJUSTE["total"] = len(orden)
+    AJUSTE["hechas"] = 0
+
+    for n_var, clave in enumerate(orden, 1):
+        AJUSTE["hechas"] = n_var
+        AJUSTE["paso"] = f"probando {clave.replace('_',' ')}"
         inicial = PESOS_INICIALES[clave]
         actual = pesos[clave]
 
@@ -3072,6 +3097,14 @@ def ajustar_algoritmo():
                 "ganador": round((ga + gb) / 2, 2),
                 "top4": round((ta + tb) / 2, 2),
             })
+            # Se guarda EN EL MOMENTO, no al final: si Render corta la
+            # tarea, lo aprendido hasta acá no se pierde.
+            try:
+                guardar_pesos(pesos)
+                AJUSTE["ultimo_cambio"] = (
+                    f"{clave.replace('_',' ')}: {round(actual,2)} → {nuevo}")
+            except Exception:
+                pass
             break   # se pasa al siguiente peso
 
     if cambios:
@@ -6119,10 +6152,15 @@ def _fichas_incompletas(tope=3000):
     try:
         con = db()
         for perfil in rehacer:
+            # La fecha 9999 las manda al principio de la cola: son las
+            # que desbloquean las variables del algoritmo, asi que van
+            # antes que los caballos nuevos.
             con.execute("""
-                INSERT INTO por_explorar(url, tipo, hecho, intentos, agregado_en)
-                VALUES(?,'caballo',0,0,?)
-                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0
+                INSERT INTO por_explorar(url, tipo, fecha, hecho, intentos,
+                                         agregado_en)
+                VALUES(?,'caballo','9999-12-31',0,0,?)
+                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0,
+                                               fecha='9999-12-31'
             """, (perfil, datetime.now().isoformat(timespec="seconds")))
         con.commit()
         con.close()
@@ -6387,22 +6425,31 @@ def recolectar_historico():
 
 
 # Estado del ultimo afinamiento, para consultarlo sin esperar.
-AJUSTE = {"corriendo": False, "resultado": None, "empezo": ""}
+AJUSTE = {"corriendo": False, "resultado": None, "empezo": "",
+          "paso": "", "hechas": 0, "total": 0, "ultimo_cambio": ""}
 
 
 def _afinar_en_segundo_plano():
     """
-    Afina sin hacer esperar a la pantalla. Con miles de carreras esto
-    puede tardar minutos, y el servidor corta las esperas largas.
+    Afina sin hacer esperar a la pantalla.
+
+    OJO: Render MATA las tareas de fondo cada tanto. Por eso el avance
+    se va guardando: si lo corta, al volver a tocar Afinar sigue donde
+    quedo en vez de empezar de nuevo. Antes se quedaba en "Probando"
+    para siempre y nunca terminaba.
     """
     AJUSTE["corriendo"] = True
     AJUSTE["empezo"] = ahora_argentina().strftime("%H:%M:%S")
+    AJUSTE["paso"] = "leyendo las carreras"
+    AJUSTE["hechas"] = 0
+    AJUSTE["total"] = 0
     try:
         AJUSTE["resultado"] = ajustar_algoritmo()
     except Exception as e:
         AJUSTE["resultado"] = {"ok": False, "motivo": str(e)[:200]}
     finally:
         AJUSTE["corriendo"] = False
+        AJUSTE["paso"] = ""
 
 
 @app.route("/api/admin/ajustar", methods=["GET", "POST"])
@@ -6439,8 +6486,18 @@ def admin_ajuste_estado():
         return jsonify(ok=False, error="Acceso restringido."), 403
     r = AJUSTE["resultado"]
     if AJUSTE["corriendo"]:
-        return jsonify(ok=True, corriendo=True, empezo=AJUSTE["empezo"],
-                       mensaje="Probando cada variable contra las carreras…")
+        hechas = AJUSTE.get("hechas", 0)
+        total = AJUSTE.get("total", 0)
+        return jsonify(
+            ok=True, corriendo=True, empezo=AJUSTE["empezo"],
+            hechas=hechas, total=total,
+            paso=AJUSTE.get("paso", ""),
+            ultimo_cambio=AJUSTE.get("ultimo_cambio", ""),
+            mensaje=((f"Va {hechas} de {total} variables. "
+                      f"Ahora: {AJUSTE.get('paso','')}."
+                      + (f" Último cambio: {AJUSTE['ultimo_cambio']}."
+                         if AJUSTE.get("ultimo_cambio") else ""))
+                     if total else "Leyendo las carreras…"))
     if not r:
         return jsonify(ok=True, corriendo=False, sin_datos=True,
                        mensaje="Todavía no se afinó nada en esta sesión.")
@@ -7321,8 +7378,20 @@ def api_suscribirme():
 
     ok, r = _mp("POST", "/preapproval", datos)
     if not ok:
+        # Queda anotado en los registros de Render para poder ver QUE
+        # rechazo Mercado Pago. Sin esto solo se sabia que fallo.
+        try:
+            print("=" * 60, flush=True)
+            print("MERCADO PAGO RECHAZO EL COBRO", flush=True)
+            print(f"  lo que se mando: {json.dumps(datos, ensure_ascii=False)}",
+                  flush=True)
+            print(f"  lo que contesto: {json.dumps(r, ensure_ascii=False)}",
+                  flush=True)
+            print("=" * 60, flush=True)
+        except Exception:
+            pass
         return jsonify(ok=False, error="No se pudo armar el cobro.",
-                       detalle=str(r)[:300]), 502
+                       detalle=str(r)[:400]), 502
 
     donde_pagar = r.get("init_point") or r.get("sandbox_init_point", "")
     if not donde_pagar:
@@ -7346,6 +7415,63 @@ def api_suscribirme():
 
     return jsonify(ok=True, pagar_en=donde_pagar, id=r.get("id", ""),
                    plan=clave_plan)
+
+
+@app.get("/api/admin/probar-mercadopago")
+def admin_probar_mercadopago():
+    """
+    Prueba la conexion con Mercado Pago y muestra QUE contesta.
+    Sirve para ver el motivo exacto de un rechazo, sin adivinar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    informe = {
+        "claves_cargadas": bool(MP_ACCESS_TOKEN),
+        "empieza_con": MP_ACCESS_TOKEN[:8] if MP_ACCESS_TOKEN else "",
+        "tipo": ("produccion" if MP_ACCESS_TOKEN.startswith("APP_USR")
+                 else "prueba" if MP_ACCESS_TOKEN.startswith("TEST")
+                 else "desconocido"),
+    }
+
+    # 1) ¿La clave sirve?
+    ok, r = _mp("GET", "/users/me")
+    informe["1_la_clave_sirve"] = ok
+    if ok:
+        informe["cuenta"] = {k: r.get(k) for k in
+                             ("id", "nickname", "site_id", "email")}
+    else:
+        informe["error_de_la_clave"] = r
+
+    # 2) Probar armar un cobro de verdad
+    sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
+    plan = plan_por_clave("normal") or {"nombre": "Normal", "precio": 1000}
+    prueba = {
+        "reason": f"LEA WIN IA — plan {plan['nombre']}",
+        "external_reference": "usuario-0-normal",
+        "payer_email": clean(request.args.get("correo", "")) or "test@test.com",
+        "back_url": f"{sitio}/suscripcion",
+        "auto_recurring": {
+            "frequency": 1, "frequency_type": "months",
+            "transaction_amount": float(plan["precio"]),
+            "currency_id": "ARS",
+        },
+        "status": "pending",
+    }
+    ok2, r2 = _mp("POST", "/preapproval", prueba)
+    informe["2_lo_que_se_manda"] = prueba
+    informe["2_se_pudo_armar"] = ok2
+    informe["2_lo_que_contesta"] = r2
+
+    if ok2 and r2.get("id"):
+        # Se cancela enseguida: era solo una prueba.
+        _mp("POST", f"/preapproval/{r2['id']}", {"status": "cancelled"})
+        informe["donde_pagaria"] = r2.get("init_point", "")
+
+    informe["QUE_PASA"] = (
+        "Todo bien: el cobro se puede armar." if ok2
+        else "Mercado Pago lo rechaza. Mirá 2_lo_que_contesta.")
+    return jsonify(ok=True, **informe)
 
 
 @app.post("/api/cancelar-suscripcion")
