@@ -391,8 +391,9 @@
   <h2>Carreras listas</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Las carreras se traen de madrugada y quedan guardadas, así el usuario
-    las abre al instante. Una hora antes de cada una se vuelven a pedir,
-    por si hubo retiros.
+    las abre al instante. Las que todavía no corrieron se revisan cada 40
+    minutos por si hubo un retiro o cambió el jockey; siguen guardadas
+    mientras tanto. Las que ya corrieron no se tocan más.
   </p>
 
   <div class="caja-recolector">
@@ -1243,12 +1244,14 @@ async function verCarrerasListas(){
 
     const total = d.fechas.reduce((s,f) => s + f.carreras, 0);
     const listas = d.fechas.reduce((s,f) => s + f.listas, 0);
+    const revisar = d.fechas.reduce((s,f) => s + (f.por_revisar||0), 0);
     const e = d.estado || {};
 
     document.getElementById('chips-listas').innerHTML = `
       <div class="chip-dato"><b>${listas} de ${total}</b>carreras listas</div>
       <div class="chip-dato"><b>${d.dias_publicados}</b>días publicados</div>
       <div class="chip-dato"><b>${d.espera_segundos}s</b>espera al sitio</div>
+      ${revisar ? `<div class="chip-dato"><b>${revisar}</b>a revisar</div>` : ''}
       ${e.ultima_vez ? `<div class="chip-dato"><b>${e.ultima_vez.slice(11)}</b>última vez</div>` : ''}`;
 
     document.getElementById('dias-listos').innerHTML = d.fechas.length
@@ -1263,7 +1266,8 @@ async function verCarrerasListas(){
                 <div class="dia-h">${f.reuniones.join(' · ')}</div>
               </div>
               <div class="dia-est ${ok ? 'ok' : 'falta'}">${
-                f.carreras ? f.listas + '/' + f.carreras : 'sin datos'}</div>
+                f.carreras ? f.listas + '/' + f.carreras : 'sin datos'}${
+                f.por_revisar ? ' · ' + f.por_revisar + ' a revisar' : ''}</div>
             </div>`;
         }).join('')
       : '<div class="progreso-txt">No hay carreras publicadas.</div>';
