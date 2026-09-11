@@ -3941,16 +3941,17 @@ def api_registro():
 
     # Un telefono, una sola cuenta. Sin esto una misma persona podria
     # hacerse diez cuentas y usar diez veces la prueba gratis.
-    otro = con.execute(
-        "SELECT usuario_visible FROM usuarios WHERE telefono=?",
-        (telefono,)).fetchone()
+    # No se dice DE QUIEN es la cuenta: cualquiera podria probar
+    # numeros al azar para averiguar quien tiene cuenta en la app.
+    otro = con.execute("SELECT 1 FROM usuarios WHERE telefono=?",
+                       (telefono,)).fetchone()
     if otro:
         con.close()
         return jsonify(
             ok=False, telefono_repetido=True,
-            usuario_existente=otro["usuario_visible"],
-            error=(f"Ese celular ya tiene una cuenta: «{otro['usuario_visible']}». "
-                   "Entrá con esa, o usá otro número."),
+            error=("Ese celular ya tiene una cuenta. Entrá con ella, o "
+                   "usá otro número. Si no te acordás el usuario, "
+                   "escribinos."),
         ), 409
 
     ahora = datetime.now().isoformat(timespec="seconds")
