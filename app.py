@@ -49,8 +49,28 @@ def fetch(url, espera=None):
     return BeautifulSoup(r.text, "html.parser")
 
 def db():
-    con = sqlite3.connect(DB)
+    """
+    Abre la base.
+
+    Dos cosas importantes, aprendidas de un error real: el historico
+    escribe miles de fichas seguidas, y mientras tanto alguien puede
+    estar usando la app. Sin esto, la app fallaba con "database is
+    locked" y no cargaba ni el calendario.
+
+    - timeout: si esta ocupada, ESPERA en vez de fallar.
+    - WAL: deja LEER mientras otro escribe. Sin esto, cada escritura
+      bloquea a todos los que quieren leer.
+    """
+    con = sqlite3.connect(DB, timeout=float(os.getenv("ESPERA_BASE", "20")))
     con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=20000")
+        # No esperar a que el disco confirme cada escritura: es mucho
+        # mas rapido y para esta app el riesgo es despreciable.
+        con.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return con
 
 def init_db():
