@@ -91,7 +91,7 @@
     <div class="campo">
       <label>Contraseña nueva</label>
       <input type="password" id="clave1" autocomplete="new-password"
-             placeholder="Al menos 4 caracteres">
+             placeholder="Al menos 6 caracteres">
     </div>
 
     <div class="campo">
@@ -132,8 +132,8 @@ async function guardar(){
   const btn = document.getElementById('btn');
 
   aviso.className = 'aviso mal';
-  if (c1.length < 4){
-    aviso.textContent = 'La contraseña tiene que tener al menos 4 caracteres.';
+  if (c1.length < 6){
+    aviso.textContent = 'La contraseña tiene que tener al menos 6 caracteres.';
     return;
   }
   if (c1 !== c2){
