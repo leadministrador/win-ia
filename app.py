@@ -307,6 +307,33 @@ def init_db():
     except Exception:
         pass
 
+    # Los telefonos guardados antes de limpiarlos bien: se emparejan
+    # ahora, para que el mismo numero escrito distinto no pase dos veces.
+    try:
+        ya = con.execute(
+            "SELECT valor FROM ajustes WHERE clave='telefonos_limpios'"
+        ).fetchone()
+        if not ya:
+            for f in con.execute(
+                    "SELECT id, telefono FROM usuarios "
+                    "WHERE telefono IS NOT NULL AND telefono != ''").fetchall():
+                limpio = _limpiar_telefono(f["telefono"])
+                if limpio and limpio != f["telefono"]:
+                    con.execute("UPDATE usuarios SET telefono=? WHERE id=?",
+                                (limpio, f["id"]))
+            for f in con.execute("SELECT telefono FROM pruebas_usadas").fetchall():
+                limpio = _limpiar_telefono(f["telefono"])
+                if limpio and limpio != f["telefono"]:
+                    con.execute(
+                        "UPDATE OR IGNORE pruebas_usadas SET telefono=? "
+                        "WHERE telefono=?", (limpio, f["telefono"]))
+            con.execute(
+                "INSERT OR REPLACE INTO ajustes(clave, valor, cambiado_en) "
+                "VALUES('telefonos_limpios','1',?)",
+                (datetime.now().isoformat(timespec="seconds"),))
+    except Exception:
+        pass
+
     # Si en Render se puso ADMIN_USUARIO, ese usuario queda como admin.
     # Asi no hay que marcarlo a mano la primera vez.
     admin_inicial = os.getenv("ADMIN_USUARIO", "").strip()
@@ -3799,10 +3826,49 @@ def usuario_actual():
 
 def _limpiar_telefono(bruto):
     """
-    Deja solo los digitos. Sirve para comparar y para guardar prolijo,
-    aunque el usuario escriba con guiones, espacios o parentesis.
+    Deja el numero limpio, para que el MISMO celular escrito de
+    distintas formas sea siempre el mismo.
+
+    En Argentina un celular se escribe de muchas maneras:
+        3584181338        como lo pedimos
+        03584181338       con el 0 adelante
+        358415181338      con el 15
+        +54 9 3584 181338 con el pais
+        3584-181338       con guion
+
+    Todos son el MISMO telefono. Sin esto, una persona podia hacerse
+    varias cuentas escribiendo su numero distinto cada vez, y usar la
+    prueba gratis otras tantas.
+
+    Queda: caracteristica + numero, sin 54, sin 9, sin 0 y sin 15.
     """
-    return re.sub(r"\D", "", bruto or "")
+    n = re.sub(r"\D", "", bruto or "")
+    if not n:
+        return ""
+
+    # El pais: +54 o 0054
+    if n.startswith("0054"):
+        n = n[4:]
+    elif n.startswith("54") and len(n) > 10:
+        n = n[2:]
+
+    # El 9 que va despues del pais para celulares
+    if n.startswith("9") and len(n) > 10:
+        n = n[1:]
+
+    # El 0 de larga distancia
+    if n.startswith("0"):
+        n = n[1:]
+
+    # El 15, que va DESPUES de la caracteristica. Las caracteristicas
+    # argentinas tienen 2, 3 o 4 cifras, asi que se prueba en ese orden.
+    if len(n) > 10:
+        for largo in (2, 3, 4):
+            if n[largo:largo + 2] == "15":
+                n = n[:largo] + n[largo + 2:]
+                break
+
+    return n
 
 
 def _validar_telefono(bruto):
