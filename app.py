@@ -6740,21 +6740,30 @@ def admin_carreras_guardadas():
     for r in proximas:
         f = r["fecha"]
         clave = f"reuniones:{f}:{normalize_text(r['hipodromo'])}"
-        guardado, fresco = cache_get(clave, TTL_REUNION)
-        cuantas, listas = 0, 0
+        guardado, _ = cache_get(clave, TTL_REUNION)
+        cuantas, listas, por_revisar = 0, 0, 0
         if guardado:
             for x in guardado:
                 for c in x.get("carreras", []):
                     cuantas += 1
                     cc = f"carrera:{r['url']}:{c['numero']}"
-                    g, fr = cache_get(cc, TTL_CARRERA)
-                    if g is not None and fr:
+                    g, _ = cache_get(cc, TTL_CARRERA)
+                    # LISTA = la tenemos guardada, el usuario la abre al
+                    # instante. Que hayan pasado 40 minutos no la borra:
+                    # solo significa que en la proxima pasada se revisa
+                    # por si hubo un retiro. Antes se contaban como
+                    # "no listas" y el panel mostraba 0 de 114.
+                    if g is not None:
                         listas += 1
+                        _, fresca = cache_get(cc, _cuanto_vale_guardada(g))
+                        if not fresca:
+                            por_revisar += 1
         por_fecha.setdefault(f, {"fecha": f, "reuniones": [], "carreras": 0,
-                                 "listas": 0})
+                                 "listas": 0, "por_revisar": 0})
         por_fecha[f]["reuniones"].append(_limpiar_nombre_hipodromo(r["hipodromo"]))
         por_fecha[f]["carreras"] += cuantas
         por_fecha[f]["listas"] += listas
+        por_fecha[f]["por_revisar"] += por_revisar
 
     fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"])
     return jsonify(ok=True, hoy=hoy, fechas=fechas,
