@@ -219,6 +219,20 @@ def init_db():
       creada_en TEXT NOT NULL,
       actualizada_en TEXT
     );
+    CREATE TABLE IF NOT EXISTS uso(
+      tipo TEXT NOT NULL,        -- pantalla | caballo | carrera | hipodromo
+      cosa TEXT NOT NULL,        -- que se miro
+      veces INTEGER DEFAULT 0,
+      primera_vez TEXT,
+      ultima_vez TEXT,
+      PRIMARY KEY(tipo, cosa)
+    );
+    CREATE TABLE IF NOT EXISTS uso_por_dia(
+      fecha TEXT NOT NULL,
+      tipo TEXT NOT NULL,
+      veces INTEGER DEFAULT 0,
+      PRIMARY KEY(fecha, tipo)
+    );
     CREATE TABLE IF NOT EXISTS contactos(
       usuario_id INTEGER PRIMARY KEY,
       correo TEXT,
@@ -2267,6 +2281,16 @@ def carrera():
 
     try:
         data, origen = con_cache(clave, cuanto, forzar, traer)
+        # Anotar que se miro esta carrera, para saber que interesa mas.
+        try:
+            f = meeting_date_from_url(url)
+            m = re.search(r"/\d{8}-([a-z\-]+?)-\d+", url)
+            hip = m.group(1).replace("-", " ").title() if m else ""
+            anotar_uso("carrera", f"{f} · {hip} · {numero}ª" if f else url[-40:])
+            if hip:
+                anotar_uso("hipodromo", hip)
+        except Exception:
+            pass
         resp = {"ok": True, **data}
         if origen == "cache_vencido":
             resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
@@ -2469,6 +2493,7 @@ def api_buscar_caballo():
             error=f"No se encontró ningún caballo con «{termino}».",
             resultados=[],
         ), 404
+    anotar_uso("pantalla", "buscar caballo")
     return jsonify(ok=True, resultados=resultados)
 
 
@@ -2532,6 +2557,7 @@ def api_caballo():
         caballo["proximas"] = proximas[:5]
         caballo["sin_proximas"] = len(proximas) == 0
 
+        anotar_uso("caballo", caballo.get("nombre", ""))
         cache_set(clave, caballo)
         return jsonify(ok=True, **caballo)
     except Exception as e:
@@ -8436,6 +8462,148 @@ def admin_exportar_usuarios():
         texto, mimetype="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{nombre}.csv"'},
     )
+
+
+# ============================================================
+# QUE SE USA MAS
+# Cuenta cuantas veces se mira cada cosa, para saber que le interesa
+# a la gente. NO guarda quien hizo que: solo el total.
+# Asi no hay datos personales de por medio.
+# ============================================================
+
+def anotar_uso(tipo, cosa=""):
+    """
+    Suma uno al contador de esa cosa. Nunca falla hacia afuera: si algo
+    sale mal, la app sigue andando igual.
+    """
+    try:
+        cosa = clean(str(cosa))[:120]
+        if not cosa:
+            cosa = "(sin nombre)"
+        ahora = datetime.now().isoformat(timespec="seconds")
+        hoy = hoy_argentina()
+        con = db()
+        con.execute("""
+            INSERT INTO uso(tipo, cosa, veces, primera_vez, ultima_vez)
+            VALUES(?,?,1,?,?)
+            ON CONFLICT(tipo, cosa) DO UPDATE SET
+              veces = uso.veces + 1, ultima_vez = excluded.ultima_vez
+        """, (tipo, cosa, ahora, ahora))
+        con.execute("""
+            INSERT INTO uso_por_dia(fecha, tipo, veces) VALUES(?,?,1)
+            ON CONFLICT(fecha, tipo) DO UPDATE SET veces = uso_por_dia.veces + 1
+        """, (hoy, tipo))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+@app.post("/api/uso")
+def api_anotar_uso():
+    """La pantalla avisa que se toco algo."""
+    d = request.get_json(silent=True) or {}
+    tipo = clean(d.get("tipo", ""))[:20]
+    if tipo not in ("pantalla", "caballo", "carrera", "hipodromo", "boton"):
+        return jsonify(ok=True), 200
+    anotar_uso(tipo, d.get("cosa", ""))
+    return jsonify(ok=True), 200
+
+
+@app.get("/api/admin/uso")
+def admin_uso():
+    """Que se usa mas, para verlo en el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    grupos = {}
+    for tipo in ("pantalla", "boton", "caballo", "carrera", "hipodromo"):
+        filas = con.execute("""
+            SELECT cosa, veces, ultima_vez FROM uso
+            WHERE tipo=? ORDER BY veces DESC LIMIT 30
+        """, (tipo,)).fetchall()
+        grupos[tipo] = [dict(f) for f in filas]
+
+    por_dia = con.execute("""
+        SELECT fecha, SUM(veces) veces FROM uso_por_dia
+        GROUP BY fecha ORDER BY fecha DESC LIMIT 30
+    """).fetchall()
+    total = con.execute("SELECT SUM(veces) t FROM uso").fetchone()["t"] or 0
+    cuantas = con.execute("SELECT COUNT(*) c FROM uso").fetchone()["c"]
+    con.close()
+
+    return jsonify(ok=True, grupos=grupos,
+                   por_dia=[dict(d) for d in por_dia],
+                   total=total, cosas_distintas=cuantas)
+
+
+@app.get("/api/admin/exportar-uso")
+def admin_exportar_uso():
+    """Baja lo que se usa como planilla o para programas."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+    formato = (request.args.get("formato", "csv") or "csv").lower()
+
+    con = db()
+    filas = con.execute("""
+        SELECT tipo, cosa, veces, primera_vez, ultima_vez FROM uso
+        ORDER BY tipo, veces DESC
+    """).fetchall()
+    dias = con.execute("""
+        SELECT fecha, tipo, veces FROM uso_por_dia ORDER BY fecha DESC
+    """).fetchall()
+    con.close()
+
+    nombre = f"uso-lea-win-ia-{hoy_argentina()}"
+
+    if formato == "json":
+        return Response(
+            json.dumps({"app": "LEA WIN IA", "fecha": hoy_argentina(),
+                        "uso": [dict(f) for f in filas],
+                        "por_dia": [dict(d) for d in dias]},
+                       ensure_ascii=False, indent=1),
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{nombre}.json"'},
+        )
+
+    def limpiar(v):
+        t = "" if v is None else str(v)
+        return t.replace(";", ",").replace("\n", " ")
+
+    lineas = ["Qué;Nombre;Veces;Primera vez;Última vez"]
+    for f in filas:
+        lineas.append(";".join([
+            limpiar(f["tipo"]), limpiar(f["cosa"]), limpiar(f["veces"]),
+            limpiar(f["primera_vez"]), limpiar(f["ultima_vez"])]))
+    lineas.append("")
+    lineas.append("POR DIA")
+    lineas.append("Fecha;Qué;Veces")
+    for d in dias:
+        lineas.append(";".join([limpiar(d["fecha"]), limpiar(d["tipo"]),
+                                limpiar(d["veces"])]))
+
+    texto = "\ufeff" + "\r\n".join(lineas)
+    return Response(
+        texto, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}.csv"'},
+    )
+
+
+@app.post("/api/admin/borrar-uso")
+def admin_borrar_uso():
+    """Empieza a contar de cero."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    n = con.execute("SELECT SUM(veces) t FROM uso").fetchone()["t"] or 0
+    con.execute("DELETE FROM uso")
+    con.execute("DELETE FROM uso_por_dia")
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Se borraron {n} toques. Empieza de cero.")
 
 
 @app.get("/api/videos")
