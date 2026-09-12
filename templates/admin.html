@@ -135,6 +135,10 @@
   .fila-exportar .btn{ flex:1; min-width:140px; text-align:center;
                        text-decoration:none; }
   .lista-usuarios{ margin-top:18px; }
+  .btn-borrar{
+    background:transparent; color:var(--carmin);
+    border:1.5px solid var(--pergamino-2);
+  }
   .peso-rot{
     font-family:'Space Mono',monospace; font-size:10px;
     text-transform:uppercase; letter-spacing:.09em; opacity:.6;
@@ -579,6 +583,27 @@
   </div>
 
 
+
+  <h2>Qué se usa más</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Cuántas veces se mira cada cosa. No se guarda quién hizo qué, solo
+    el total. Sirve para saber qué le interesa a la gente.
+  </p>
+
+  <div class="caja-recolector">
+    <div class="chips" id="chips-uso"></div>
+
+    <div class="fila-exportar">
+      <a class="btn btn-run" id="uso-csv" href="#">Bajar planilla</a>
+      <a class="btn btn-ghost" id="uso-json" href="#">Bajar para programas</a>
+    </div>
+
+    <div id="lista-uso" style="margin-top:16px;"></div>
+
+    <button class="btn btn-borrar" style="width:100%; margin-top:14px;"
+            onclick="borrarUso()">Empezar a contar de cero</button>
+    <div class="progreso-txt" id="uso-estado" style="margin-top:11px;"></div>
+  </div>
   <h2>Los planes</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Lo que ve el usuario en la pantalla de suscripción. Podés cambiar el
@@ -1298,6 +1323,93 @@ async function traerCarreras(todas){
   }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
 }
 
+
+// ---------- Qué se usa más ----------
+const NOMBRES_USO = {
+  pantalla: 'Pantallas', boton: 'Botones', caballo: 'Caballos',
+  carrera: 'Carreras', hipodromo: 'Hipódromos',
+};
+
+async function verUso(){
+  try{
+    const r = await fetch('/api/admin/uso?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+
+    const hoy = (d.por_dia || [])[0];
+    document.getElementById('chips-uso').innerHTML = `
+      <div class="chip-dato"><b>${(d.total||0).toLocaleString('es-AR')}</b>toques</div>
+      <div class="chip-dato"><b>${d.cosas_distintas||0}</b>cosas distintas</div>
+      ${hoy ? `<div class="chip-dato"><b>${hoy.veces}</b>hoy</div>` : ''}
+      <div class="chip-dato"><b>${(d.por_dia||[]).length}</b>días contados</div>`;
+
+    const base = '/api/admin/exportar-uso?clave=' + encodeURIComponent(clave);
+    document.getElementById('uso-csv').href = base + '&formato=csv';
+    document.getElementById('uso-json').href = base + '&formato=json';
+
+    let html = '';
+    for (const [tipo, nombre] of Object.entries(NOMBRES_USO)){
+      const lista = (d.grupos || {})[tipo] || [];
+      if (!lista.length) continue;
+      const id = 'uso-' + tipo;
+      html += `
+        <div class="u-grupo">
+          <button class="u-cab" onclick="abrirGrupo('${id}')">
+            <span class="u-flecha" id="${id}-f">▸</span>
+            <span class="u-tit">${nombre}</span>
+            <span class="u-cuenta">${lista.length}</span>
+          </button>
+          <div class="u-cuerpo" id="${id}">
+            ${lista.map(x => `
+              <div class="u-fila">
+                <div class="u-datos">
+                  <div class="u-nom">${x.cosa}</div>
+                  <div class="u-tel">${(x.ultima_vez||'').replace('T',' a las ').slice(0,19)}</div>
+                </div>
+                <div class="u-est paga">${x.veces}</div>
+              </div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    if ((d.por_dia || []).length){
+      html += `
+        <div class="u-grupo">
+          <button class="u-cab" onclick="abrirGrupo('uso-dias')">
+            <span class="u-flecha" id="uso-dias-f">▸</span>
+            <span class="u-tit">Por día</span>
+            <span class="u-cuenta">${d.por_dia.length}</span>
+          </button>
+          <div class="u-cuerpo" id="uso-dias">
+            ${d.por_dia.map(x => `
+              <div class="dia-fila">
+                <div class="dia-f">${alFechaCorta(x.fecha)}</div>
+                <div class="dia-est ok">${x.veces}</div>
+              </div>`).join('')}
+          </div>
+        </div>`;
+    }
+
+    document.getElementById('lista-uso').innerHTML = html ||
+      '<div class="progreso-txt">Todavía nadie usó la app. ' +
+      'Los números aparecen a medida que la gente entra.</div>';
+  }catch(e){}
+}
+
+async function borrarUso(){
+  if (!confirm('¿Empezar a contar de cero?\n\n' +
+               'Se pierden todos los números que juntaste hasta ahora.')) return;
+  const e = document.getElementById('uso-estado');
+  e.textContent = 'Borrando…';
+  try{
+    const r = await fetch('/api/admin/borrar-uso?clave=' + encodeURIComponent(clave),
+                          {method:'POST'});
+    const d = await r.json();
+    e.textContent = d.mensaje || d.error;
+    if (d.ok) verUso();
+  }catch(err){ e.textContent = 'No se pudo: ' + err.message; }
+}
+
 // ---------- Los planes ----------
 async function verPlanes(){
   try{
@@ -1559,6 +1671,7 @@ async function cambiarAjuste(claveAjuste, encendido){
     });
     verAjustes();
 verUsuarios();
+verUso();
 verCarrerasListas();
 verPlanes();
 verPromocion();
@@ -1753,6 +1866,7 @@ verEstadoAvisos();
 verAnuncios();
 verAjustes();
 verUsuarios();
+verUso();
 verCarrerasListas();
 verPlanes();
 verPromocion();
