@@ -20,6 +20,40 @@ def hora_argentina():
     return ahora_argentina().strftime("%H:%M")
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _cuidar_el_servidor():
+    """
+    Frena a quien hace demasiados pedidos. Asi una sola persona no
+    puede dejar la app inservible para el resto.
+    """
+    if request.path.startswith("/static/"):
+        return None
+    quien = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+             or request.remote_addr or "?")
+    if _demasiados_pedidos(quien):
+        return jsonify(
+            ok=False, demasiado_rapido=True,
+            error="Estás haciendo muchos pedidos. Esperá unos segundos.",
+        ), 429
+    return None
+
+
+@app.after_request
+def _poner_seguridad(resp):
+    """
+    Cabeceras que le dicen al navegador como cuidar la app:
+    - que nadie la meta dentro de otra pagina para engañar al usuario
+    - que no adivine tipos de archivo
+    - que no filtre la direccion a otros sitios
+    """
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault("Permissions-Policy",
+                            "geolocation=(), microphone=(), camera=()")
+    return resp
 BASE = "https://www.studbook.org.ar"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; LEA-WIN-IA/1.0)",
@@ -33,6 +67,34 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 def clean(v):
     return re.sub(r"\s+", " ", v or "").strip()
+
+
+# ============================================================
+# CUIDAR EL SERVIDOR
+# Sin esto, una sola persona puede hacer miles de pedidos por minuto
+# y dejar la app inservible para todos los demas.
+# ============================================================
+
+PEDIDOS_POR_MINUTO = int(os.getenv("PEDIDOS_POR_MINUTO", "120"))
+_pedidos = {}
+_candado_pedidos = threading.Lock()
+
+
+def _demasiados_pedidos(quien):
+    """True si esa persona esta haciendo mas pedidos de la cuenta."""
+    ahora = time.time()
+    with _candado_pedidos:
+        # Limpiar lo viejo, para que no crezca la memoria.
+        if len(_pedidos) > 2000:
+            for k in [k for k, v in _pedidos.items() if ahora - v[0] > 120]:
+                _pedidos.pop(k, None)
+
+        desde, cuantos = _pedidos.get(quien, (ahora, 0))
+        if ahora - desde > 60:
+            desde, cuantos = ahora, 0
+        cuantos += 1
+        _pedidos[quien] = (desde, cuantos)
+        return cuantos > PEDIDOS_POR_MINUTO
 
 # Cuanto se espera al sitio oficial antes de darse por vencido.
 # Poco a proposito: las carreras se traen de madrugada y quedan
@@ -218,6 +280,12 @@ def init_db():
       plan TEXT DEFAULT 'normal',     -- normal | premium
       creada_en TEXT NOT NULL,
       actualizada_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS intentos(
+      quien TEXT PRIMARY KEY,     -- el usuario que se intento
+      fallos INTEGER DEFAULT 0,
+      ultimo TEXT,
+      bloqueado_hasta TEXT
     );
     CREATE TABLE IF NOT EXISTS uso(
       tipo TEXT NOT NULL,        -- pantalla | caballo | carrera | hipodromo
@@ -3997,8 +4065,83 @@ def api_registro():
     resp = jsonify(ok=True, usuario=usuario, token=token,
                    mensaje=f"Bienvenido, {usuario}.")
     resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
-                    samesite="Lax", secure=True, httponly=False)
+                    samesite="Lax", secure=True, httponly=True)
     return resp
+
+
+# ============================================================
+# SEGURIDAD AL ENTRAR
+# Sin esto, alguien puede probar miles de contraseñas por minuto
+# hasta acertar. Con 5 intentos fallidos se traba 10 minutos.
+# Al entrar bien, la cuenta vuelve a cero.
+# ============================================================
+
+INTENTOS_ANTES_DE_TRABAR = int(os.getenv("INTENTOS_MAX", "5"))
+MINUTOS_TRABADO = int(os.getenv("MINUTOS_TRABADO", "10"))
+
+
+def _esta_trabado(quien):
+    """Si esta trabado, devuelve cuantos minutos faltan. Si no, None."""
+    try:
+        con = db()
+        f = con.execute("SELECT bloqueado_hasta FROM intentos WHERE quien=?",
+                        (quien,)).fetchone()
+        con.close()
+        if not f or not f["bloqueado_hasta"]:
+            return None
+        hasta = datetime.fromisoformat(f["bloqueado_hasta"])
+        faltan = (hasta - datetime.now()).total_seconds() / 60
+        return max(1, int(faltan + 0.5)) if faltan > 0 else None
+    except Exception:
+        return None
+
+
+def _anotar_fallo(quien):
+    """Suma un intento fallido. Devuelve cuantos le quedan."""
+    try:
+        ahora = datetime.now()
+        con = db()
+        f = con.execute("SELECT fallos, ultimo FROM intentos WHERE quien=?",
+                        (quien,)).fetchone()
+
+        # Si el ultimo fallo fue hace rato, se empieza a contar de nuevo.
+        fallos = 0
+        if f and f["ultimo"]:
+            try:
+                minutos = (ahora - datetime.fromisoformat(f["ultimo"])).total_seconds() / 60
+                fallos = f["fallos"] if minutos <= MINUTOS_TRABADO * 2 else 0
+            except ValueError:
+                fallos = 0
+        fallos += 1
+
+        trabado = None
+        if fallos >= INTENTOS_ANTES_DE_TRABAR:
+            trabado = (ahora + timedelta(minutes=MINUTOS_TRABADO)).isoformat(
+                timespec="seconds")
+
+        con.execute("""
+            INSERT INTO intentos(quien, fallos, ultimo, bloqueado_hasta)
+            VALUES(?,?,?,?)
+            ON CONFLICT(quien) DO UPDATE SET
+              fallos=excluded.fallos, ultimo=excluded.ultimo,
+              bloqueado_hasta=excluded.bloqueado_hasta
+        """, (quien, fallos, ahora.isoformat(timespec="seconds"), trabado))
+        con.commit()
+        con.close()
+        return max(0, INTENTOS_ANTES_DE_TRABAR - fallos)
+    except Exception:
+        return INTENTOS_ANTES_DE_TRABAR
+
+
+def _borrar_fallos(quien):
+    """Entro bien: se borra la cuenta de intentos."""
+    try:
+        con = db()
+        con.execute("DELETE FROM intentos WHERE quien=?", (quien,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
 
 
 @app.post("/api/ingresar")
@@ -4008,6 +4151,16 @@ def api_ingresar():
     clave = d.get("clave", "")
     if not usuario or not clave:
         return jsonify(ok=False, error="Poné el usuario y la contraseña."), 400
+
+    # ¿Esta trabado por haber fallado muchas veces?
+    quien = normalize_text(usuario)
+    faltan = _esta_trabado(quien)
+    if faltan:
+        return jsonify(
+            ok=False, trabado=True, minutos=faltan,
+            error=(f"Muchos intentos fallidos. Esperá {faltan} minuto"
+                   f"{'s' if faltan > 1 else ''} y probá de nuevo."),
+        ), 429
 
     con = db()
     fila = con.execute("SELECT * FROM usuarios WHERE usuario=?",
@@ -4019,8 +4172,19 @@ def api_ingresar():
                        error=f"No existe el usuario «{usuario}»."), 401
     if not _clave_correcta(clave, fila["clave_hash"]):
         con.close()
-        return jsonify(ok=False, clave_mal=True,
-                       error="La contraseña no es correcta."), 401
+        quedan = _anotar_fallo(quien)
+        if quedan == 0:
+            return jsonify(
+                ok=False, trabado=True, minutos=MINUTOS_TRABADO,
+                error=(f"Muchos intentos fallidos. Esperá {MINUTOS_TRABADO} "
+                       "minutos y probá de nuevo."),
+            ), 429
+        aviso = ""
+        if quedan <= 2:
+            aviso = (f" Te queda{'n' if quedan > 1 else ''} {quedan} "
+                     f"intento{'s' if quedan > 1 else ''}.")
+        return jsonify(ok=False, clave_mal=True, quedan=quedan,
+                       error="La contraseña no es correcta." + aviso), 401
     if fila["bloqueado"]:
         con.close()
         return jsonify(ok=False, error="Esta cuenta está bloqueada."), 403
@@ -4032,10 +4196,11 @@ def api_ingresar():
     con.execute("UPDATE usuarios SET ultimo_ingreso=? WHERE id=?", (ahora, fila["id"]))
     con.commit()
     con.close()
+    _borrar_fallos(quien)   # entro bien: se limpia la cuenta
 
     resp = jsonify(ok=True, usuario=fila["usuario_visible"], token=token)
     resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
-                    samesite="Lax", secure=True, httponly=False)
+                    samesite="Lax", secure=True, httponly=True)
     return resp
 
 
