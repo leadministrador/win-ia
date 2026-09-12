@@ -430,7 +430,11 @@ def init_db():
     con.close()
 
 # --- Cache genérico con TTL, para no depender de scrapear en cada request ---
-TTL_CALENDARIO = 2 * 60 * 60      # 2hs: el calendario cambia poco
+# El calendario se revisa de madrugada, cuando el historico trabaja.
+# Antes valia 2 horas y la app iba al sitio todo el dia a buscarlo,
+# haciendo esperar al usuario de gusto. Las reuniones se publican con
+# dias de anticipacion: no cambian cada dos horas.
+TTL_CALENDARIO = int(os.getenv("TTL_CALENDARIO", str(20 * 60 * 60)))
 # Cuanto vale lo guardado de una carrera.
 # Si YA SE CORRIO, mucho: el resultado no cambia mas.
 # Si TODAVIA NO, poco: hay que volver a pedirla para que aparezcan los
@@ -1096,6 +1100,37 @@ def enrich_horse(horse):
     if guardada is not None and fresca:
         horse.update(guardada)
         return horse
+
+    # Antes de ir al sitio: ¿está en las fichas que junto el histórico?
+    # Esas quedan guardadas PARA SIEMPRE. Sin esto, la app tenia miles
+    # de campañas guardadas y no las usaba: iba al sitio igual.
+    try:
+        con = db()
+        f = con.execute("SELECT carreras, datos FROM fichas WHERE perfil=?",
+                        (profile,)).fetchone()
+        con.close()
+        if f and f["carreras"]:
+            carreras = json.loads(f["carreras"])
+            if carreras:
+                horse["carreras"] = carreras[:20]
+                if f["datos"]:
+                    for k, v in json.loads(f["datos"]).items():
+                        if v and not horse.get(k):
+                            horse[k] = v
+                puestos = [x["puesto"] for x in carreras if x.get("puesto")]
+                horse["victorias"] = sum(1 for p in puestos if p == 1)
+                horse["podios"] = sum(1 for p in puestos if p <= 3)
+                horse["corridas"] = len(carreras)
+                horse["actuaciones"] = [
+                    f"{x.get('fecha','')} {x.get('hipodromo','')} {x['puesto']}º"
+                    for x in carreras if x.get("puesto")][:20]
+                horse.setdefault("sexo", "")
+                horse.setdefault("campana", horse.get("logro", ""))
+                horse["cargado"] = True
+                horse["de_lo_guardado"] = True
+                return horse
+    except Exception:
+        pass
 
     try:
         soup = fetch(profile)
@@ -4866,6 +4901,8 @@ ADELANTO = {
     "carreras": 0,
     "reuniones": 0,
     "refrescadas": 0,
+    "campanas": 0,      # campañas de caballos traidas
+    "pronosticos": 0,   # pronosticos ya armados
     "ultimo": "",
 }
 
@@ -4888,6 +4925,63 @@ def _guardar_una_carrera(url, numero, forzar=False):
         return False
 
 
+def _dejar_todo_listo(data, reunion, carrera):
+    """
+    Deja una carrera lista para que el usuario no espere nada:
+      1) trae la campaña de cada caballo y la guarda
+      2) arma el pronostico y lo guarda
+
+    Antes esto se hacia recien cuando alguien abria la carrera, y eran
+    14 pedidos al sitio con el usuario esperando. Ahora se hace de
+    madrugada y el usuario solo lee lo guardado.
+    """
+    try:
+        corredores = [p for p in data.get("participantes", [])
+                      if not p.get("retirado")]
+        if len(corredores) < 2:
+            return
+
+        # 1) La campaña de cada uno. La ficha queda guardada, asi que
+        #    un caballo que corre varias veces se pide una sola vez.
+        completos = []
+        pausa = float(os.getenv("PAUSA_ADELANTO", "1.0"))
+        for p in corredores:
+            perfil = p.get("perfil", "")
+            antes = cache_get(f"ficha:{perfil}", TTL_FICHA_CABALLO)[1] if perfil else True
+            completos.append(enrich_horse(dict(p)))
+            if perfil and not antes:
+                ADELANTO["campanas"] = ADELANTO.get("campanas", 0) + 1
+                time.sleep(pausa)
+
+        # 2) El pronostico, armado y guardado.
+        fecha = meeting_date_from_url(reunion["url"])
+        hip = _limpiar_nombre_hipodromo(reunion["hipodromo"])
+
+        oficiales = condiciones_de(fecha, hip)
+        contexto = {
+            "participantes": completos,
+            "distancia": data.get("distancia", ""),
+            "hora": carrera.get("hora", ""),
+            "hipodromo": hip,
+            "categoria": data.get("categoria", ""),
+            "condicion": data.get("condicion", ""),
+        }
+        for campo in OPCIONES_CONDICIONES:
+            contexto[campo["clave"]] = oficiales.get(campo["clave"], "")
+
+        pesos = cargar_pesos()
+        _, top = rankear(completos, contexto, pesos)
+
+        cache_set(f"listo:{reunion['url']}:{carrera['numero']}", {
+            "participantes": completos,
+            "ranking": top,
+            "armado_en": datetime.now().isoformat(timespec="seconds"),
+        })
+        ADELANTO["pronosticos"] = ADELANTO.get("pronosticos", 0) + 1
+    except Exception:
+        pass
+
+
 def traer_las_que_vienen(forzar=False):
     """
     Recorre las reuniones publicadas y guarda todas sus carreras.
@@ -4903,7 +4997,10 @@ def traer_las_que_vienen(forzar=False):
 
     try:
         try:
+            # Se pide FRESCO y se guarda: es el unico momento del dia en
+            # que se va a buscar. El resto del dia la app usa lo guardado.
             calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+            cache_set("calendario", calendario)
         except Exception as e:
             ADELANTO["ultimo"] = f"no se pudo abrir el calendario: {str(e)[:60]}"
             return {"ok": False, "motivo": ADELANTO["ultimo"]}
@@ -4927,7 +5024,10 @@ def traer_las_que_vienen(forzar=False):
                     "carreras": carreras,
                 }])
 
-                # Y cada carrera con sus competidores.
+                # Y cada carrera con TODO: competidores, campañas y el
+                # pronostico ya armado. Asi el usuario abre y no espera
+                # nada: antes la campaña se buscaba recien cuando alguien
+                # abria la carrera, y eso eran 14 pedidos al sitio.
                 for c in carreras:
                     clave = f"carrera:{reunion['url']}:{c['numero']}"
                     guardada, _ = cache_get(clave, TTL_CARRERA)
@@ -4939,6 +5039,7 @@ def traer_las_que_vienen(forzar=False):
                         if data:
                             cache_set(clave, data)
                             ADELANTO["carreras"] += 1
+                            _dejar_todo_listo(data, reunion, c)
                     except Exception:
                         continue
                     time.sleep(float(os.getenv("PAUSA_ADELANTO", "1.0")))
@@ -4988,7 +5089,9 @@ def refrescar_las_que_estan_por_correrse():
             except Exception:
                 continue
 
-            # Solo las que salen en la proxima hora y media.
+            # Hora y media antes: asi cuando sale el aviso de "una hora
+            # antes" los datos ya estan revisados y el usuario se entera
+            # si su caballo se retiro.
             if not (0 < faltan <= 90):
                 continue
 
@@ -5004,6 +5107,17 @@ def refrescar_las_que_estan_por_correrse():
 
             cache_set(clave, data)
             ADELANTO["refrescadas"] += 1
+
+            # Si cambio algo, se rehace el pronostico con lo nuevo.
+            try:
+                antes_n = len([p for p in (antes or {}).get("participantes", [])
+                               if not p.get("retirado")])
+                ahora_n = len([p for p in data.get("participantes", [])
+                               if not p.get("retirado")])
+                if antes is None or antes_n != ahora_n:
+                    _dejar_todo_listo(data, reunion, c)
+            except Exception:
+                pass
 
             # ¿Se retiro alguno que antes corria?
             if antes:
