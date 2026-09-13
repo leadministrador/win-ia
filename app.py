@@ -287,6 +287,15 @@ def init_db():
       ultimo TEXT,
       bloqueado_hasta TEXT
     );
+    CREATE TABLE IF NOT EXISTS transmisiones(
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      video TEXT,                 -- el id del video de YouTube
+      buscada INTEGER DEFAULT 0,  -- 1 si ya se busco, para no repetir
+      a_mano INTEGER DEFAULT 0,   -- 1 si la cargo el admin
+      guardada_en TEXT,
+      PRIMARY KEY(fecha, hipodromo)
+    );
     CREATE TABLE IF NOT EXISTS uso(
       tipo TEXT NOT NULL,        -- pantalla | caballo | carrera | hipodromo
       cosa TEXT NOT NULL,        -- que se miro
@@ -5379,6 +5388,13 @@ def revision_de_avisos():
         except Exception:
             pass
 
+        # El vivo de cada hipodromo, 25 minutos antes de su primera
+        # carrera. Cada uno se busca UNA sola vez por dia.
+        try:
+            buscar_las_transmisiones()
+        except Exception:
+            pass
+
         # De madrugada, traer todas las que vienen y dejarlas guardadas.
         try:
             h = ahora_argentina().hour
@@ -9077,6 +9093,239 @@ def admin_borrar_uso():
     con.commit()
     con.close()
     return jsonify(ok=True, mensaje=f"Se borraron {n} toques. Empieza de cero.")
+
+
+# ============================================================
+# TRANSMISIONES EN VIVO
+# Los hipodromos transmiten por YouTube. La app busca el video UNA
+# VEZ, 25 minutos antes de la primera carrera. Si no lo encuentra,
+# avisa al admin para que lo cargue a mano o marque que no transmite.
+# El video NO pasa por el servidor: lo trae YouTube directo al
+# celular del usuario.
+# ============================================================
+
+CANALES = {
+    "palermo": "UCBQnpH3GKOKRGg4O8PpqQSw",
+    "san isidro": "UCxHHKMSJXJkTsJHMHkYQOYQ",
+    "la plata": "UCmwGF3xHxFwvvBLD0xQfjZw",
+}
+MINUTOS_ANTES_DE_BUSCAR = int(os.getenv("MINUTOS_BUSCAR_VIVO", "25"))
+
+
+def _id_de_youtube(texto):
+    """Saca el identificador del video de cualquier forma de enlace."""
+    t = clean(texto)
+    if not t:
+        return ""
+    if re.fullmatch(r"[\w-]{11}", t):
+        return t
+    for patron in (r"[?&]v=([\w-]{11})", r"youtu\.be/([\w-]{11})",
+                   r"/embed/([\w-]{11})", r"/live/([\w-]{11})"):
+        m = re.search(patron, t)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _buscar_transmision(hipodromo):
+    """
+    Busca la transmision en vivo de ese hipodromo.
+    Devuelve el id del video, o vacio si no hay ninguna.
+    Se lee la pagina del canal: no hace falta clave ni pagar nada.
+    """
+    canal = CANALES.get(normalize_text(hipodromo))
+    if not canal:
+        return ""
+    try:
+        r = requests.get(
+            f"https://www.youtube.com/channel/{canal}/live",
+            headers={"User-Agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
+                     "Accept-Language": "es-AR,es"},
+            timeout=(4, 8), allow_redirects=True)
+        texto = r.text
+    except Exception:
+        return ""
+
+    # Solo sirve si YouTube dice que esta EN VIVO ahora. Si es un video
+    # viejo, no se muestra.
+    if '"isLiveNow":true' not in texto and '"isLive":true' not in texto:
+        return ""
+    m = re.search(r'"videoId":"([\w-]{11})"', texto)
+    return m.group(1) if m else ""
+
+
+def transmision_de(fecha, hipodromo):
+    """Lo que hay guardado para ese dia e hipodromo."""
+    try:
+        con = db()
+        f = con.execute("""SELECT video, buscada, a_mano FROM transmisiones
+                           WHERE fecha=? AND hipodromo=?""",
+                        (fecha, normalize_text(hipodromo))).fetchone()
+        con.close()
+        return dict(f) if f else None
+    except Exception:
+        return None
+
+
+def _guardar_transmision(fecha, hipodromo, video="", a_mano=False):
+    try:
+        con = db()
+        con.execute("""
+            INSERT INTO transmisiones(fecha, hipodromo, video, buscada,
+                                      a_mano, guardada_en)
+            VALUES(?,?,?,1,?,?)
+            ON CONFLICT(fecha, hipodromo) DO UPDATE SET
+              video=excluded.video, buscada=1, a_mano=excluded.a_mano,
+              guardada_en=excluded.guardada_en
+        """, (fecha, normalize_text(hipodromo), video, 1 if a_mano else 0,
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def buscar_las_transmisiones():
+    """
+    Busca las transmisiones del dia. Se llama cada tanto, pero cada
+    hipodromo se busca UNA SOLA VEZ: 25 minutos antes de su primera
+    carrera. Si no la encuentra, avisa al admin.
+    """
+    hoy = hoy_argentina()
+    ahora = ahora_argentina()
+    buscadas = 0
+
+    # La primera carrera de cada hipodromo de hoy.
+    primeras = {}
+    for c in _carreras_de_hoy_guardadas():
+        hip = c["hipodromo"]
+        if not c.get("hora"):
+            continue
+        if hip not in primeras or c["hora"] < primeras[hip]:
+            primeras[hip] = c["hora"]
+
+    for hip, hora in primeras.items():
+        ya = transmision_de(hoy, hip)
+        if ya and ya.get("buscada"):
+            continue      # ya se busco hoy: no se insiste
+
+        faltan = _minutos_para(hora)
+        if faltan is None or faltan > MINUTOS_ANTES_DE_BUSCAR:
+            continue      # todavia falta
+
+        video = _buscar_transmision(hip)
+        _guardar_transmision(hoy, hip, video)
+        buscadas += 1
+
+        if not video:
+            # Avisar al admin para que la cargue o marque que no hay.
+            try:
+                con = db()
+                admins = con.execute(
+                    "SELECT id FROM usuarios WHERE es_admin=1").fetchall()
+                con.close()
+                for a in admins:
+                    avisar_a_usuario(
+                        a["id"], f"Sin transmisión de {hip}",
+                        ("No se encontró el vivo. Cargalo a mano o marcá "
+                         "que hoy no transmite."),
+                        "/admin", "sin_vivo")
+            except Exception:
+                pass
+
+    return buscadas
+
+
+@app.get("/api/transmision")
+def api_transmision():
+    """El vivo de esa fecha e hipodromo, para mostrarlo en la carrera."""
+    fecha = clean(request.args.get("fecha", "")) or hoy_argentina()
+    hip = clean(request.args.get("hipodromo", ""))
+    if not hip:
+        return jsonify(ok=True, hay=False)
+
+    t = transmision_de(fecha, hip)
+    video = (t or {}).get("video", "")
+    # "NO" quiere decir que el admin marco que hoy no transmite: no es
+    # un video, es una marca. No se muestra nada.
+    if video == "NO":
+        video = ""
+    return jsonify(ok=True, hay=bool(video), video=video,
+                   hipodromo=_limpiar_nombre_hipodromo(hip))
+
+
+@app.get("/api/admin/transmisiones")
+def admin_transmisiones():
+    """Las transmisiones de hoy, para el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    hoy = hoy_argentina()
+    hipodromos, primeras = [], {}
+    for c in _carreras_de_hoy_guardadas():
+        hip = c["hipodromo"]
+        if hip not in primeras:
+            primeras[hip] = c.get("hora", "")
+        elif c.get("hora") and c["hora"] < primeras[hip]:
+            primeras[hip] = c["hora"]
+
+    for hip, hora in sorted(primeras.items()):
+        t = transmision_de(hoy, hip) or {}
+        video = t.get("video", "")
+        if video == "NO":
+            estado, modo = "no transmite", "no"
+        elif video and t.get("a_mano"):
+            estado, modo = "cargada a mano", "enlace"
+        elif video:
+            estado, modo = "la encontró", "sola"
+        elif t.get("buscada"):
+            estado, modo = "no la encontró", "sola"
+        else:
+            estado, modo = "todavía no la buscó", "sola"
+        hipodromos.append({
+            "hipodromo": hip, "primera": hora, "estado": estado,
+            "modo": modo, "video": "" if video == "NO" else video,
+        })
+
+    return jsonify(ok=True, fecha=hoy, hipodromos=hipodromos,
+                   minutos_antes=MINUTOS_ANTES_DE_BUSCAR)
+
+
+@app.post("/api/admin/transmision")
+def admin_guardar_transmision():
+    """El admin carga el enlace o marca que hoy no transmite."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    hip = clean(d.get("hipodromo", ""))
+    modo = clean(d.get("modo", "")) or "sola"
+    if not hip:
+        return jsonify(ok=False, error="Falta el hipódromo."), 400
+
+    hoy = hoy_argentina()
+
+    if modo == "no":
+        _guardar_transmision(hoy, hip, "NO", a_mano=True)
+        return jsonify(ok=True, mensaje=f"{hip}: hoy no transmite.")
+
+    if modo == "enlace":
+        video = _id_de_youtube(d.get("enlace", ""))
+        if not video:
+            return jsonify(ok=False,
+                           error="Ese enlace de YouTube no se entiende."), 400
+        _guardar_transmision(hoy, hip, video, a_mano=True)
+        return jsonify(ok=True, video=video,
+                       mensaje=f"{hip}: transmisión cargada.")
+
+    # Buscar de nuevo, a pedido
+    video = _buscar_transmision(hip)
+    _guardar_transmision(hoy, hip, video)
+    return jsonify(ok=True, video=video,
+                   mensaje=(f"{hip}: se encontró la transmisión."
+                            if video else
+                            f"{hip}: no se encontró ninguna transmisión."))
 
 
 @app.get("/api/videos")
