@@ -267,6 +267,36 @@
   .carrera-item .dist{ font-family:'Space Mono',monospace; font-size:11px; opacity:.6; margin-top:4px; }
 
   /* competidores */
+  /* La transmisión en vivo del hipódromo */
+  .vivo{
+    background:var(--hueso); border-radius:10px; overflow:hidden;
+    border-left:4px solid var(--carmin); margin-bottom:14px;
+    box-shadow:0 3px 12px rgba(21,56,50,.1);
+  }
+  .vivo-cab{
+    display:flex; align-items:center; gap:9px;
+    padding:12px 14px; cursor:pointer; min-height:52px;
+  }
+  .punto{
+    width:8px; height:8px; border-radius:50%; background:var(--carmin);
+    flex-shrink:0; animation:latir 1.4s infinite;
+  }
+  @keyframes latir{ 0%,100%{opacity:1;} 50%{opacity:.25;} }
+  .vivo-txt{ flex:1; min-width:0; }
+  .vivo-tit{
+    font-family:'Fraunces',serif; font-size:16px; font-weight:600;
+  }
+  .vivo-sub{
+    font-family:'Space Mono',monospace; font-size:10.5px; opacity:.6;
+    margin-top:1px;
+  }
+  .vivo-flecha{ font-size:13px; color:var(--bronce); flex-shrink:0; }
+  .vivo-caja{ display:none; padding:0 12px 12px; }
+  .vivo-caja.abierta{ display:block; }
+  .vivo-caja iframe{
+    width:100%; aspect-ratio:16/9; border:none; border-radius:9px;
+    background:#000; display:block;
+  }
   .comp-list{ display:flex; flex-direction:column; gap:8px; }
   .comp-item{
     display:flex; align-items:center; gap:14px;
@@ -1719,6 +1749,18 @@
         <span class="chev">⌄</span>
       </div>
       <div class="step-body">
+        <div class="vivo" id="vivo" style="display:none;">
+          <div class="vivo-cab" onclick="abrirElVivo()">
+            <div class="punto"></div>
+            <div class="vivo-txt">
+              <div class="vivo-tit" id="vivo-tit">En vivo</div>
+              <div class="vivo-sub" id="vivo-sub">tocá para ver la transmisión</div>
+            </div>
+            <div class="vivo-flecha" id="vivo-flecha">▸</div>
+          </div>
+          <div class="vivo-caja" id="vivo-caja"></div>
+        </div>
+
         <div class="comp-list" id="comp-list"></div>
 
         <div class="ficha-section" id="caja-condiciones" style="display:none;">
@@ -2326,6 +2368,10 @@ async function elegirCarrera(c, itemEl){
   }
 
   renderCompetidores(participantesActuales);
+
+  // ¿Hay transmisión en vivo de este hipódromo hoy?
+  verSiHayVivo(fechaElegida || '',
+               (hipodromoElegido || {}).hipodromo || '');
 
   // Enriquecer (campaña) y luego pedir el análisis.
   const n = participantesActuales.length;
@@ -4430,6 +4476,58 @@ function cerrarInstalar(){
 // En iPhone el navegador no avisa, así que se propone a mano.
 if (esIphone() && !yaEstaInstalada()){
   setTimeout(() => mostrarInvitacionInstalar('iphone'), 4000);
+}
+
+// ---------- La transmisión en vivo ----------
+// El video NO pasa por el servidor: lo trae YouTube directo al celular.
+// Arranca cerrado para que se vean los competidores y el pronóstico.
+
+let vivoAbierto = false;
+
+async function verSiHayVivo(fecha, hipodromo){
+  const caja = document.getElementById('vivo');
+  if (!caja) return;
+  caja.style.display = 'none';
+  cerrarElVivo();
+  try{
+    const d = await apiGet('/api/transmision?fecha='
+      + encodeURIComponent(fecha) + '&hipodromo=' + encodeURIComponent(hipodromo));
+    if (!d.hay || !d.video) return;
+    caja.dataset.video = d.video;
+    document.getElementById('vivo-tit').textContent =
+      'En vivo desde ' + (d.hipodromo || hipodromo);
+    caja.style.display = 'block';
+  }catch(e){ /* si falla, no se muestra nada */ }
+}
+
+function abrirElVivo(){
+  const caja = document.getElementById('vivo');
+  const dentro = document.getElementById('vivo-caja');
+  const flecha = document.getElementById('vivo-flecha');
+  const sub = document.getElementById('vivo-sub');
+  if (!caja || !dentro) return;
+
+  if (vivoAbierto){ cerrarElVivo(); return; }
+
+  const id = caja.dataset.video;
+  if (!id) return;
+  dentro.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0&modestbranding=1"
+    allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+    allowfullscreen></iframe>`;
+  dentro.classList.add('abierta');
+  if (flecha) flecha.textContent = '▾';
+  if (sub) sub.textContent = 'tocá de nuevo para cerrarlo';
+  vivoAbierto = true;
+}
+
+function cerrarElVivo(){
+  const dentro = document.getElementById('vivo-caja');
+  const flecha = document.getElementById('vivo-flecha');
+  const sub = document.getElementById('vivo-sub');
+  if (dentro){ dentro.innerHTML = ''; dentro.classList.remove('abierta'); }
+  if (flecha) flecha.textContent = '▸';
+  if (sub) sub.textContent = 'tocá para ver la transmisión';
+  vivoAbierto = false;
 }
 
 // ---------- Arranque ----------
