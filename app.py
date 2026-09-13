@@ -3049,43 +3049,75 @@ APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0,
                "ultima_vez_con": 0, "ultima_vez_fichas": (0, 0)}
 
 
-def _carreras_para_aprender(limite=None):
+def _carreras_para_aprender(limite=None, desde=0, mitad=None):
     """
-    Trae TODAS las carreras ya corridas del historico. Cada peso se prueba
-    contra todas: es la unica forma de saber si una variable sirve de
-    verdad o si acerto de casualidad.
-    El tope existe solo por si algun dia son cientos de miles.
+    Trae carreras ya corridas del historico, para medir el algoritmo.
+
+    Se puede pedir DE A TANDAS: antes se cargaban las 11.000 juntas y
+    eso ocupaba 527 MB de los 512 que tiene el servidor. Render mataba
+    la app. De a 250, cada tanda ocupa unos 12 MB.
+
+    desde: desde que carrera empezar (para ir tanda por tanda)
+    mitad: "a" o "b", para partirlas y verificar que un cambio no sea
+           casualidad. Se parte por el numero de fila, asi cada mitad
+           tiene carreras de todas las epocas.
     """
     if limite is None:
         limite = int(os.getenv("CARRERAS_PARA_APRENDER", "20000"))
+
+    filtro_mitad = ""
+    if mitad == "a":
+        filtro_mitad = "AND (rowid % 2) = 0"
+    elif mitad == "b":
+        filtro_mitad = "AND (rowid % 2) = 1"
+
     try:
         con = db()
-        filas = con.execute("""
+        filas = con.execute(f"""
             SELECT url, fecha, hipodromo, pista, estado, distancia, participantes
             FROM historico
-            WHERE participantes IS NOT NULL
-            ORDER BY fecha DESC LIMIT ?
-        """, (limite,)).fetchall()
+            WHERE participantes IS NOT NULL {filtro_mitad}
+            ORDER BY fecha DESC LIMIT ? OFFSET ?
+        """, (limite, desde)).fetchall()
         con.close()
     except Exception:
         return []
 
-    # Las campañas se leen UNA vez y quedan en memoria: un caballo aparece
-    # en muchas carreras y seria absurdo buscarlo cada vez.
+    if not filas:
+        return []
+
+    # Solo las campañas de los caballos QUE ESTAN EN ESTA TANDA. Antes se
+    # cargaban las 3.000 fichas enteras cada vez, y eso solo ya ocupaba
+    # cientos de megas.
+    perfiles = set()
+    for f in filas:
+        try:
+            for p in json.loads(f["participantes"]):
+                if p.get("perfil"):
+                    perfiles.add(p["perfil"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
     fichas, datos_caballo = {}, {}
     try:
         con = db()
-        for f in con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall():
-            try:
-                fichas[f["perfil"]] = json.loads(f["carreras"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-            # Edad, sexo, padre y madre de ese caballo.
-            if f["datos"]:
+        lista = list(perfiles)
+        for i in range(0, len(lista), 400):
+            trozo = lista[i:i + 400]
+            huecos = ",".join("?" * len(trozo))
+            for f in con.execute(
+                    f"SELECT perfil, carreras, datos FROM fichas "
+                    f"WHERE perfil IN ({huecos})", trozo).fetchall():
                 try:
-                    datos_caballo[f["perfil"]] = json.loads(f["datos"])
+                    fichas[f["perfil"]] = json.loads(f["carreras"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+                # Edad, sexo, padre y madre de ese caballo.
+                if f["datos"]:
+                    try:
+                        datos_caballo[f["perfil"]] = json.loads(f["datos"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
         con.close()
     except Exception:
         pass
@@ -3142,6 +3174,40 @@ def _carreras_para_aprender(limite=None):
     return carreras
 
 
+CARRERAS_POR_TANDA = int(os.getenv("CARRERAS_POR_TANDA", "250"))
+
+
+def _acierto_por_tandas(pesos, mitad, tanda=None):
+    """
+    Mide cuanto acierta, leyendo las carreras DE A TANDAS.
+
+    Antes se cargaban las 11.000 carreras juntas y eso ocupaba 527 MB,
+    de los 512 que tiene el servidor. Render mataba la app.
+    De a 250, cada tanda ocupa unos 12 MB.
+
+    mitad: "a" la primera mitad, "b" la segunda. Sirve para probar un
+    cambio en una y verificarlo en la otra, para que no sea casualidad.
+    """
+    tanda = tanda or CARRERAS_POR_TANDA
+    total_g, total_t, vueltas = 0.0, 0.0, 0
+    desde = 0
+    while True:
+        carreras = _carreras_para_aprender(limite=tanda, desde=desde,
+                                           mitad=mitad)
+        if not carreras:
+            break
+        g, t = _cuanto_acierta(carreras, pesos)
+        if g or t:
+            total_g += g
+            total_t += t
+            vueltas += 1
+        desde += tanda
+        del carreras   # se suelta la memoria antes de la proxima tanda
+    if not vueltas:
+        return 0.0, 0.0
+    return round(total_g / vueltas, 2), round(total_t / vueltas, 2)
+
+
 def _cuanto_acierta(carreras, pesos):
     """
     Vuelve a pronosticar esas carreras con esos pesos y devuelve cuanto
@@ -3192,7 +3258,18 @@ def ajustar_algoritmo():
     Antes se movian todos los pesos juntos para el mismo lado, asi que
     nunca se descubria cual servia. Terminaban todos en el piso.
     """
-    todas = _carreras_para_aprender()
+    # Cuantas hay, sin cargarlas: solo se cuentan.
+    try:
+        con = db()
+        cuantas = con.execute(
+            "SELECT COUNT(*) c FROM historico WHERE participantes IS NOT NULL"
+        ).fetchone()["c"]
+        con.close()
+    except Exception:
+        cuantas = 0
+
+    # Una tanda chica, solo para saber si hay con que trabajar.
+    todas = _carreras_para_aprender(limite=CARRERAS_POR_TANDA)
 
     # Si no hay carreras nuevas desde la ultima vez, no tiene sentido
     # hacer todo el calculo otra vez: daria exactamente lo mismo.
@@ -3203,12 +3280,12 @@ def ajustar_algoritmo():
     # cambia el resultado aunque las carreras sean las mismas.
     fichas_ahora = (APRENDIZAJE.get("fichas_disponibles", 0),
                     APRENDIZAJE.get("fichas_completas", 0))
-    if (todas
-            and len(todas) == APRENDIZAJE.get("ultima_vez_con", 0)
+    if (cuantas
+            and cuantas == APRENDIZAJE.get("ultima_vez_con", 0)
             and fichas_ahora == APRENDIZAJE.get("ultima_vez_fichas", 0)):
         return {"ok": False, "sin_novedades": True,
                 "motivo": (f"No hay nada nuevo desde la última vez: "
-                           f"las mismas {len(todas)} carreras y "
+                           f"las mismas {cuantas} carreras y "
                            f"{fichas_ahora[0]} fichas de caballos. "
                            "Afinar de nuevo daría el mismo resultado.")}
 
@@ -3224,16 +3301,17 @@ def ajustar_algoritmo():
         return {"ok": False,
                 "motivo": f"solo hay {len(todas)} carreras útiles, hacen falta 60"}
 
-    # Dos mitades, mezcladas para que no queden todas las viejas de un lado.
-    import random as _r
-    mezcla = list(todas)
-    _r.Random(7).shuffle(mezcla)
-    mitad = len(mezcla) // 2
-    grupo_a, grupo_b = mezcla[:mitad], mezcla[mitad:]
+    # Ya no se cargan las carreras en memoria: se leen de a tandas cada
+    # vez que hace falta medir. Las dos mitades se separan por el numero
+    # de fila (par e impar), asi cada una tiene carreras de toda epoca.
+    del todas
+    mitad_a = cuantas // 2
+    mitad_b = cuantas - mitad_a
 
     pesos = cargar_pesos()
-    base_ga, base_ta = _cuanto_acierta(grupo_a, pesos)
-    base_gb, base_tb = _cuanto_acierta(grupo_b, pesos)
+    AJUSTE["paso"] = "midiendo como esta ahora"
+    base_ga, base_ta = _acierto_por_tandas(pesos, "a")
+    base_gb, base_tb = _acierto_por_tandas(pesos, "b")
 
     # Lo que se busca es ACERTAR EL GANADOR. El acierto entre los cuatro
     # solo desempata, porque con el ganador solo puede haber empates.
@@ -3293,12 +3371,12 @@ def ajustar_algoritmo():
             prueba[clave] = nuevo
 
             # 1) ¿Mejora en la primera mitad?
-            ga, ta = _cuanto_acierta(grupo_a, prueba)
+            ga, ta = _acierto_por_tandas(prueba, "a")
             if puntaje(ga, ta) <= mejor_a + 1.0:
                 continue   # ni siquiera mejora aca, se descarta
 
             # 2) ¿Se REPITE en la segunda mitad? Si no, fue casualidad.
-            gb, tb = _cuanto_acierta(grupo_b, prueba)
+            gb, tb = _acierto_por_tandas(prueba, "b")
             if puntaje(gb, tb) <= mejor_b:
                 descartados.append({
                     "peso": clave, "probado": nuevo,
@@ -3328,7 +3406,7 @@ def ajustar_algoritmo():
     if cambios:
         guardar_pesos(pesos)
 
-    APRENDIZAJE["ultima_vez_con"] = len(todas)
+    APRENDIZAJE["ultima_vez_con"] = cuantas
     APRENDIZAJE["ultima_vez_fichas"] = (
         APRENDIZAJE.get("fichas_disponibles", 0),
         APRENDIZAJE.get("fichas_completas", 0))
@@ -3339,14 +3417,14 @@ def ajustar_algoritmo():
 
     return {
         "ok": True,
-        "carreras_usadas": len(todas),
+        "carreras_usadas": cuantas,
         "carreras_sin_campana": APRENDIZAJE.get("carreras_sin_campana", 0),
         "fichas_guardadas": APRENDIZAJE.get("fichas_disponibles", 0),
         # Cuantas de esas fichas tienen ya los datos nuevos: edad, sexo,
         # padre, madre. Sin eso, 7 de las variables no se pueden medir.
         "fichas_completas": APRENDIZAJE.get("fichas_completas", 0),
-        "grupo_prueba": len(grupo_a),
-        "grupo_verificacion": len(grupo_b),
+        "grupo_prueba": mitad_a,
+        "grupo_verificacion": mitad_b,
         # Lo que importa: acertar el ganador.
         "ganador_antes": round(ini_g, 2),
         "ganador_ahora": round(fin_g, 2),
@@ -6885,9 +6963,20 @@ def recolectar_historico():
         try:
             if _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
                 trabajar_una_tanda(cuantos=40)
-                # Al terminar la noche, afinar con lo que se junto.
-                if not _es_horario_de_recoleccion():
+
+            # El afinamiento va DESPUES del historico, de 7 a 9, nunca
+            # al mismo tiempo. Los dos juntos llegaban al limite de
+            # memoria y Render reiniciaba la app.
+            h = ahora_argentina().hour
+            hoy = hoy_argentina()
+            if (HORA_AFINAR <= h < HORA_AFINAR_FIN
+                    and not AJUSTE.get("corriendo")
+                    and AJUSTE.get("ultimo_dia") != hoy):
+                AJUSTE["ultimo_dia"] = hoy
+                if True:
                     try:
+                        AJUSTE["corriendo"] = True
+                        AJUSTE["empezo"] = ahora_argentina().strftime("%H:%M:%S")
                         r = ajustar_algoritmo()
                         if r.get("ok"):
                             HISTORICO["ultimo_ajuste"] = {
@@ -6905,8 +6994,13 @@ def recolectar_historico():
 
 
 # Estado del ultimo afinamiento, para consultarlo sin esperar.
+# El afinamiento corre DESPUES del historico, para que no se pisen.
+HORA_AFINAR = int(os.getenv("HORA_AFINAR", "7"))
+HORA_AFINAR_FIN = int(os.getenv("HORA_AFINAR_FIN", "9"))
+
 AJUSTE = {"corriendo": False, "resultado": None, "empezo": "",
-          "paso": "", "hechas": 0, "total": 0, "ultimo_cambio": ""}
+          "paso": "", "hechas": 0, "total": 0, "ultimo_cambio": "",
+          "ultimo_dia": ""}
 
 
 def _afinar_en_segundo_plano():
