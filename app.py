@@ -278,6 +278,11 @@ def init_db():
       ultimo_pago TEXT,
       monto REAL,
       plan TEXT DEFAULT 'normal',     -- normal | premium
+      -- El arrepentimiento: por ley tiene 10 dias para arrepentirse.
+      -- Una sola vez: despues el boton no le aparece mas.
+      se_arrepintio INTEGER DEFAULT 0,
+      arrepentido_en TEXT,
+      monto_devuelto REAL,
       creada_en TEXT NOT NULL,
       actualizada_en TEXT
     );
@@ -386,6 +391,14 @@ def init_db():
         cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
         if cols_cola and "fecha" not in cols_cola:
             con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
+        cols_arr = [f[1] for f in con.execute(
+            "PRAGMA table_info(suscripciones_pago)").fetchall()]
+        for col, tipo in (("se_arrepintio", "INTEGER DEFAULT 0"),
+                          ("arrepentido_en", "TEXT"),
+                          ("monto_devuelto", "REAL")):
+            if cols_arr and col not in cols_arr:
+                con.execute(
+                    f"ALTER TABLE suscripciones_pago ADD COLUMN {col} {tipo}")
         cols_fic = [f[1] for f in con.execute(
             "PRAGMA table_info(fichas)").fetchall()]
         if cols_fic and "datos" not in cols_fic:
@@ -8184,6 +8197,136 @@ def admin_probar_mercadopago():
     return jsonify(ok=True, **informe)
 
 
+# ============================================================
+# BOTON DE ARREPENTIMIENTO
+# Lo exige la Resolucion 424/2020: el que compra por internet puede
+# arrepentirse dentro de los 10 dias y le devolves la plata.
+# Mercado Pago NO cobra comision por el pago devuelto, asi que
+# devolver no cuesta nada.
+# Una sola vez por usuario: despues el boton no aparece mas.
+# ============================================================
+
+DIAS_PARA_ARREPENTIRSE = int(os.getenv("DIAS_ARREPENTIRSE", "10"))
+
+
+def _puede_arrepentirse(usuario_id):
+    """
+    Devuelve (si_puede, motivo, dias_que_le_quedan).
+    """
+    s = suscripcion_de(usuario_id)
+    if not s:
+        return False, "No tenés ninguna compra.", 0
+    if s.get("se_arrepintio"):
+        return False, "Ya usaste tu derecho a arrepentirte una vez.", 0
+    if not s.get("ultimo_pago"):
+        return False, "Todavía no registramos ningún pago tuyo.", 0
+
+    try:
+        pago = datetime.strptime(str(s["ultimo_pago"])[:10], "%Y-%m-%d")
+        pasaron = (datetime.strptime(hoy_argentina(), "%Y-%m-%d") - pago).days
+    except ValueError:
+        return False, "No se pudo leer la fecha del pago.", 0
+
+    quedan = DIAS_PARA_ARREPENTIRSE - pasaron
+    if quedan <= 0:
+        return False, (f"Pasaron más de {DIAS_PARA_ARREPENTIRSE} días "
+                       "desde tu pago."), 0
+    return True, "", quedan
+
+
+@app.get("/api/puedo-arrepentirme")
+def api_puedo_arrepentirme():
+    """Si el botón le tiene que aparecer, y cuántos días le quedan."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, puede=False)
+    puede, motivo, quedan = _puede_arrepentirse(u["id"])
+    s = suscripcion_de(u["id"]) or {}
+    return jsonify(ok=True, puede=puede, motivo=motivo, dias=quedan,
+                   monto=s.get("monto"), dias_por_ley=DIAS_PARA_ARREPENTIRSE)
+
+
+@app.post("/api/arrepentirme")
+def api_arrepentirme():
+    """
+    El usuario se arrepiente. Se cancela la suscripcion, se le devuelve
+    la plata y queda anotado para que no lo pueda repetir.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, error="Entrá a tu cuenta."), 401
+
+    puede, motivo, _ = _puede_arrepentirse(u["id"])
+    if not puede:
+        return jsonify(ok=False, error=motivo), 400
+
+    s = suscripcion_de(u["id"]) or {}
+    monto = s.get("monto") or 0
+
+    # 1) Cortar el cobro, para que no se le siga descontando.
+    if s.get("id_mercadopago"):
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}",
+            {"status": "cancelled"})
+
+    # 2) Devolver la plata del ultimo pago.
+    devuelto = False
+    try:
+        con = db()
+        p = con.execute("""SELECT id FROM pagos
+                           WHERE usuario_id=? AND estado='approved'
+                           ORDER BY fecha DESC LIMIT 1""",
+                        (u["id"],)).fetchone()
+        con.close()
+        if p and p["id"]:
+            ok, r = _mp("POST", f"/v1/payments/{p['id']}/refunds", {})
+            devuelto = ok
+            if not ok:
+                print(f"NO SE PUDO DEVOLVER el pago {p['id']}: "
+                      f"{json.dumps(r, ensure_ascii=False)[:200]}", flush=True)
+    except Exception:
+        pass
+
+    # 3) Anotarlo: una sola vez por usuario.
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""UPDATE suscripciones_pago
+                   SET estado='cancelada', paga_hasta=NULL,
+                       se_arrepintio=1, arrepentido_en=?, monto_devuelto=?,
+                       actualizada_en=?
+                   WHERE usuario_id=?""",
+                (ahora, monto if devuelto else 0, ahora, u["id"]))
+    con.commit()
+    con.close()
+
+    # 4) Avisarle al admin.
+    try:
+        con = db()
+        admins = con.execute(
+            "SELECT id FROM usuarios WHERE es_admin=1").fetchall()
+        f = con.execute("SELECT usuario_visible FROM usuarios WHERE id=?",
+                        (u["id"],)).fetchone()
+        con.close()
+        quien = f["usuario_visible"] if f else "un usuario"
+        for a in admins:
+            avisar_a_usuario(
+                a["id"], f"{quien} se arrepintió de la compra",
+                (f"Se le devolvieron ${monto:,.0f}." if devuelto else
+                 f"Hay que devolverle ${monto:,.0f} a mano desde "
+                 "Mercado Pago."),
+                "/admin", "arrepentimiento")
+    except Exception:
+        pass
+
+    return jsonify(
+        ok=True, devuelto=devuelto,
+        mensaje=("Listo. Cancelamos tu suscripción y te devolvimos la "
+                 "plata. Puede tardar unos días en aparecer según cómo "
+                 "hayas pagado."
+                 if devuelto else
+                 "Listo. Cancelamos tu suscripción. La devolución se "
+                 "hace en las próximas horas; si tenés dudas, escribinos."))
+
+
 @app.post("/api/cancelar-suscripcion")
 def api_cancelar_suscripcion():
     """
@@ -8782,7 +8925,8 @@ def admin_lista_usuarios():
     filas = con.execute("""
         SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
                u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
-               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan,
+               s.se_arrepintio, s.arrepentido_en, s.monto_devuelto
         FROM usuarios u
         LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
         ORDER BY u.id DESC
@@ -8865,7 +9009,8 @@ def admin_exportar_usuarios():
     filas = con.execute("""
         SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
                u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
-               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan,
+               s.se_arrepintio, s.arrepentido_en, s.monto_devuelto
         FROM usuarios u
         LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
         ORDER BY u.id
@@ -8890,6 +9035,8 @@ def admin_exportar_usuarios():
         al_dia = esta_al_dia(d["id"])
         d["al_dia"] = "si" if al_dia else "no"
         d["plan"] = (d.get("plan") or "normal") if al_dia else "gratis"
+        d["se_arrepintio"] = "si" if d.get("se_arrepintio") else "no"
+        d["arrepentido_en"] = str(d.get("arrepentido_en") or "")[:10]
         d["dias_registrado"] = dias_desde(d.get("creado_en"))
         if al_dia:
             d["sin_suscripcion_desde"] = ""
@@ -8929,11 +9076,13 @@ def admin_exportar_usuarios():
                reverse=True)
 
     columnas = ["usuario_visible", "telefono", "desde", "dias",
-                "plan", "al_dia", "estado", "paga_hasta", "ultimo_pago",
+                "plan", "al_dia", "se_arrepintio", "arrepentido_en",
+                "monto_devuelto", "estado", "paga_hasta", "ultimo_pago",
                 "monto", "creado_en", "ultimo_ingreso", "acepto_en",
                 "bloqueado", "es_admin", "id"]
     titulos = ["Nombre", "Teléfono", "Fecha de inicio", "Días transcurridos",
-               "Plan", "Al día", "Estado", "Paga hasta", "Último pago",
+               "Plan", "Al día", "Se arrepintió", "Cuándo se arrepintió",
+               "Monto devuelto", "Estado", "Paga hasta", "Último pago",
                "Monto", "Se registró", "Último ingreso", "Aceptó términos",
                "Bloqueado", "Es admin", "Nº"]
 
