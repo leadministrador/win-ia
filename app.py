@@ -444,27 +444,68 @@ TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
 TTL_CARRERA_SIN_CORRER = int(os.getenv("TTL_SIN_CORRER", str(40 * 60)))
 
 
-def _cuanto_vale_guardada(data, fecha=""):
+def _hora_de_la_carrera(url, numero):
+    """La hora de largada, sacada de lo guardado. Vacio si no se sabe."""
+    try:
+        fecha = meeting_date_from_url(url)
+        calendario, _ = cache_get("calendario", TTL_CALENDARIO)
+        for r in (calendario or []):
+            if r["url"] != url:
+                continue
+            guardado, _ = cache_get(
+                f"reuniones:{fecha}:{normalize_text(r['hipodromo'])}",
+                TTL_REUNION)
+            for x in (guardado or []):
+                for c in x.get("carreras", []):
+                    if str(c.get("numero")) == str(numero):
+                        return c.get("hora", "")
+    except Exception:
+        pass
+    return ""
+
+
+def _cuanto_vale_guardada(data, fecha="", hora=""):
     """
-    Cuanto tiempo sirve lo guardado de esta carrera.
+    Cuanto tiempo sirve lo guardado de esta carrera, o sea cuando la app
+    puede volver a pedirla al sitio.
 
-    - YA CORRIO y tiene resultado: para siempre, no cambia mas.
-    - ES DE OTRO DIA: tambien mucho. Una carrera del 15 no puede tener
-      retiros hoy, asi que no hay por que ir a buscarla.
-    - ES DE HOY y todavia no corrio: 40 minutos, por si hubo cambios.
+    La regla, tal como la definimos:
 
-    Antes valia 40 minutos SIEMPRE, sin mirar el dia, y la app iba al
-    sitio a buscar carreras de dentro de tres dias. El usuario esperaba
-    de gusto.
+      - YA TIENE RESULTADO  -> para siempre. No cambia mas.
+      - ES DE OTRO DIA      -> para siempre por hoy. Una carrera del 15
+                               no puede tener retiros hoy.
+      - ES DE HOY Y NO CORRIO -> tampoco se toca. El repaso de hora y
+                               media antes ya se encarga de los cambios.
+      - YA CORRIO Y NO HAY RESULTADO -> 40 minutos, hasta que aparezca.
+                               Ese pedido trae el resultado Y los cambios
+                               de la reunion, en un solo viaje.
+
+    Antes valia 40 minutos siempre, sin mirar nada: la app iba al sitio
+    a buscar carreras de dentro de tres dias, y el usuario esperaba de
+    gusto.
     """
     try:
         if any(p.get("puesto") for p in (data or {}).get("participantes", [])):
-            return TTL_CARRERA
+            return TTL_CARRERA      # ya tiene resultado
     except Exception:
         pass
-    # De otro dia: no hace falta revisarla hoy.
+
     if fecha and fecha != hoy_argentina():
-        return TTL_CARRERA
+        return TTL_CARRERA          # de otro dia
+
+    # De hoy: solo se vuelve a pedir si YA se corrio y falta el resultado.
+    if hora:
+        try:
+            h, m = [int(x) for x in str(hora).split(":")[:2]]
+            ahora = ahora_argentina()
+            largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+            if ahora > largada:
+                return TTL_CARRERA_SIN_CORRER   # buscar el resultado
+        except (ValueError, TypeError):
+            pass
+        return TTL_CARRERA          # todavia no corrio: no se toca
+
+    # Sin hora no se puede saber: se deja el comportamiento de antes.
     return TTL_CARRERA_SIN_CORRER
 
 def cache_get(clave, ttl_seg):
@@ -2391,7 +2432,9 @@ def carrera():
     # Cuanto vale lo guardado depende de si ya se corrio: con resultado
     # sirve todo el dia, sin resultado hay que volver a pedirla.
     guardada, _ = cache_get(clave, TTL_CARRERA)
-    cuanto = _cuanto_vale_guardada(guardada, meeting_date_from_url(url))
+    cuanto = _cuanto_vale_guardada(
+        guardada, meeting_date_from_url(url),
+        (guardada or {}).get("hora", "") or _hora_de_la_carrera(url, numero))
 
     try:
         data, origen = con_cache(clave, cuanto, forzar, traer)
