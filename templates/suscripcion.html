@@ -167,6 +167,16 @@
     padding:14px; border-radius:9px; cursor:pointer; min-height:48px;
   }
 
+  .btn-arrep{
+    display:block; width:100%; margin-top:9px; text-align:center;
+    font-family:'Archivo',sans-serif; font-weight:600; font-size:15px;
+    background:var(--carmin); color:#fff; border:none;
+    padding:14px; border-radius:9px; cursor:pointer; min-height:48px;
+  }
+  .btn-arrep:hover{ background:#7a2424; }
+  .arrep-nota{
+    font-size:12.5px; line-height:1.55; opacity:.75; margin-top:9px;
+  }
   .medios{
     font-family:'Space Mono',monospace; font-size:11.5px; opacity:.6;
     text-align:center; margin-top:18px; line-height:1.7;
@@ -209,6 +219,11 @@
             style="display:none;" onclick="cancelar()">
       Cancelar la suscripción
     </button>
+    <button class="btn-arrep" id="btn-arrep"
+            style="display:none;" onclick="arrepentirme()">
+      Arrepentirme de la compra
+    </button>
+    <div class="arrep-nota" id="arrep-nota" style="display:none;"></div>
   </div>
 
   <div class="caja-correo" id="caja-correo" style="display:none;">
@@ -327,6 +342,10 @@ async function verEstado(){
 
     caja.style.display = 'block';
     btnCan.style.display = 'none';
+    const btnArr = document.getElementById('btn-arrep');
+    const notaArr = document.getElementById('arrep-nota');
+    if (btnArr) btnArr.style.display = 'none';
+    if (notaArr) notaArr.style.display = 'none';
 
     // El correo solo se pide al que va a pagar.
     const cajaCorreo = document.getElementById('caja-correo');
@@ -368,6 +387,7 @@ async function verEstado(){
         : 'Tenés acceso completo.';
       if (d.estado !== 'cancelada') btnCan.style.display = 'block';
       else sub.textContent += ' Ya lo cancelaste: no se te va a cobrar más.';
+      verSiPuedeArrepentirse();
 
       // Al premium se le muestra el WhatsApp.
       if (d.mi_plan === 'premium'){
@@ -432,6 +452,48 @@ async function suscribirme(plan){
     msg.className = 'msg mal';
     msg.textContent = 'No se pudo preparar el pago. ' + e.message;
     if (btn) btn.disabled = false;
+  }
+}
+
+// El botón de arrepentimiento. Por ley tiene 10 días para arrepentirse
+// de una compra por internet. Una sola vez.
+async function verSiPuedeArrepentirse(){
+  const btn = document.getElementById('btn-arrep');
+  const nota = document.getElementById('arrep-nota');
+  if (!btn) return;
+  try{
+    const r = await fetch('/api/puedo-arrepentirme', {headers: cabeceras()});
+    const d = await r.json();
+    if (d.puede){
+      btn.style.display = 'block';
+      nota.style.display = 'block';
+      nota.textContent = 'Por ley podés arrepentirte de la compra dentro de '
+        + 'los ' + d.dias_por_ley + ' días. Te quedan ' + d.dias
+        + (d.dias === 1 ? ' día.' : ' días.');
+    } else {
+      btn.style.display = 'none';
+      nota.style.display = 'none';
+    }
+  }catch(e){}
+}
+
+async function arrepentirme(){
+  if (!confirm('¿Arrepentirte de la compra?\n\n' +
+               'Se cancela tu suscripción y te devolvemos la plata.\n\n' +
+               'Solo se puede una vez.')) return;
+  const msg = document.getElementById('msg');
+  msg.className = 'msg';
+  msg.textContent = 'Procesando…';
+  try{
+    const r = await fetch('/api/arrepentirme',
+                          {method:'POST', headers: cabeceras()});
+    const d = await r.json();
+    msg.className = d.ok ? 'msg bien' : 'msg mal';
+    msg.textContent = d.mensaje || d.error;
+    if (d.ok) verEstado();
+  }catch(e){
+    msg.className = 'msg mal';
+    msg.textContent = 'No se pudo. ' + e.message;
   }
 }
 
