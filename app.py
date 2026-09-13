@@ -444,16 +444,27 @@ TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
 TTL_CARRERA_SIN_CORRER = int(os.getenv("TTL_SIN_CORRER", str(40 * 60)))
 
 
-def _cuanto_vale_guardada(data):
+def _cuanto_vale_guardada(data, fecha=""):
     """
     Cuanto tiempo sirve lo guardado de esta carrera.
-    Con resultado, todo el dia. Sin resultado, 40 minutos.
+
+    - YA CORRIO y tiene resultado: para siempre, no cambia mas.
+    - ES DE OTRO DIA: tambien mucho. Una carrera del 15 no puede tener
+      retiros hoy, asi que no hay por que ir a buscarla.
+    - ES DE HOY y todavia no corrio: 40 minutos, por si hubo cambios.
+
+    Antes valia 40 minutos SIEMPRE, sin mirar el dia, y la app iba al
+    sitio a buscar carreras de dentro de tres dias. El usuario esperaba
+    de gusto.
     """
     try:
         if any(p.get("puesto") for p in (data or {}).get("participantes", [])):
             return TTL_CARRERA
     except Exception:
         pass
+    # De otro dia: no hace falta revisarla hoy.
+    if fecha and fecha != hoy_argentina():
+        return TTL_CARRERA
     return TTL_CARRERA_SIN_CORRER
 
 def cache_get(clave, ttl_seg):
@@ -2380,7 +2391,7 @@ def carrera():
     # Cuanto vale lo guardado depende de si ya se corrio: con resultado
     # sirve todo el dia, sin resultado hay que volver a pedirla.
     guardada, _ = cache_get(clave, TTL_CARRERA)
-    cuanto = _cuanto_vale_guardada(guardada)
+    cuanto = _cuanto_vale_guardada(guardada, meeting_date_from_url(url))
 
     try:
         data, origen = con_cache(clave, cuanto, forzar, traer)
@@ -4720,13 +4731,66 @@ def _marcar_avisado(usuario_id, caballo, tipo, fecha, hipodromo):
     con.close()
 
 
+def _carreras_de_hoy_guardadas():
+    """
+    Las carreras de hoy, sacadas de LO GUARDADO. No le pide nada al
+    sitio: todo se trajo a las 2 de la mañana.
+    """
+    hoy = hoy_argentina()
+    calendario, _ = cache_get("calendario", TTL_CALENDARIO)
+    if not calendario:
+        return []
+
+    salida = []
+    for r in calendario:
+        if r["fecha"] != hoy:
+            continue
+        hip = _limpiar_nombre_hipodromo(r["hipodromo"])
+        guardado, _ = cache_get(
+            f"reuniones:{r['fecha']}:{normalize_text(r['hipodromo'])}",
+            TTL_REUNION)
+        if not guardado:
+            continue
+        for x in guardado:
+            for c in x.get("carreras", []):
+                data, _ = cache_get(f"carrera:{r['url']}:{c['numero']}",
+                                    TTL_CARRERA)
+                if not data:
+                    continue
+                salida.append({
+                    "fecha": r["fecha"], "hipodromo": hip, "url": r["url"],
+                    "numero": c["numero"], "hora": c.get("hora", ""),
+                    "data": data,
+                })
+    return salida
+
+
+def _minutos_para(hora):
+    """Cuantos minutos faltan para esa hora. None si no se entiende."""
+    if not hora:
+        return None
+    try:
+        h, m = [int(x) for x in str(hora).split(":")[:2]]
+    except (ValueError, TypeError):
+        return None
+    ahora = ahora_argentina()
+    largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+    return (largada - ahora).total_seconds() / 60
+
+
 def revisar_caballos_seguidos():
     """
-    Recorre las reuniones de hoy y de manana buscando caballos que alguien
-    sigue. Manda dos avisos distintos:
-      - cuando aparece inscripto en el boletin
-      - una hora antes de su carrera
-    Cada aviso se manda UNA sola vez por carrera.
+    Avisa a quien sigue un caballo. TRES avisos por carrera:
+
+      1) A la mañana  — "tu caballo corre hoy"
+      2) Una hora antes — "corre a las 15:30" o "se retiró"
+      3) Con el resultado — "salió 2º"
+
+    NO LE PIDE NADA AL SITIO: todo sale de lo que se guardo a las 2 de
+    la mañana. Antes pedia el calendario y cada reunion CADA 15 MINUTOS,
+    o sea casi 100 pedidos por dia de gusto.
+
+    Cada aviso se manda una sola vez, y al tocarlo lleva a esa carrera.
     """
     if not hay_notificaciones():
         return {"enviados": 0, "motivo": "faltan las claves"}
@@ -4744,91 +4808,82 @@ def revisar_caballos_seguidos():
     if not seguidos:
         return {"enviados": 0, "motivo": "nadie sigue caballos todavia"}
 
-    buscados = {s["caballo"]: s for s in seguidos}
-    hoy = hoy_argentina()
-    ahora = ahora_argentina()
-    manana = (ahora + timedelta(days=1)).strftime("%Y-%m-%d")
+    buscados = {}
+    for s in seguidos:
+        buscados.setdefault(s["caballo"], []).append(s)
 
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return {"enviados": 0, "motivo": "no se pudo abrir el calendario"}
-
-    reuniones = [r for r in calendario if r["fecha"] in (hoy, manana)]
     enviados = 0
+    for c in _carreras_de_hoy_guardadas():
+        faltan = _minutos_para(c["hora"])
+        data = c["data"]
+        enlace = (f"/?fecha={c['fecha']}"
+                  f"&hipodromo={quote_plus(c['hipodromo'])}"
+                  f"&carrera={c['numero']}")
 
-    for reunion in reuniones:
-        try:
-            soup = fetch(reunion["url"])
-            carreras = extract_races_from_meeting(soup)
-        except Exception:
-            continue
-
-        for c in carreras:
-            try:
-                data = parse_race(soup, c["numero"])
-            except Exception:
+        for p in data.get("participantes", []):
+            clave = normalize_text(p.get("nombre", ""))
+            if clave not in buscados:
                 continue
-            if not data:
-                continue
+            retirado = bool(p.get("retirado"))
+            puesto = p.get("puesto")
 
-            for p in data.get("participantes", []):
-                clave = normalize_text(p.get("nombre", ""))
-                if clave not in buscados or p.get("retirado"):
-                    continue
-
-                seg = buscados[clave]
+            for seg in buscados[clave]:
                 uid = seg["usuario_id"]
                 visible = seg["caballo_visible"]
-                hip = reunion["hipodromo"]
-                hora = c.get("hora", "")
-                enlace = f"/?fecha={reunion['fecha']}&hipodromo={quote_plus(hip)}"
 
-                # 1) Aviso de inscripcion
-                if not _ya_se_aviso(uid, clave, "inscripto", reunion["fecha"], hip):
-                    titulo_av = (f"{visible} corre el "
-                                 f"{reunion['fecha'][8:10]}/{reunion['fecha'][5:7]}")
-                    detalle_av = (f"{hip} · {c['numero']}ª carrera"
-                                  + (f" · {hora}" if hora else ""))
+                def mandar(tipo, titulo, detalle, rotulo):
+                    if _ya_se_aviso(uid, clave, tipo, c["fecha"], c["hipodromo"]):
+                        return 0
                     n = avisar_a_usuario(
-                        uid, titulo_av, detalle_av,
-                        ("/aviso?r=" + quote_plus("Tu caballo sale a la pista")
-                         + "&t=" + quote_plus(titulo_av)
-                         + "&d=" + quote_plus(detalle_av)
+                        uid, titulo, detalle,
+                        ("/aviso?r=" + quote_plus(rotulo)
+                         + "&t=" + quote_plus(titulo)
+                         + "&d=" + quote_plus(detalle)
                          + "&ir=" + quote_plus(enlace)),
-                        "inscripto",
-                    )
+                        tipo)
                     if n:
-                        _marcar_avisado(uid, clave, "inscripto", reunion["fecha"], hip)
-                        enviados += n
+                        _marcar_avisado(uid, clave, tipo,
+                                        c["fecha"], c["hipodromo"])
+                    return n
 
-                # 2) Aviso una hora antes
-                if reunion["fecha"] == hoy and hora:
-                    try:
-                        h, m = [int(x) for x in hora.split(":")]
-                        largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-                        faltan = (largada - ahora).total_seconds() / 60
-                    except Exception:
-                        faltan = None
+                # 1) A la mañana: corre hoy
+                enviados += mandar(
+                    "inscripto",
+                    f"{visible} corre hoy",
+                    (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                     + (f" · {c['hora']}" if c["hora"] else "")),
+                    "Tu caballo sale a la pista")
 
-                    if faltan is not None and 0 < faltan <= 75:
-                        if not _ya_se_aviso(uid, clave, "una_hora", reunion["fecha"], hip):
-                            titulo_av = f"{visible} corre en {int(faltan)} minutos"
-                            detalle_av = f"{hip} · {c['numero']}ª carrera · {hora}"
-                            n = avisar_a_usuario(
-                                uid, titulo_av, detalle_av,
-                                ("/aviso?r=" + quote_plus("Falta poco")
-                                 + "&t=" + quote_plus(titulo_av)
-                                 + "&d=" + quote_plus(detalle_av)
-                                 + "&ir=" + quote_plus(enlace)),
-                                "una_hora",
-                            )
-                            if n:
-                                _marcar_avisado(uid, clave, "una_hora",
-                                                reunion["fecha"], hip)
-                                enviados += n
+                # 2) Una hora antes: corre, o se retiro
+                if faltan is not None and 0 < faltan <= 75:
+                    if retirado:
+                        enviados += mandar(
+                            "una_hora",
+                            f"{visible} no corre",
+                            (f"Se retiró de la {c['numero']}ª carrera "
+                             f"de {c['hipodromo']}."),
+                            "Se retiró")
+                    else:
+                        enviados += mandar(
+                            "una_hora",
+                            f"{visible} corre en {int(faltan)} minutos",
+                            (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                             + (f" · {c['hora']}" if c["hora"] else "")),
+                            "Falta poco")
 
-    return {"enviados": enviados, "reuniones_revisadas": len(reuniones)}
+                # 3) Con el resultado
+                if puesto:
+                    lugar = {1: "ganó", 2: "salió 2º", 3: "salió 3º"}.get(
+                        puesto, f"salió {puesto}º")
+                    pago = p.get("pago", "")
+                    enviados += mandar(
+                        "resultado",
+                        f"{visible} {lugar}",
+                        (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                         + (f" · pagó ${pago}" if pago and puesto == 1 else "")),
+                        "Ya se corrió")
+
+    return {"enviados": enviados}
 
 
 def avisar_a_los_que_vencieron():
@@ -4912,7 +4967,8 @@ def _guardar_una_carrera(url, numero, forzar=False):
     clave = f"carrera:{url}:{numero}"
     if not forzar:
         guardada, _ = cache_get(clave, TTL_CARRERA)
-        _, fresca = cache_get(clave, _cuanto_vale_guardada(guardada))
+        _, fresca = cache_get(
+            clave, _cuanto_vale_guardada(guardada, meeting_date_from_url(url)))
         if guardada is not None and fresca:
             return True
     try:
@@ -5031,7 +5087,8 @@ def traer_las_que_vienen(forzar=False):
                 for c in carreras:
                     clave = f"carrera:{reunion['url']}:{c['numero']}"
                     guardada, _ = cache_get(clave, TTL_CARRERA)
-                    _, fresca = cache_get(clave, _cuanto_vale_guardada(guardada))
+                    _, fresca = cache_get(
+                        clave, _cuanto_vale_guardada(guardada, reunion["fecha"]))
                     if guardada is not None and fresca and not forzar:
                         continue
                     try:
@@ -5063,38 +5120,38 @@ def refrescar_las_que_estan_por_correrse():
     Ahi es cuando aparecen los retiros de ultimo momento.
     Devuelve los retiros nuevos que encontro.
     """
-    hoy = hoy_argentina()
-    ahora = ahora_argentina()
     retiros = []
 
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
-        return retiros
+    # Que carreras salen en la proxima hora y media. Se mira LO
+    # GUARDADO: antes se pedia el calendario y CADA reunion al sitio,
+    # cada 15 minutos, aunque no hubiera ninguna carrera cerca.
+    pendientes = []
+    for x in _carreras_de_hoy_guardadas():
+        faltan = _minutos_para(x["hora"])
+        if faltan is not None and 0 < faltan <= 90:
+            pendientes.append(x)
 
-    for reunion in [r for r in calendario if r["fecha"] == hoy]:
-        try:
-            soup = fetch(reunion["url"])
-            carreras = extract_races_from_meeting(soup)
-        except Exception:
-            continue
+    if not pendientes:
+        return retiros   # nada cerca: no se molesta al sitio
 
-        for c in carreras:
-            if not c.get("hora"):
-                continue
+    # Recien ahora se va al sitio, y solo por esas reuniones.
+    soups = {}
+    for x in pendientes:
+        if x["url"] not in soups:
             try:
-                h, m = [int(x) for x in c["hora"].split(":")]
-                largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
-                faltan = (largada - ahora).total_seconds() / 60
+                soups[x["url"]] = fetch(x["url"])
             except Exception:
-                continue
+                soups[x["url"]] = None
 
-            # Hora y media antes: asi cuando sale el aviso de "una hora
-            # antes" los datos ya estan revisados y el usuario se entera
-            # si su caballo se retiro.
-            if not (0 < faltan <= 90):
-                continue
+    for x in pendientes:
+        soup = soups.get(x["url"])
+        if soup is None:
+            continue
+        reunion = {"url": x["url"], "hipodromo": x["hipodromo"],
+                   "fecha": x["fecha"]}
+        c = {"numero": x["numero"], "hora": x["hora"]}
 
+        if True:
             clave = f"carrera:{reunion['url']}:{c['numero']}"
             antes, _ = cache_get(clave, TTL_CARRERA)
 
@@ -5134,7 +5191,7 @@ def refrescar_las_que_estan_por_correrse():
                             "caballo": n,
                             "visible": p.get("nombre", ""),
                             "fecha": reunion["fecha"],
-                            "hipodromo": _limpiar_nombre_hipodromo(reunion["hipodromo"]),
+                            "hipodromo": reunion["hipodromo"],
                             "numero": c["numero"],
                         })
     return retiros
@@ -7127,7 +7184,7 @@ def admin_carreras_guardadas():
                     # "no listas" y el panel mostraba 0 de 114.
                     if g is not None:
                         listas += 1
-                        _, fresca = cache_get(cc, _cuanto_vale_guardada(g))
+                        _, fresca = cache_get(cc, _cuanto_vale_guardada(g, f))
                         if not fresca:
                             por_revisar += 1
         por_fecha.setdefault(f, {"fecha": f, "reuniones": [], "carreras": 0,
