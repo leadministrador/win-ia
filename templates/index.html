@@ -3435,7 +3435,8 @@ function verVideoTabulada(id){
   const caja = document.getElementById('g-video-caja');
   if (!caja) return;
   caja.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0&modestbranding=1"
-    allow="accelerometer; autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+    allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+    referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>`;
 }
 
 function cerrarTabulada(){
@@ -3908,6 +3909,7 @@ function alternarCarrera(i){
   if (id){
     caja.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0&modestbranding=1"
       allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+      referrerpolicy="strict-origin-when-cross-origin"
       allowfullscreen></iframe>`;
     caja.classList.add('abierta');
   }
@@ -4534,6 +4536,7 @@ function abrirElVivo(){
   if (!id) return;
   dentro.innerHTML = `<iframe src="https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0&modestbranding=1"
     allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+    referrerpolicy="strict-origin-when-cross-origin"
     allowfullscreen></iframe>`;
   dentro.classList.add('abierta');
   if (flecha) flecha.textContent = '▾';
