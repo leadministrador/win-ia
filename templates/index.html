@@ -3,7 +3,27 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LEA WIN IA — Prototipo</title>
+<title>LEA WIN IA — Pronóstico de carreras</title>
+<meta name="description" content="Pronóstico de los primeros cuatro puestos
+      de cada carrera, con la campaña completa de cada ejemplar.
+      San Isidro, Palermo y La Plata.">
+
+<!-- Lo que se ve al compartir el enlace por WhatsApp o las redes -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="LEA WIN IA">
+<meta property="og:title" content="LEA WIN IA — Leé la carrera antes de la carrera">
+<meta property="og:description" content="Pronóstico de los primeros cuatro
+      puestos de cada carrera, con la campaña completa de cada ejemplar.">
+<meta property="og:image" content="https://leawinia.com/static/compartir.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="https://leawinia.com">
+<meta property="og:locale" content="es_AR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="LEA WIN IA — Leé la carrera antes de la carrera">
+<meta name="twitter:description" content="Pronóstico de los primeros cuatro
+      puestos de cada carrera, con la campaña completa de cada ejemplar.">
+<meta name="twitter:image" content="https://leawinia.com/static/compartir.png">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#153832">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -4436,9 +4456,10 @@ function ocultarInstalarUnosDias(){
 
 function mostrarInvitacionInstalar(tipo){
   if (yaEstaInstalada()) return;
-  // Si la escondió hace menos de 15 días, no insistir.
+  // Si la escondió hoy, no insistir. Mañana se le vuelve a ofrecer,
+  // hasta que la instale. Antes esperaba 15 días.
   const dias = (Date.now() - cuandoSeOculto()) / 86400000;
-  if (cuandoSeOculto() && dias < 15) return;
+  if (cuandoSeOculto() && dias < 1) return;
 
   const caja = document.getElementById('instalar-app');
   if (!caja) return;
