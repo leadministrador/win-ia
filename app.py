@@ -50,7 +50,13 @@ def _poner_seguridad(resp):
     """
     resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    # OJO: NO poner "same-origin" acá. Eso le saca al navegador el dato
+    # de que viene de nuestra app, y YouTube RECHAZA el video con
+    # "error 153 - configuración del reproductor". Rompió todos los
+    # videos de las carreras cuando se agregó.
+    # "strict-origin-when-cross-origin" es lo que YouTube pide, y es
+    # el valor que usan los navegadores por defecto.
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault("Permissions-Policy",
                             "geolocation=(), microphone=(), camera=()")
     return resp
@@ -9388,11 +9394,21 @@ def buscar_las_transmisiones():
 
 @app.get("/api/transmision")
 def api_transmision():
-    """El vivo de esa fecha e hipodromo, para mostrarlo en la carrera."""
-    fecha = clean(request.args.get("fecha", "")) or hoy_argentina()
+    """
+    El vivo de esa fecha e hipodromo.
+
+    SOLO para carreras de HOY. Antes, si no venia la fecha se usaba la
+    de hoy, y una carrera del 5 de septiembre terminaba mostrando la
+    transmision de hoy: el video daba error 153 y tapaba la carrera.
+    """
+    fecha = clean(request.args.get("fecha", ""))
     hip = clean(request.args.get("hipodromo", ""))
-    if not hip:
+    if not hip or not fecha:
         return jsonify(ok=True, hay=False)
+
+    # Una carrera de otro dia no tiene transmision en vivo.
+    if fecha != hoy_argentina():
+        return jsonify(ok=True, hay=False, otro_dia=True)
 
     t = transmision_de(fecha, hip)
     video = (t or {}).get("video", "")
