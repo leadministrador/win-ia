@@ -61,9 +61,25 @@ def _poner_seguridad(resp):
                             "geolocation=(), microphone=(), camera=()")
     return resp
 BASE = "https://www.studbook.org.ar"
+# Como se presenta la app cuando le pide una pagina al Stud Book.
+#
+# Antes decia "LEA-WIN-IA/1.0", que la delataba como programa. Desde el
+# 17 de septiembre el sitio empezo a contestar 403 (prohibido) y dejaron
+# de entrar los resultados: la misma pagina que a la app le da 403 abre
+# perfecto desde un navegador comun.
+#
+# Ahora se presenta como un navegador normal y manda las mismas cabeceras
+# que manda Chrome. Se puede cambiar desde Render sin tocar el codigo,
+# con la variable NAVEGADOR.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; LEA-WIN-IA/1.0)",
-    "Accept-Language": "es-AR,es;q=0.9"
+    "User-Agent": os.getenv(
+        "NAVEGADOR",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
 }
 DB = os.getenv("LEA_DB", "lea_win.db")
 # Version de los terminos. Al cambiarlos, subir esta fecha: asi queda
