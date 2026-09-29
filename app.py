@@ -470,6 +470,16 @@ TTL_CALENDARIO = int(os.getenv("TTL_CALENDARIO", str(20 * 60 * 60)))
 TTL_REUNION = int(os.getenv("TTL_REUNION", str(12 * 60 * 60)))
 TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
 TTL_CARRERA_SIN_CORRER = int(os.getenv("TTL_SIN_CORRER", str(40 * 60)))
+# Una reunion que YA PASO no cambia nunca mas: la lista de carreras del
+# 27 no se va a modificar hoy. Antes valia 12 horas igual que la de hoy,
+# asi que al dia siguiente la app volvia al Stud Book de gusto, tardaba
+# los 9 segundos de espera y despues mostraba el cartel rojo de
+# "los datos oficiales estan tardando". Eso era lo que se veia en las
+# jornadas ya corridas.
+TTL_REUNION_VIEJA = int(os.getenv("TTL_REUNION_VIEJA", str(30 * 24 * 60 * 60)))
+# Una carrera CON RESULTADO tampoco cambia mas. Mismo valor que usa la
+# tabulada desde siempre (TTL_DETALLE_CARRERA).
+TTL_RESULTADO = int(os.getenv("TTL_RESULTADO", str(30 * 24 * 60 * 60)))
 
 
 def _hora_de_la_carrera(url, numero):
@@ -514,7 +524,13 @@ def _cuanto_vale_guardada(data, fecha="", hora=""):
     """
     try:
         if any(p.get("puesto") for p in (data or {}).get("participantes", [])):
-            return TTL_CARRERA      # ya tiene resultado
+            # Ya tiene resultado: no cambia mas.
+            # OJO: antes esto devolvia TTL_CARRERA, que son 12 HORAS, no
+            # "para siempre". Al dia siguiente la app volvia a pedir una
+            # carrera que ya tenia el resultado puesto, esperaba los 9
+            # segundos y mostraba el cartel rojo de "los datos oficiales
+            # estan tardando". Es el mismo valor que ya usa la tabulada.
+            return TTL_RESULTADO
     except Exception:
         pass
 
@@ -535,6 +551,101 @@ def _cuanto_vale_guardada(data, fecha="", hora=""):
 
     # Sin hora no se puede saber: se deja el comportamiento de antes.
     return TTL_CARRERA_SIN_CORRER
+
+
+def _cuanto_vale_la_reunion(guardado, fecha):
+    """
+    Lo mismo que _cuanto_vale_guardada, pero para la LISTA de carreras de
+    una reunion (el paso anterior a abrir una carrera).
+
+    Esta era la unica de las tres puertas al Stud Book que no tenia la
+    regla: miraba el reloj y nada mas. Si lo guardado tenia mas de 12
+    horas, salia a pedirlo aunque la jornada fuera de anteayer.
+
+    La regla:
+      - FECHA ANTERIOR A HOY  -> no se pide nunca mas. Ya esta corrida.
+      - DE HOY Y YA TERMINO   -> tampoco. La ultima ya largo.
+      - DE HOY CON CARRERAS POR CORRER -> 12 horas, como antes: el sitio
+                                puede agregar o sacar carreras.
+      - DE UNA FECHA POR VENIR -> 12 horas, como antes, por lo mismo.
+      - NO HAY NADA GUARDADO  -> da igual lo que devuelva: con_cache ve
+                                que no hay cache y va al sitio igual.
+    """
+    if not guardado:
+        return TTL_REUNION
+
+    hoy = hoy_argentina()
+    if fecha and fecha < hoy:
+        return TTL_REUNION_VIEJA        # jornada pasada: no cambia mas
+
+    if fecha and fecha == hoy:
+        # ¿Quedo alguna por correrse? Se mira la hora de largada.
+        ahora = hora_argentina()
+        try:
+            for r in (guardado or []):
+                for c in r.get("carreras", []):
+                    h = str(c.get("hora") or "")
+                    if not h:
+                        return TTL_REUNION   # sin hora no se arriesga
+                    if h >= ahora:
+                        return TTL_REUNION   # todavia falta correr
+            return TTL_REUNION_VIEJA         # jornada terminada
+        except Exception:
+            return TTL_REUNION
+
+    return TTL_REUNION
+
+TTL_HORARIOS = int(os.getenv("TTL_HORARIOS", str(20 * 60 * 60)))
+
+
+def _horas_de_la_reunion(url, fecha="", hipodromo=""):
+    """
+    Las horas de largada de una reunion, SIN molestar al sitio si ya las
+    tenemos.
+
+    Para que sirve: el calendario necesita saber si la jornada de hoy
+    termino, y para eso mira la hora de la ultima carrera. Antes lo
+    resolvia pidiendole la reunion al Stud Book EN CADA VISITA de cada
+    persona. Con el sitio lento, la PRIMERA PANTALLA de la app tardaba
+    9 segundos. Y las horas de largada no cambian en todo el dia.
+
+    Se busca en este orden:
+      1) lo guardado por url (lo deja el trabajo de la madrugada)
+      2) la lista de carreras de esa reunion, que ya estaba guardada
+      3) recien ahi, el sitio; y si el sitio falla, lo ultimo que haya
+    """
+    clave = f"horarios:{url}"
+    guardado, fresco = cache_get(clave, TTL_HORARIOS)
+    if guardado is not None and fresco:
+        return guardado
+
+    # Lo que ya trajo la pantalla de carreras, para no pedir de nuevo.
+    if fecha and hipodromo:
+        try:
+            otra, _ = cache_get(
+                f"reuniones:{fecha}:{normalize_text(hipodromo)}", TTL_REUNION)
+            for r in (otra or []):
+                if r.get("url") == url and r.get("carreras"):
+                    horas = [c.get("hora", "") for c in r["carreras"]]
+                    cache_set(clave, horas)
+                    return horas
+        except Exception:
+            pass
+
+    try:
+        horas = [c.get("hora", "")
+                 for c in extract_races_from_meeting(fetch(url))]
+        if horas:
+            cache_set(clave, horas)
+        return horas
+    except Exception:
+        # Mejor lo viejo que hacer esperar: las horas no cambian.
+        # Si no habia nada guardado se devuelve None, no una lista vacia:
+        # asi quien llama sabe que el sitio no contesta y deja de probar
+        # con las demas reuniones en vez de esperar 9 segundos por cada
+        # una.
+        return guardado
+
 
 def cache_get(clave, ttl_seg):
     con = db()
@@ -2238,8 +2349,18 @@ def calendario():
                     de_hoy = [m for m in meetings if m["fecha"] == hoy]
                     quedan = False
                     for m in de_hoy:
-                        cs = extract_races_from_meeting(fetch(m["url"]))
-                        if any(c.get("hora") and c["hora"] >= ahora for c in cs):
+                        # Antes esto era fetch(m["url"]) a secas: un pedido
+                        # al Stud Book por reunion CADA VEZ que alguien abria
+                        # la app. Ahora usa lo guardado.
+                        horas = _horas_de_la_reunion(
+                            m["url"], hoy, m.get("hipodromo", ""))
+                        if horas is None:
+                            # El sitio no contesta y no hay nada guardado.
+                            # No tiene sentido esperar 9 segundos por cada
+                            # reunion que falta: se deja el dia como esta.
+                            quedan = True
+                            break
+                        if any(h and h >= ahora for h in horas):
                             quedan = True
                             break
                     jornada_terminada = not quedan
@@ -2333,7 +2454,11 @@ def reuniones():
         return output
 
     try:
-        output, origen = con_cache(clave, TTL_REUNION, forzar, traer)
+        # Cuanto vale lo guardado depende de la fecha: una jornada que ya
+        # se corrio no se vuelve a pedir. Antes eran 12 horas para todas.
+        guardado, _ = cache_get(clave, TTL_REUNION)
+        cuanto = _cuanto_vale_la_reunion(guardado, fecha)
+        output, origen = con_cache(clave, cuanto, forzar, traer)
         # Por si el cache guardo el nombre sucio.
         for r in output:
             r["hipodromo"] = _limpiar_nombre_hipodromo(r.get("hipodromo", ""))
@@ -2746,6 +2871,14 @@ def api_caballo():
         cache_set(clave, caballo)
         return jsonify(ok=True, **caballo)
     except Exception as e:
+        # Si el sitio no contesta pero la campaña estaba guardada, se
+        # muestra la guardada. Antes se tiraba y salia un error, teniendo
+        # el dato a mano.
+        if cacheado is not None:
+            return jsonify(
+                ok=True, **cacheado,
+                aviso=("Los datos oficiales están tardando en llegar. "
+                       "Te mostramos la última versión que guardamos."))
         return jsonify(ok=False, error="No se pudo cargar el caballo.", detalle=str(e)), 502
 
 
@@ -5228,6 +5361,10 @@ def traer_las_que_vienen(forzar=False):
                     "url": reunion["url"],
                     "carreras": carreras,
                 }])
+                # Las horas de largada, aparte y por url. Con esto el
+                # calendario sabe si la jornada termino sin ir al sitio.
+                cache_set(f"horarios:{reunion['url']}",
+                          [c.get("hora", "") for c in carreras])
 
                 # Y cada carrera con TODO: competidores, campañas y el
                 # pronostico ya armado. Asi el usuario abre y no espera
