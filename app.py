@@ -9778,6 +9778,10 @@ def recolectar(desde, hasta):
         calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
 
         reuniones = [r for r in calendario if desde <= r["fecha"] <= hasta]
+        # De lo mas nuevo a lo mas viejo: primero los resultados de ayer
+        # y anteayer, que son los que la gente busca. Antes empezaba por
+        # la fecha mas vieja del tramo y los de ayer entraban al final.
+        reuniones.sort(key=lambda r: r["fecha"], reverse=True)
         RECOLECTOR["reuniones_totales"] = len(reuniones)
         _log_recolector(f"{len(reuniones)} reuniones encontradas entre {desde} y {hasta}")
 
