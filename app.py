@@ -2299,6 +2299,45 @@ def calendario_del_mes(anio, mes):
         return cacheado or []
 
 
+def calendario_completo():
+    """
+    El calendario que usa la app: el mes ANTERIOR, el ACTUAL y el SIGUIENTE.
+
+    Por que: la pagina de reuniones del Stud Book muestra UN SOLO MES.
+    El 30 de septiembre las reuniones de octubre ya estaban publicadas,
+    pero no aparecian: la app solo miraba esa pagina y la pantalla no
+    mostraba ninguna fecha futura. Y el dia 1 de cada mes pasaba lo
+    contrario: desaparecian las fechas pasadas.
+
+    Pedidos al sitio: la pagina del mes actual, como antes. El mes
+    siguiente se guarda 20 horas y el anterior 90 dias (ya no cambia),
+    asi que casi siempre salen de lo guardado.
+    """
+    # Si esta pagina falla, el error sube como antes y se usa lo guardado.
+    actual = calendar_from_meetings(fetch(BASE + "/reuniones"))
+
+    hoy = ahora_argentina()
+    a, m = hoy.year, hoy.month
+    anterior = (a, m - 1) if m > 1 else (a - 1, 12)
+    siguiente = (a, m + 1) if m < 12 else (a + 1, 1)
+
+    juntas = list(actual)
+    vistas = {r["url"] for r in actual}
+    for anio, mes in (anterior, siguiente):
+        try:
+            for r in calendario_del_mes(anio, mes):
+                if r.get("url") and r["url"] not in vistas:
+                    vistas.add(r["url"])
+                    juntas.append(r)
+        except Exception:
+            # Si el otro mes no se pudo traer, se sigue con lo que hay:
+            # nunca dejar la app sin calendario por un mes extra.
+            continue
+
+    juntas.sort(key=lambda r: (r["fecha"], normalize_text(r["hipodromo"])))
+    return juntas
+
+
 def calendario_entre(desde, hasta):
     """Junta las reuniones de todos los meses entre dos fechas (AAAA-MM-DD)."""
     try:
@@ -2344,7 +2383,7 @@ def calendario():
     try:
         meetings, origen = con_cache(
             "calendario", TTL_CALENDARIO, forzar,
-            lambda: calendar_from_meetings(fetch(BASE + "/reuniones"))
+            lambda: calendario_completo()
         )
         if meetings:
             # El cache puede tener nombres viejos, con la sigla y los numeros
@@ -2445,7 +2484,8 @@ def reuniones():
     clave = f"reuniones:{fecha}:{normalize_text(hipodromo)}"
 
     def traer():
-        calendar = calendar_from_meetings(fetch(BASE + "/reuniones"))
+        # El completo: si no, una reunion del mes que viene no se encontraba.
+        calendar = calendario_completo()
         # El nombre puede venir sucio del cache viejo ("SIS San Isidro 13 131"),
         # asi que se compara con los dos limpios.
         buscado = normalize_text(_limpiar_nombre_hipodromo(hipodromo))
@@ -3588,8 +3628,13 @@ def ajustar_algoritmo():
         APRENDIZAJE.get("fichas_disponibles", 0),
         APRENDIZAJE.get("fichas_completas", 0))
 
-    # El acierto final, medido contra TODAS las carreras.
-    fin_g, fin_t = _cuanto_acierta(todas, pesos)
+    # El acierto final, medido IGUAL que el inicial: por las dos mitades.
+    # Antes usaba la lista "todas", que se borra mas arriba para ahorrar
+    # memoria: al llegar aca daba error y el informe final se perdia.
+    # Ademas asi el antes y el despues se comparan con las mismas carreras.
+    fin_ga, fin_ta = _acierto_por_tandas(pesos, "a")
+    fin_gb, fin_tb = _acierto_por_tandas(pesos, "b")
+    fin_g, fin_t = (fin_ga + fin_gb) / 2, (fin_ta + fin_tb) / 2
     ini_g, ini_t = (base_ga + base_gb) / 2, (base_ta + base_tb) / 2
 
     return {
@@ -5353,14 +5398,18 @@ def traer_las_que_vienen(forzar=False):
         try:
             # Se pide FRESCO y se guarda: es el unico momento del dia en
             # que se va a buscar. El resto del dia la app usa lo guardado.
-            calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+            calendario = calendario_completo()
             cache_set("calendario", calendario)
         except Exception as e:
             ADELANTO["ultimo"] = f"no se pudo abrir el calendario: {str(e)[:60]}"
             return {"ok": False, "motivo": ADELANTO["ultimo"]}
 
         # Solo de hoy en adelante: lo viejo ya no cambia.
-        proximas = [r for r in calendario if r["fecha"] >= hoy]
+        # Del mes que viene, solo las de la proxima semana: las demas
+        # todavia no tienen carreras y serian pedidos al sitio de balde.
+        en_7_dias = (ahora_argentina() + timedelta(days=7)).strftime("%Y-%m-%d")
+        proximas = [r for r in calendario if r["fecha"] >= hoy
+                    and (r["fecha"][:7] == hoy[:7] or r["fecha"] <= en_7_dias)]
         proximas.sort(key=lambda r: r["fecha"])
 
         for reunion in proximas:
@@ -7176,6 +7225,14 @@ def recolectar_historico():
                             }
                     except Exception:
                         pass
+                    finally:
+                        # Antes nunca se volvia a poner en False: despues
+                        # de la primera mañana quedaba "trabajando" para
+                        # siempre, no volvia a afinar solo hasta el proximo
+                        # deploy, y el boton del panel decia "ya se esta
+                        # afinando" sin estar haciendo nada.
+                        AJUSTE["corriendo"] = False
+                        AJUSTE["paso"] = ""
         except Exception:
             pass
         time.sleep(30)
@@ -7485,7 +7542,7 @@ def admin_carreras_guardadas():
     hoy = hoy_argentina()
     try:
         calendario, _ = con_cache("calendario", TTL_CALENDARIO, False,
-                                  lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+                                  lambda: calendario_completo())
     except Exception:
         calendario = []
 
@@ -7757,7 +7814,7 @@ def api_buscar_fechas():
     # 1) Lo que el sitio publica ahora.
     try:
         cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
-                           lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+                           lambda: calendario_completo())
         for r in cal or []:
             f = r["fecha"]
             hip = _limpiar_nombre_hipodromo(r["hipodromo"])
@@ -7848,7 +7905,7 @@ def api_carreras_de():
     # 2) Si no esta guardada, se pide al sitio.
     try:
         cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
-                           lambda: calendar_from_meetings(fetch(BASE + "/reuniones")))
+                           lambda: calendario_completo())
         buscado = normalize_text(_limpiar_nombre_hipodromo(hip)) if hip else ""
         for r in cal or []:
             if r["fecha"] != fecha:
