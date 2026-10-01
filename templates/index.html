@@ -1682,6 +1682,19 @@
     .comp-item{ gap:10px; padding:12px 10px; }
     .pron-row{ gap:10px; padding:12px 10px; }
   }
+  /* Buscar caballo y Caballos seguidos: blancos, como pidió Leandro. */
+  .hero .btn-ghost{ background:#fff; color:#141414; border-color:#fff; }
+  .hero .btn-ghost:hover{ background:#f5f5f2; color:#141414; border-color:#f5f5f2; }
+  /* Tarjeta de cada una de las ultimas carreras: que se note que se toca. */
+  .mini{ cursor:pointer; border:2px solid var(--naranja) !important; transition:transform .15s ease, box-shadow .15s ease; }
+  .mini:hover{ transform:translateY(-2px); box-shadow:0 6px 16px rgba(232,98,12,.25); }
+  .mini:active{ transform:scale(.98); }
+  .mini-ir{
+    display:flex; align-items:center; justify-content:space-between; gap:6px;
+    margin:10px -2px 0; padding:9px 10px; border-radius:8px;
+    background:var(--naranja); color:#fff; font-weight:800; font-size:15px;
+  }
+  .mini-video{ background:#141414; color:#fff; padding:3px 8px; border-radius:6px; font-size:14px; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -2240,16 +2253,14 @@ async function cargarCalendario(){
       grid.innerHTML = estadoMsg('No hay reuniones publicadas por ahora.', true);
       return;
     }
-    // Solo desde 10 dias atras hacia adelante. Las mas viejas se buscan
-    // con el calendario del buscador, no aca: si no la lista se hace
-    // larguisima y hay que bajar mucho para llegar a la de hoy.
+    // Las 3 ULTIMAS FECHAS con reunion, hoy, y TODAS las que vienen
+    // (aunque sean del mes siguiente). Antes eran 10 dias para atras:
+    // la lista era larga y la de hoy quedaba abajo. Las mas viejas se
+    // buscan con "Buscar carrera por fecha".
     const hoyCal = hoyArgentina || new Date().toISOString().slice(0,10);
-    const limite = new Date(hoyCal + 'T00:00:00');
-    limite.setDate(limite.getDate() - 10);
-    const desdeCal = limite.toISOString().slice(0,10);
-
     const todasLasFechas = [...new Set(calendarioCache.map(r => r.fecha))].sort();
-    const fechasUnicas = todasLasFechas.filter(f => f >= desdeCal);
+    const pasadas = todasLasFechas.filter(f => f < hoyCal).slice(-3);
+    const fechasUnicas = [...pasadas, ...todasLasFechas.filter(f => f >= hoyCal)];
     const cuantasViejas = todasLasFechas.length - fechasUnicas.length;
     grid.innerHTML = '';
     fechasUnicas.forEach(f=>{
@@ -3425,11 +3436,17 @@ function miniHTML(c, tab){
     ${acum ? '<div class="mini-acum">'+acum+'</div>' : ''}
     <div class="mini-pie">
       <span>${c.distancia ? c.distancia+' m' : ''}${c.tiempo ? ' · '+c.tiempo : ''}</span>
-      <span class="lupa">ampliar ›</span>
     </div>
     <div class="mini-pie" style="border:none; padding-top:3px; margin-top:0;">
       <span>${(tab && tab.pista) || c.pista_txt || ''}${
         (tab && tab.estado) || c.estado_txt ? ' · ' + ((tab && tab.estado) || c.estado_txt) : ''}</span>
+    </div>
+    <!-- Antes decia "ampliar" chiquito y no se notaba que se podia tocar.
+         Ahora es una barra que dice adonde lleva: al resultado completo
+         y, si la carrera tiene video, a verlo. -->
+    <div class="mini-ir">
+      <span style="white-space:nowrap">Resultado ›</span>
+      ${c.video ? '<span class="mini-video">▶ Video</span>' : ''}
     </div>`;
 }
 
