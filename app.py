@@ -126,9 +126,36 @@ ESPERA_CONECTAR = float(os.getenv("ESPERA_CONECTAR", "4"))
 ESPERA_RESPUESTA = float(os.getenv("ESPERA_RESPUESTA", "5"))
 
 
+# Una sesion por hilo: conserva las galletitas del sitio y reusa la
+# conexion. No se comparte entre hilos para no pisarse.
+_SESIONES = threading.local()
+
+
+def _sesion():
+    """
+    La sesion con la que se le pide al Stud Book.
+
+    POR QUE: pedir "a secas", sin sesion y sin Referer, el sitio lo
+    contesta con 403 (prohibido) y deja de entrar TODO: resultados,
+    campañas e historico. Comprobado el 2/10/2026 en el servidor, en el
+    mismo minuto y con la misma direccion:
+        sin sesion ni Referer -> 403
+        con sesion y Referer  -> 200
+    Es la misma forma que ya usaba _sesion_studbook() para traer los
+    meses viejos, que nunca fallo.
+    """
+    s = getattr(_SESIONES, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.headers["Referer"] = BASE + "/reuniones"
+        _SESIONES.s = s
+    return s
+
+
 def fetch(url, espera=None):
-    r = requests.get(url, headers=HEADERS,
-                     timeout=(ESPERA_CONECTAR, espera or ESPERA_RESPUESTA))
+    r = _sesion().get(url,
+                      timeout=(ESPERA_CONECTAR, espera or ESPERA_RESPUESTA))
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
@@ -686,6 +713,53 @@ def cache_set(clave, valor):
     """, (clave, json.dumps(valor, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")))
     con.commit()
     con.close()
+
+def lo_guardado(clave):
+    """
+    Lo guardado, sin fijarse hace cuanto se guardo.
+
+    LA REGLA, tal como la puso Leandro: "nadie debe ir al sitio".
+    Ninguna visita de un usuario pide nada al Stud Book. Si la carrera,
+    la reunion o el calendario estan guardados, se devuelven y listo.
+    Al sitio van SOLO las tareas de fondo.
+
+    Por que: antes lo guardado "vencia" a las 12 horas. La busqueda de
+    las 2 de la mañana traia la reunion del 5/10 con tres dias de
+    anticipacion, y 12 horas despues la app la daba por vieja. El
+    usuario que la abria salia al Stud Book, esperaba 9 segundos y veia
+    el cartel rojo de "los datos oficiales estan tardando", teniendo
+    todo guardado y correcto.
+    """
+    guardado, _ = cache_get(clave, 10 ** 9)
+    return guardado
+
+
+def _carreras_guardadas_de(url):
+    """
+    Las carreras de una reunion (numero y hora), SIN ir al sitio.
+    Se buscan en lo que dejo guardado la pantalla de reuniones.
+    Se busca por la FECHA de la direccion y se compara la direccion
+    entera, para no depender de como este escrito el hipodromo.
+    """
+    fecha = meeting_date_from_url(url)
+    if not fecha:
+        return []
+    try:
+        con = db()
+        filas = con.execute("SELECT valor FROM cache WHERE clave LIKE ?",
+                            (f"reuniones:{fecha}:%",)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    for f in filas:
+        try:
+            for r in (json.loads(f["valor"]) or []):
+                if r.get("url") == url and r.get("carreras"):
+                    return r["carreras"]
+        except Exception:
+            continue
+    return []
+
 
 def con_cache(clave, ttl_seg, forzar, fetch_fn):
     """
@@ -2381,10 +2455,18 @@ def saved_calendar():
 def calendario():
     forzar = request.args.get("refresh") == "1"
     try:
-        meetings, origen = con_cache(
-            "calendario", TTL_CALENDARIO, forzar,
-            lambda: calendario_completo()
-        )
+        # NADIE VA AL SITIO. El calendario guardado vale siempre: lo
+        # renuevan las tareas de fondo. Antes valia 20 horas, y pasadas
+        # esas horas la PRIMERA PANTALLA de la app salia al Stud Book y
+        # mostraba el cartel rojo aunque las 40 fechas estuvieran bien.
+        guardado = lo_guardado("calendario")
+        if guardado:
+            meetings, origen = guardado, "cache"
+        else:
+            meetings, origen = con_cache(
+                "calendario", TTL_CALENDARIO, forzar,
+                lambda: calendario_completo()
+            )
         if meetings:
             # El cache puede tener nombres viejos, con la sigla y los numeros
             # pegados. Se limpian aca tambien, para no depender de vaciarlo.
@@ -2509,11 +2591,22 @@ def reuniones():
             raise ValueError("sin carreras")
         return output
 
+    # NADIE VA AL SITIO. Si la lista de carreras esta guardada, se
+    # devuelve, sin importar hace cuanto. Antes valia 12 horas para las
+    # fechas de hoy y las que vienen, asi que la reunion del 5/10 traida
+    # el 2/10 de madrugada se daba por vieja y la visita salia a
+    # buscarla.
+    guardado = lo_guardado(clave)
+    if guardado:
+        for r in guardado:
+            r["hipodromo"] = _limpiar_nombre_hipodromo(r.get("hipodromo", ""))
+        return jsonify(ok=True, reuniones=guardado,
+                       hoy=hoy_argentina(), ahora=hora_argentina())
+
     try:
-        # Cuanto vale lo guardado depende de la fecha: una jornada que ya
-        # se corrio no se vuelve a pedir. Antes eran 12 horas para todas.
-        guardado, _ = cache_get(clave, TTL_REUNION)
-        cuanto = _cuanto_vale_la_reunion(guardado, fecha)
+        # Sin nada guardado si se va al sitio: es la unica forma de
+        # mostrarle algo.
+        cuanto = TTL_REUNION
         output, origen = con_cache(clave, cuanto, forzar, traer)
         # Por si el cache guardo el nombre sucio.
         for r in output:
@@ -2551,10 +2644,19 @@ def _es_la_proxima(url, numero):
     hoy = hoy_argentina()
     ahora = hora_argentina()
 
-    try:
-        carreras = extract_races_from_meeting(fetch(url))
-    except Exception:
-        return False
+    # NADIE VA AL SITIO. Antes esto hacia fetch(url) en CADA visita de
+    # un usuario sin suscripcion, sin guardar nada y sin respaldo: con
+    # el Stud Book devolviendo 403, el permiso no se podia confirmar y
+    # la app contestaba 401 en TODAS las carreras. El visitante sin
+    # cuenta no podia abrir ninguna.
+    carreras = _carreras_guardadas_de(url)
+    if not carreras:
+        # Nada guardado de esa reunion: es el unico caso en que se va al
+        # sitio, porque si no, no hay con que decidir.
+        try:
+            carreras = extract_races_from_meeting(fetch(url))
+        except Exception:
+            return False
     if not carreras:
         return False
 
@@ -2577,17 +2679,20 @@ def _es_la_proxima(url, numero):
 
 
 def _hoy_ya_termino():
-    """True si no queda ninguna carrera por correrse hoy."""
+    """
+    True si no queda ninguna carrera por correrse hoy.
+
+    NADIE VA AL SITIO: antes pedia el calendario Y CADA reunion de hoy
+    al Stud Book, en cada visita de un usuario sin suscripcion.
+    """
     hoy = hoy_argentina()
     ahora = hora_argentina()
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
+    calendario = lo_guardado("calendario")
+    if not calendario:
         return False
     for r in [x for x in calendario if x["fecha"] == hoy]:
-        try:
-            carreras = extract_races_from_meeting(fetch(r["url"]))
-        except Exception:
+        carreras = _carreras_guardadas_de(r["url"])
+        if not carreras:
             continue
         if any(c.get("hora") and c["hora"] >= ahora for c in carreras):
             return False
@@ -2595,11 +2700,13 @@ def _hoy_ya_termino():
 
 
 def _es_la_fecha_mas_proxima(fecha):
-    """True si no hay ninguna reunion entre hoy y esa fecha."""
+    """
+    True si no hay ninguna reunion entre hoy y esa fecha.
+    NADIE VA AL SITIO: usa el calendario guardado.
+    """
     hoy = hoy_argentina()
-    try:
-        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
-    except Exception:
+    calendario = lo_guardado("calendario")
+    if not calendario:
         return False
     futuras = sorted({r["fecha"] for r in calendario if r["fecha"] > hoy})
     return bool(futuras) and fecha == futuras[0]
@@ -2638,12 +2745,32 @@ def carrera():
             raise ValueError("carrera no encontrada")
         return data
 
-    # Cuanto vale lo guardado depende de si ya se corrio: con resultado
-    # sirve todo el dia, sin resultado hay que volver a pedirla.
-    guardada, _ = cache_get(clave, TTL_CARRERA)
-    cuanto = _cuanto_vale_guardada(
-        guardada, meeting_date_from_url(url),
-        (guardada or {}).get("hora", "") or _hora_de_la_carrera(url, numero))
+    def _anotar():
+        try:
+            f = meeting_date_from_url(url)
+            m = re.search(r"/\d{8}-([a-z\-]+?)-\d+", url)
+            hip = m.group(1).replace("-", " ").title() if m else ""
+            anotar_uso("carrera", f"{f} · {hip} · {numero}ª" if f else url[-40:])
+            if hip:
+                anotar_uso("hipodromo", hip)
+        except Exception:
+            pass
+
+    # NADIE VA AL SITIO. Si la carrera esta guardada, se devuelve lo
+    # guardado, haga 1 minuto o 3 dias. Quien la mantiene al dia son las
+    # tareas de fondo: el refresco de hora y media antes (retiros) y el
+    # que completa los resultados cada 15 minutos.
+    # El boton Actualizar tampoco sale al sitio: vuelve a leer lo
+    # guardado, que las tareas de fondo ya dejaron fresco.
+    guardada = lo_guardado(clave)
+    if guardada is not None:
+        _anotar()
+        return jsonify(ok=True, **guardada)
+
+    # Solo si NO hay nada guardado se va al sitio: es la unica forma de
+    # mostrarle algo. Con el trabajo de las 2 de la mañana al dia, esto
+    # no deberia pasar nunca.
+    cuanto = TTL_CARRERA_SIN_CORRER
 
     try:
         data, origen = con_cache(clave, cuanto, forzar, traer)
@@ -5465,6 +5592,73 @@ def traer_las_que_vienen(forzar=False):
         ADELANTO["trabajando"] = False
 
 
+MINUTOS_PARA_EL_RESULTADO = int(os.getenv("MINUTOS_RESULTADO", "40"))
+
+# Cuando se busco por ultima vez el resultado de cada reunion, para no
+# pedirlo mas seguido de lo acordado.
+_ULTIMA_BUSQUEDA_RESULTADO = {}
+
+
+def completar_resultados():
+    """
+    Busca el resultado de las carreras de HOY que ya largaron y todavia
+    no lo tienen. Si no esta, vuelve a buscarlo cada 40 minutos hasta
+    encontrarlo.
+
+    Hace falta porque ahora NADIE VA AL SITIO: antes el resultado lo
+    traia, sin querer, la visita de un usuario. Si ya nadie va, el
+    resultado entraria recien con el repaso de cada 6 horas.
+
+    NUNCA TRABA NADA: corre de fondo, en su propio hilo. Mientras tanto
+    la carrera se sigue mostrando con su pronostico, como siempre.
+
+    Es barata: la pagina de la reunion trae TODAS sus carreras juntas,
+    asi que se pide UNA vez por reunion y se completan todas las que
+    falten. Y si no falta ninguna, no se pide nada.
+    """
+    completadas = 0
+    faltan = {}
+    for c in _carreras_de_hoy_guardadas():
+        minutos = _minutos_para(c.get("hora"))
+        if minutos is None:
+            continue
+        # Todavia no largo, o largo hace menos de 40 minutos: se espera.
+        if minutos > -MINUTOS_PARA_EL_RESULTADO:
+            continue
+        data = c.get("data") or {}
+        if any(p.get("puesto") for p in data.get("participantes", [])):
+            continue        # ya tiene resultado
+        faltan.setdefault(c["url"], []).append(c["numero"])
+
+    if not faltan:
+        return 0            # nada que completar: no se molesta al sitio
+
+    ahora = time.time()
+    for url, numeros in faltan.items():
+        # Cada 40 minutos por reunion, no en cada vuelta de 15.
+        ultima = _ULTIMA_BUSQUEDA_RESULTADO.get(url, 0)
+        if ahora - ultima < MINUTOS_PARA_EL_RESULTADO * 60:
+            continue
+        _ULTIMA_BUSQUEDA_RESULTADO[url] = ahora
+        try:
+            soup = fetch(url)
+        except Exception:
+            continue        # el sitio no contesta: se prueba en 40 minutos
+        for n in numeros:
+            try:
+                data = parse_race(soup, n)
+            except Exception:
+                continue
+            if not data:
+                continue
+            if not any(p.get("puesto") for p in data.get("participantes", [])):
+                continue    # el sitio todavia no lo publico
+            cache_set(f"carrera:{url}:{n}", data)
+            completadas += 1
+
+    return completadas
+
+
 def refrescar_las_que_estan_por_correrse():
     """
     Vuelve a pedir las carreras que salen en la proxima hora y media.
@@ -5593,6 +5787,15 @@ def revision_de_avisos():
     """
     time.sleep(90)
     while True:
+        # PRIMERO los resultados: asi el aviso de "ganó / salió 2º" sale
+        # en la misma vuelta, con el resultado ya guardado.
+        # Es la unica tarea que trae resultados, porque la visita del
+        # usuario ya no va al sitio.
+        try:
+            completar_resultados()
+        except Exception:
+            pass
+
         try:
             revisar_caballos_seguidos()
         except Exception:
