@@ -2867,6 +2867,90 @@ def _armar_resultado(item):
     }
 
 
+def _buscar_en_lo_guardado(termino):
+    """
+    Busca el caballo en la base propia, sin molestar al sitio.
+
+    Hay casi 25.000 caballos guardados en la tabla fichas. Antes el
+    buscador iba al Stud Book SIEMPRE, hasta diez consultas por
+    busqueda: con el sitio caido no encontraba nada, aunque el caballo
+    estuviera guardado.
+    """
+    objetivo = normalize_text(termino)
+    if len(objetivo) < 3:
+        return []
+    try:
+        con = db()
+        filas = con.execute(
+            "SELECT perfil, nombre, datos FROM fichas WHERE nombre LIKE ? "
+            "ORDER BY LENGTH(nombre) LIMIT 60",
+            (f"%{termino}%",)).fetchall()
+        con.close()
+    except Exception:
+        return []
+
+    salida = []
+    for f in filas:
+        nombre = clean(f["nombre"] or "")
+        if not nombre or objetivo not in normalize_text(nombre):
+            continue
+        try:
+            d = json.loads(f["datos"] or "{}") or {}
+        except Exception:
+            d = {}
+        partes = []
+        if d.get("logro"):
+            partes.append(clean(str(d["logro"])))
+        padres = " y ".join(clean(str(d[k])) for k in ("padre", "madre")
+                            if d.get(k))
+        if padres:
+            partes.append("por " + padres)
+        salida.append({
+            "nombre": nombre,
+            "perfil": f["perfil"],
+            "detalle": " ".join(partes),
+            "sexo": clean(str(d.get("sexo", ""))),
+            "nacimiento": clean(str(d.get("nacimiento", ""))),
+            "pelo": clean(str(d.get("pelo", ""))),
+            "guardado": True,
+        })
+
+    # El que se escribio igual, primero.
+    pegado = objetivo.replace(" ", "")
+    salida.sort(key=lambda r: (
+        normalize_text(r["nombre"]).replace(" ", "") != pegado,
+        len(r["nombre"])))
+    return salida[:15]
+
+
+def guardar_ficha_de_caballo(perfil, nombre, carreras, datos):
+    """
+    Deja el caballo en la tabla fichas, que es la que lee el algoritmo.
+
+    IMPORTANTE: se guarda TAMBIEN si no corrio nunca. Un caballo sin
+    campaña igual trae padre, madre, sexo y edad, y eso sirve para los
+    cruces de pedigree. Antes la ficha de un caballo abierto a mano
+    quedaba solo en el cache, que vence, y nunca entraba a fichas.
+    """
+    if not perfil or not nombre:
+        return False
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, datos,
+                                          actualizada_en)
+            VALUES(?,?,?,?,?)
+        """, (perfil, nombre,
+              json.dumps(carreras or [], ensure_ascii=False),
+              json.dumps(datos or {}, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
 def buscar_ejemplares(termino):
     """
     Busca caballos por nombre. Sortea las dos limitaciones del buscador del
@@ -2883,6 +2967,13 @@ def buscar_ejemplares(termino):
     cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
     if cacheado is not None and fresco:
         return cacheado
+
+    # PRIMERO lo guardado. Si el caballo ya esta en la base, se contesta
+    # al instante y no se molesta al sitio.
+    propios = _buscar_en_lo_guardado(termino)
+    if propios:
+        cache_set(clave, propios)
+        return propios
 
     objetivo = normalize_text(termino)
     objetivo_pegado = objetivo.replace(" ", "")
@@ -3052,6 +3143,19 @@ def api_caballo():
 
         anotar_uso("caballo", caballo.get("nombre", ""))
         cache_set(clave, caballo)
+
+        # Y ademas a la tabla fichas, que es la que lee el algoritmo.
+        # Se guarda aunque NO HAYA CORRIDO NUNCA: igual trae padre,
+        # madre, sexo y edad, y eso sirve para los cruces de pedigree.
+        try:
+            guardar_ficha_de_caballo(
+                perfil, nombre, carreras,
+                {k: v for k, v in caballo.items()
+                 if k in ("sexo", "edad", "nacimiento", "pelo", "padre",
+                          "madre", "logro")})
+        except Exception:
+            pass
+
         return jsonify(ok=True, **caballo)
     except Exception as e:
         # Si el sitio no contesta pero la campaña estaba guardada, se
