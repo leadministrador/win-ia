@@ -71,14 +71,25 @@ BASE = "https://www.studbook.org.ar"
 # Ahora se presenta como un navegador normal y manda las mismas cabeceras
 # que manda Chrome. Se puede cambiar desde Render sin tocar el codigo,
 # con la variable NAVEGADOR.
+# Como se presenta la app ante el Stud Book.
+#
+# OJO: ESTAS CABECERAS SON EXACTAS. No tocarlas "para modernizarlas".
+# Comprobado en el servidor el 2/10/2026, en el mismo minuto y con la
+# misma direccion:
+#     Chrome/126.0 + Referer  ->  200 OK
+#     Chrome/140.0 + Referer  ->  403 Forbidden
+# El sitio mira el texto del navegador. Con Chrome/140 lo rechaza y deja
+# de entrar TODO: resultados, campañas e historico.
+# Son las mismas que usa _sesion_studbook(), que nunca fallo.
 HEADERS = {
     "User-Agent": os.getenv(
         "NAVEGADOR",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"),
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"),
     "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
                "image/avif,image/webp,*/*;q=0.8"),
-    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9",
     "Upgrade-Insecure-Requests": "1",
 }
 DB = os.getenv("LEA_DB", "lea_win.db")
