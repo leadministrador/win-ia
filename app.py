@@ -1381,7 +1381,21 @@ def detalle_de_carrera(url_carrera):
 TTL_FICHA_CABALLO = 6 * 60 * 60   # 6 horas: la campaña no cambia en el día
 
 
-def enrich_horse(horse):
+def enrich_horse(horse, ir_al_sitio=False):
+    """
+    Completa el caballo con su campaña.
+
+    ir_al_sitio=False (lo normal): usa SOLO lo guardado. Si el caballo no
+    tiene ficha, se devuelve sin campaña y listo.
+    ir_al_sitio=True: lo usan las TAREAS DE FONDO, que si pueden salir.
+
+    POR QUE: esto era lo ultimo que hacia esperar al usuario. Al abrir
+    una carrera, /api/enriquecer pedia la ficha de CADA caballo que no
+    estuviera guardado. De a 8, con 9 segundos de espera cada tanda:
+    14 caballos = hasta 18 segundos con la pantalla trabada. Y como el
+    servidor atiende de a uno, ese usuario dejaba a todos los demas
+    esperando.
+    """
     profile = horse.get("perfil", "")
     if not profile:
         return horse
@@ -1423,6 +1437,19 @@ def enrich_horse(horse):
                 return horse
     except Exception:
         pass
+
+    # NADIE VA AL SITIO. Hasta aca se busco en lo guardado.
+    if not ir_al_sitio:
+        # Ultimo intento antes de rendirse: el cache VIEJO. Mas arriba se
+        # descarto por tener mas de 6 horas, pero una campaña de ayer es
+        # muchisimo mejor que no mostrar nada.
+        if guardada is not None:
+            horse.update(guardada)
+            return horse
+        # No hay nada guardado: se muestra sin campaña. La ficha la trae
+        # esa noche el historico, que si puede salir.
+        horse["sin_ficha"] = True
+        return horse
 
     try:
         soup = fetch(profile)
@@ -5589,7 +5616,7 @@ def _dejar_todo_listo(data, reunion, carrera):
         for p in corredores:
             perfil = p.get("perfil", "")
             antes = cache_get(f"ficha:{perfil}", TTL_FICHA_CABALLO)[1] if perfil else True
-            completos.append(enrich_horse(dict(p)))
+            completos.append(enrich_horse(dict(p), ir_al_sitio=True))
             if perfil and not antes:
                 ADELANTO["campanas"] = ADELANTO.get("campanas", 0) + 1
                 time.sleep(pausa)
@@ -7095,7 +7122,7 @@ def guardar_carrera_historica(url):
             con_campana = []
             for p in corredores:
                 antes = cache_get(f"ficha:{p.get('perfil','')}", TTL_FICHA_CABALLO)[1]
-                completo = enrich_horse(dict(p))
+                completo = enrich_horse(dict(p), ir_al_sitio=True)
                 # SOLO lo anterior a esta carrera: si no, el pronostico
                 # ya sabria como termino y el acierto seria falso.
                 con_campana.append(_campana_hasta(completo, fecha))
@@ -10122,7 +10149,8 @@ def procesar_carrera(url_reunion, numero, fecha, hipodromo):
         # el puesto real ya alcanza y evitamos miles de pedidos extra.
         ya_corrida = any(p.get("puesto") for p in participantes)
         if not ya_corrida:
-            participantes = [enrich_horse(dict(p)) for p in participantes]
+            participantes = [enrich_horse(dict(p), ir_al_sitio=True)
+                             for p in participantes]
 
         pesos = cargar_pesos()
         ranked, top = rankear(
