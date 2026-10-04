@@ -2206,11 +2206,31 @@ function cabecerasSesion(){
   return h;
 }
 
+// Lee la respuesta con cuidado. Si el servidor devuelve una pagina de
+// error (HTML) en vez de datos, r.json() reventaba con "unexpected
+// token '<'", que al usuario no le dice nada. Ahora se avisa claro.
+async function leerRespuesta(r){
+  const texto = await r.text();
+  try{
+    return JSON.parse(texto);
+  }catch(e){
+    return {
+      ok: false,
+      error: 'El servidor tardó demasiado y cortó la respuesta.',
+      que_hacer: 'Probá de nuevo en unos segundos.',
+      reintentar: true,
+      corto: true,
+    };
+  }
+}
+
 async function apiGet(url){
   const r = await fetch(url, {headers: cabecerasSesion()});
-  const data = await r.json();
+  const data = await leerRespuesta(r);
   if (!r.ok || data.ok === false){
     const err = new Error(data.error || 'Error de conexión con el servidor.');
+    err.estado = r.status;
+    err.corto = !!data.corto;
     err.necesitaCuenta = !!data.necesita_cuenta;
     err.necesitaPagar = !!data.necesita_pagar;
     err.noExiste = !!data.no_existe;
@@ -2227,8 +2247,13 @@ async function apiPost(url, body){
     headers:{'Content-Type':'application/json', ...cabecerasSesion()},
     body: JSON.stringify(body)
   });
-  const data = await r.json();
-  if (!r.ok || data.ok === false) throw new Error(data.error || 'Error de conexión con el servidor.');
+  const data = await leerRespuesta(r);
+  if (!r.ok || data.ok === false){
+    const err = new Error(data.error || 'Error de conexión con el servidor.');
+    err.estado = r.status;
+    err.corto = !!data.corto;
+    throw err;
+  }
   return data;
 }
 
@@ -3106,22 +3131,63 @@ function iniciarBuscador(){
 async function consultarSugerencias(q){
   const sug = document.getElementById('sug-caballo');
   const miNumero = ++sugPeticion;   // para descartar respuestas viejas
-  try{
-    const d = await apiGet('/api/buscar-caballo?q=' + encodeURIComponent(q));
-    if (miNumero !== sugPeticion) return;   // llegó tarde, ya escribió otra cosa
+
+  // EL CABALLITO, pero solo si la busqueda TARDA. Si el caballo ya esta
+  // guardado contesta en milesimas y mostrarlo seria un parpadeo feo.
+  // Si no esta guardado hay que ir al Stud Book y ahi sí se agradece
+  // ver que la app esta trabajando y no colgada.
+  let barraPuesta = false;
+  const tempCaballito = setTimeout(()=>{
+    if (miNumero === sugPeticion){
+      barraPuesta = true;
+      mostrarBarra('Buscando «' + q + '»', 'Buscando el caballo');
+    }
+  }, 600);
+  const limpiar = ()=>{
+    clearTimeout(tempCaballito);
+    if (barraPuesta) ocultarBarra();
+  };
+
+  // DOS INTENTOS. Si el primero se corta, se reintenta solo: antes el
+  // usuario veia el error y tenia que volver a escribir todo.
+  // No se reintenta si falta cuenta o si el caballo no existe: ahi
+  // reintentar no cambiaria nada.
+  let d = null, falla = null;
+  for (let intento = 1; intento <= 2; intento++){
+    try{
+      d = await apiGet('/api/buscar-caballo?q=' + encodeURIComponent(q));
+      falla = null;
+      break;
+    }catch(e){
+      falla = e;
+      if (miNumero !== sugPeticion){ limpiar(); return; }
+      if (e.necesitaCuenta || e.necesitaPagar || e.estado === 404) break;
+      if (intento === 1){
+        barraPuesta = true;
+        mostrarBarra('Está tardando. Probando de nuevo', 'Buscando el caballo');
+      }
+    }
+  }
+
+  limpiar();
+  if (miNumero !== sugPeticion) return;   // llegó tarde, ya escribió otra cosa
+
+  if (!falla){
     sugUltimos = d.resultados || [];
     sugActivo = -1;
     pintarSugerencias(sugUltimos, q);
-  }catch(e){
-    if (miNumero !== sugPeticion) return;
-    sugUltimos = [];
-    if (e.necesitaCuenta || e.necesitaPagar){
-      sug.innerHTML = e.necesitaPagar
-        ? invitacionPagar(e.message) : invitacionCuenta(e.message);
-      if (e.necesitaPagar) abrirAvisoPagar(); else abrirAvisoCuenta();
-    } else {
-      sug.innerHTML = '<div class="sug-estado">' + e.message + '</div>';
-    }
+    return;
+  }
+
+  sugUltimos = [];
+  const e = falla;
+  if (e.necesitaCuenta || e.necesitaPagar){
+    sug.innerHTML = e.necesitaPagar
+      ? invitacionPagar(e.message) : invitacionCuenta(e.message);
+    if (e.necesitaPagar) abrirAvisoPagar(); else abrirAvisoCuenta();
+  } else {
+    sug.innerHTML = '<div class="sug-estado">' + e.message
+      + (e.queHacer ? '<br>' + e.queHacer : '') + '</div>';
   }
 }
 
