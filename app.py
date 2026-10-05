@@ -536,24 +536,6 @@ TTL_REUNION_VIEJA = int(os.getenv("TTL_REUNION_VIEJA", str(30 * 24 * 60 * 60)))
 TTL_RESULTADO = int(os.getenv("TTL_RESULTADO", str(30 * 24 * 60 * 60)))
 
 
-def _hora_de_la_carrera(url, numero):
-    """La hora de largada, sacada de lo guardado. Vacio si no se sabe."""
-    try:
-        fecha = meeting_date_from_url(url)
-        calendario, _ = cache_get("calendario", TTL_CALENDARIO)
-        for r in (calendario or []):
-            if r["url"] != url:
-                continue
-            guardado, _ = cache_get(
-                f"reuniones:{fecha}:{normalize_text(r['hipodromo'])}",
-                TTL_REUNION)
-            for x in (guardado or []):
-                for c in x.get("carreras", []):
-                    if str(c.get("numero")) == str(numero):
-                        return c.get("hora", "")
-    except Exception:
-        pass
-    return ""
 
 
 def _cuanto_vale_guardada(data, fecha="", hora=""):
@@ -607,47 +589,6 @@ def _cuanto_vale_guardada(data, fecha="", hora=""):
     return TTL_CARRERA_SIN_CORRER
 
 
-def _cuanto_vale_la_reunion(guardado, fecha):
-    """
-    Lo mismo que _cuanto_vale_guardada, pero para la LISTA de carreras de
-    una reunion (el paso anterior a abrir una carrera).
-
-    Esta era la unica de las tres puertas al Stud Book que no tenia la
-    regla: miraba el reloj y nada mas. Si lo guardado tenia mas de 12
-    horas, salia a pedirlo aunque la jornada fuera de anteayer.
-
-    La regla:
-      - FECHA ANTERIOR A HOY  -> no se pide nunca mas. Ya esta corrida.
-      - DE HOY Y YA TERMINO   -> tampoco. La ultima ya largo.
-      - DE HOY CON CARRERAS POR CORRER -> 12 horas, como antes: el sitio
-                                puede agregar o sacar carreras.
-      - DE UNA FECHA POR VENIR -> 12 horas, como antes, por lo mismo.
-      - NO HAY NADA GUARDADO  -> da igual lo que devuelva: con_cache ve
-                                que no hay cache y va al sitio igual.
-    """
-    if not guardado:
-        return TTL_REUNION
-
-    hoy = hoy_argentina()
-    if fecha and fecha < hoy:
-        return TTL_REUNION_VIEJA        # jornada pasada: no cambia mas
-
-    if fecha and fecha == hoy:
-        # ¿Quedo alguna por correrse? Se mira la hora de largada.
-        ahora = hora_argentina()
-        try:
-            for r in (guardado or []):
-                for c in r.get("carreras", []):
-                    h = str(c.get("hora") or "")
-                    if not h:
-                        return TTL_REUNION   # sin hora no se arriesga
-                    if h >= ahora:
-                        return TTL_REUNION   # todavia falta correr
-            return TTL_REUNION_VIEJA         # jornada terminada
-        except Exception:
-            return TTL_REUNION
-
-    return TTL_REUNION
 
 TTL_HORARIOS = int(os.getenv("TTL_HORARIOS", str(20 * 60 * 60)))
 
@@ -686,19 +627,12 @@ def _horas_de_la_reunion(url, fecha="", hipodromo=""):
         except Exception:
             pass
 
-    try:
-        horas = [c.get("hora", "")
-                 for c in extract_races_from_meeting(fetch(url))]
-        if horas:
-            cache_set(clave, horas)
-        return horas
-    except Exception:
-        # Mejor lo viejo que hacer esperar: las horas no cambian.
-        # Si no habia nada guardado se devuelve None, no una lista vacia:
-        # asi quien llama sabe que el sitio no contesta y deja de probar
-        # con las demas reuniones en vez de esperar 9 segundos por cada
-        # una.
-        return guardado
+    # NADIE VA AL SITIO: la primera pantalla de la app no puede esperar
+    # al Stud Book (medido el 4/10/2026: 5 s con el sitio colgado). Lo
+    # guardado vale sin importar la edad: las horas de largada no cambian.
+    # Las guarda la tarea de las 2 de la mañana (traer_las_que_vienen).
+    # Si no hay nada, None: quien llama ya sabe tratarlo.
+    return guardado
 
 
 def cache_get(clave, ttl_seg):
@@ -1340,19 +1274,25 @@ def _resumen_del_perfil(soup, texto):
 TTL_DETALLE_CARRERA = 30 * 24 * 60 * 60   # 30 dias: una carrera corrida ya no cambia
 
 
-def detalle_de_carrera(url_carrera):
+def detalle_de_carrera(url_carrera, ir_al_sitio=True):
     """
     Entra a la pagina de una carrera y saca, en palabras, la condicion
     y el estado de la pista. Se guarda en cache porque una carrera ya
     corrida no cambia nunca.
+
+    ir_al_sitio=False: lo usan las VISITAS. Solo lo guardado, sin
+    importar la edad (una carrera corrida no cambia). Las tareas de fondo
+    siguen llamando con True y son las que lo traen del sitio.
     """
     if not url_carrera:
         return {}
 
     clave = f"detalle_carrera:{url_carrera}"
     cacheado, fresco = cache_get(clave, TTL_DETALLE_CARRERA)
-    if cacheado is not None and fresco:
+    if cacheado is not None and (fresco or not ir_al_sitio):
         return cacheado
+    if not ir_al_sitio:
+        return {}
 
     try:
         soup = fetch(url_carrera)
@@ -2851,7 +2791,7 @@ TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
 RUTA_AUTOCOMPLETE = "/ejemplares/autocomplete?tipo=1&muerto=1&term={q}"
 
 
-def _consultar_autocomplete(termino, tipo="1", muerto="1"):
+def _consultar_autocomplete(termino, tipo="1", muerto="1", espera=10):
     """
     Consulta cruda al autocompletado del Stud Book.
     Comprobado en el sitio: solo responde con UNA palabra (sin espacios) y
@@ -2865,11 +2805,14 @@ def _consultar_autocomplete(termino, tipo="1", muerto="1"):
     url = (f"{BASE}/ejemplares/autocomplete"
            f"?tipo={tipo}&muerto={muerto}&term={quote(termino)}")
     try:
-        r = requests.get(url, headers=cabeceras, timeout=(4, 10))
+        r = requests.get(url, headers=cabeceras,
+                         timeout=(min(4, espera), espera))
         r.raise_for_status()
         datos = r.json()
     except Exception:
-        return []
+        # None (y no lista vacia): asi quien llama distingue "el sitio no
+        # contesto" de "el sitio contesto que no hay ninguno".
+        return None
     if isinstance(datos, dict):
         datos = datos.get("results") or datos.get("data") or []
     return datos if isinstance(datos, list) else []
@@ -3002,9 +2945,6 @@ def buscar_ejemplares(termino):
         return []
 
     clave = f"busqueda4:{normalize_text(termino)}"
-    cacheado, fresco = cache_get(clave, TTL_BUSQUEDA)
-    if cacheado is not None and fresco:
-        return cacheado
 
     # PRIMERO lo guardado. Si el caballo ya esta en la base, se contesta
     # al instante y no se molesta al sitio.
@@ -3013,15 +2953,59 @@ def buscar_ejemplares(termino):
         cache_set(clave, propios)
         return propios
 
+    # Una busqueda anterior que el sitio SI contesto vale siempre, sin
+    # importar hace cuanto (regla de Leandro: nadie va al sitio si esta
+    # guardado). Una lista vacia no cuenta: pudo ser el sitio caido.
+    cacheado, _ = cache_get(clave, TTL_BUSQUEDA)
+    if cacheado:
+        return cacheado
+
+    # LA UNICA EXCEPCION a "nadie va al sitio": un caballo que la app no
+    # tiene (por ejemplo, uno que nunca corrio). Medido el 4/10/2026 con el
+    # sitio colgado: hacia hasta 7 consultas de 10 s = 70 s, y 8 busquedas
+    # asi ocupaban los 8 hilos y frenaban a TODOS los usuarios.
+    # Ahora: como maximo 2 busquedas al sitio a la vez, 3 consultas cada
+    # una y 10 s en total. La 3a no espera: recibe "probá en un minuto".
+    if not _TURNOS_STUDBOOK.acquire(blocking=False):
+        raise SitioOcupado()
+    try:
+        return _buscar_en_el_sitio(termino, clave)
+    finally:
+        _TURNOS_STUDBOOK.release()
+
+
+class SitioOcupado(Exception):
+    """Ya hay 2 visitas esperando al Stud Book: no se suma otra."""
+
+
+class SitioNoContesto(Exception):
+    """El Stud Book no respondio dentro del tiempo limite."""
+
+
+# Cuantas visitas pueden estar esperando al Stud Book al mismo tiempo.
+# Las tareas de fondo NO usan esto: tienen su propio hilo.
+_TURNOS_STUDBOOK = threading.BoundedSemaphore(
+    int(os.getenv("VISITAS_AL_SITIO", "2")))
+TIEMPO_MAXIMO_SITIO = float(os.getenv("TIEMPO_MAXIMO_SITIO", "10"))
+
+
+def _buscar_en_el_sitio(termino, clave):
+
     objetivo = normalize_text(termino)
     objetivo_pegado = objetivo.replace(" ", "")
     palabras = termino.split()
 
     vistos, encontrados = set(), []
     consultas = 0
-    MAX_CONSULTAS = 10
+    contesto = False            # ¿el sitio respondio al menos una vez?
+    MAX_CONSULTAS = int(os.getenv("CONSULTAS_AL_SITIO", "3"))
+    hasta = time.time() + TIEMPO_MAXIMO_SITIO
 
     def agregar(lista):
+        nonlocal contesto
+        if lista is None:
+            return
+        contesto = True
         for item in lista:
             if not isinstance(item, dict):
                 continue
@@ -3041,8 +3025,11 @@ def buscar_ejemplares(termino):
         nonlocal consultas
         if consultas >= MAX_CONSULTAS or not q:
             return
+        queda = hasta - time.time()
+        if queda < 1:
+            return
         consultas += 1
-        agregar(_consultar_autocomplete(q, tipo, muerto))
+        agregar(_consultar_autocomplete(q, tipo, muerto, espera=queda))
 
     # 1) El termino TAL COMO SE ESCRIBIO, con espacios y todo.
     #    Comprobado con el diagnostico: el sitio si acepta espacios.
@@ -3085,7 +3072,12 @@ def buscar_ejemplares(termino):
 
     filtrados.sort(key=orden)
     resultado = filtrados[:25] if filtrados else sorted(encontrados, key=orden)[:25]
-    cache_set(clave, resultado)
+    if not contesto:
+        raise SitioNoContesto()
+    if resultado:
+        # Solo se guarda lo que encontro: guardar una lista vacia haria
+        # que despues nunca se vuelva a buscar ese nombre.
+        cache_set(clave, resultado)
     return resultado
 
 
@@ -3105,10 +3097,19 @@ def api_buscar_caballo():
     termino = request.args.get("q", "").strip()
     if len(termino) < 3:
         return jsonify(ok=False, error="Escribí al menos 3 letras."), 400
+    # Se contesta 404 (y no 502) a proposito: la pantalla reintenta sola
+    # cualquier otro error, y reintentar aca solo duplicaria la espera.
     try:
         resultados = buscar_ejemplares(termino)
+    except SitioOcupado:
+        return jsonify(ok=False, ocupado=True,
+                       error="Estamos buscando otros caballos. "
+                             "Probá en un minuto.", resultados=[]), 404
     except Exception:
-        return jsonify(ok=False, error="No se pudo buscar en este momento."), 502
+        return jsonify(ok=False,
+                       error=f"No encontramos «{termino}» en lo guardado y "
+                             "el Stud Book no contesta. Probá en un rato.",
+                       resultados=[]), 404
     if not resultados:
         return jsonify(
             ok=False,
@@ -3119,6 +3120,68 @@ def api_buscar_caballo():
     return jsonify(ok=True, resultados=resultados)
 
 
+def _caballo_guardado(perfil, cacheado):
+    """
+    La ficha del caballo armada con lo que la app ya tiene:
+      - la ficha completa que guardo una visita anterior (cache)
+      - la tabla fichas que llena el historico
+    Se usa la campaña MAS NUEVA de las dos. Las "proximas carreras" de una
+    copia vieja se filtran: una fecha que ya paso no es proxima.
+    """
+    ficha = None
+    try:
+        con = db()
+        ficha = con.execute(
+            "SELECT nombre, carreras, datos, actualizada_en FROM fichas "
+            "WHERE perfil=?", (perfil,)).fetchone()
+        guardado_en = con.execute(
+            "SELECT actualizado_en FROM cache WHERE clave=?",
+            (f"caballo:{perfil}",)).fetchone()
+        con.close()
+    except Exception:
+        guardado_en = None
+
+    if cacheado is None and ficha is None:
+        return None
+
+    caballo = dict(cacheado or {})
+    caballo["perfil"] = perfil
+    usar_ficha = ficha is not None and (
+        cacheado is None or not guardado_en
+        or (ficha["actualizada_en"] or "") > (guardado_en["actualizado_en"] or ""))
+    if usar_ficha:
+        try:
+            carreras = json.loads(ficha["carreras"] or "[]")
+            datos = json.loads(ficha["datos"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            carreras, datos = None, {}
+        if carreras is not None:
+            caballo["nombre"] = caballo.get("nombre") or ficha["nombre"] or ""
+            for k in ("sexo", "edad", "nacimiento", "pelo", "padre",
+                      "madre", "logro"):
+                if datos.get(k) and not caballo.get(k):
+                    caballo[k] = datos[k]
+            puestos = [c.get("puesto") for c in carreras if c.get("puesto")]
+            caballo["carreras"] = carreras[:30]
+            caballo["corridas"] = len(carreras)
+            caballo["victorias"] = sum(1 for p in puestos if p == 1)
+            caballo["podios"] = sum(1 for p in puestos
+                                    if isinstance(p, int) and p <= 3)
+
+    hoy = hoy_argentina()
+    proximas = []
+    for p in caballo.get("proximas") or []:
+        m = re.search(r"(\d{2})/(\d{2})/(\d{4})", p.get("texto", ""))
+        if not m or f"{m.group(3)}-{m.group(2)}-{m.group(1)}" >= hoy:
+            proximas.append(p)
+    caballo["proximas"] = proximas
+    # Sin copia completa no se sabe si tiene proximas: no se afirma nada.
+    caballo["sin_proximas"] = bool(cacheado) and not proximas \
+        and bool(cacheado.get("sin_proximas"))
+    caballo.setdefault("carreras", [])
+    return caballo
+
+
 @app.get("/api/caballo")
 def api_caballo():
     """Ficha completa de un caballo: datos, próximas carreras y campaña."""
@@ -3127,10 +3190,21 @@ def api_caballo():
         return jsonify(ok=False, error="Dirección inválida."), 400
 
     clave = f"caballo:{perfil}"
-    cacheado, fresco = cache_get(clave, TTL_CARRERA)
-    if cacheado is not None and fresco:
-        return jsonify(ok=True, **cacheado)
+    cacheado, _ = cache_get(clave, TTL_CARRERA)
 
+    # NADIE VA AL SITIO si la app ya lo tiene, sin importar la edad.
+    # La ficha guardada por el historico (9.398 al 3/10/2026) trae la
+    # campaña completa; antes se ignoraba y se iba al Stud Book.
+    propio = _caballo_guardado(perfil, cacheado)
+    if propio:
+        return jsonify(ok=True, **propio)
+
+    # LA UNICA EXCEPCION: un caballo que la app no tiene (por ejemplo,
+    # uno que nunca corrio). Mismo tope que el buscador: 2 a la vez.
+    if not _TURNOS_STUDBOOK.acquire(blocking=False):
+        return jsonify(ok=False, ocupado=True,
+                       error="Estamos buscando otros caballos. "
+                             "Probá en un minuto."), 404
     try:
         soup = fetch(perfil)
         texto = clean(soup.get_text(" "))
@@ -3204,7 +3278,12 @@ def api_caballo():
                 ok=True, **cacheado,
                 aviso=("Los datos oficiales están tardando en llegar. "
                        "Te mostramos la última versión que guardamos."))
-        return jsonify(ok=False, error="No se pudo cargar el caballo.", detalle=str(e)), 502
+        return jsonify(ok=False,
+                       error="Todavía no tenemos los datos de este caballo "
+                             "y el Stud Book no contesta. Probá en un rato.",
+                       detalle=str(e)[:120]), 404
+    finally:
+        _TURNOS_STUDBOOK.release()
 
 
 @app.get("/api/detalle-carrera")
@@ -3213,9 +3292,12 @@ def api_detalle_carrera():
     url = request.args.get("url", "")
     if not url.startswith(BASE) and not url.startswith("https://studbook.org.ar"):
         return jsonify(ok=False, error="Dirección inválida."), 400
-    detalle = detalle_de_carrera(url)
+    # NADIE VA AL SITIO: solo lo guardado. Si no esta, la pantalla
+    # sigue sin el detalle (no muestra error); lo trae el fondo.
+    detalle = detalle_de_carrera(url, ir_al_sitio=False)
     if not detalle:
-        return jsonify(ok=False, error="No se pudo leer el detalle."), 502
+        return jsonify(ok=False, sin_datos=True,
+                       error="Todavía no hay datos de esta carrera."), 404
     return jsonify(ok=True, **detalle)
 
 
@@ -4083,9 +4165,13 @@ def admin_diagnostico():
         "variantes_con_algun_resultado": len(exitosos),
         "variantes_probadas": len(informe["intentos"]),
     }
-    informe["lo_que_usa_la_app"] = [
-        e["nombre"] for e in buscar_ejemplares(termino)
-    ]
+    try:
+        informe["lo_que_usa_la_app"] = [
+            e["nombre"] for e in buscar_ejemplares(termino)
+        ]
+    except Exception as e:
+        # Sitio ocupado o sin respuesta: el diagnostico sigue igual.
+        informe["lo_que_usa_la_app"] = f"no se pudo: {type(e).__name__}"
 
     return jsonify(ok=True, **informe)
 
@@ -4328,6 +4414,36 @@ def admin_diag_tabulada():
     return jsonify(ok=True, **informe)
 
 
+def _carrera_guardada_para_tabulada(url, numero):
+    """
+    Arma la carrera con lo que la app YA TIENE, sin ir al sitio:
+      1) la tabla del historico (16.188 carreras al 3/10/2026), que guarda
+         puesto, cuerpos, pago, jockey... de cada uno
+      2) la carrera guardada por la tarea de cada 15 minutos
+    """
+    try:
+        con = db()
+        f = con.execute(
+            "SELECT numero, distancia, pista, estado, participantes "
+            "FROM historico WHERE url=?", (url,)).fetchone()
+        con.close()
+        if f and f["participantes"]:
+            return {
+                "carrera": f["numero"],
+                "distancia": f["distancia"] or "",
+                "superficie": f["pista"] or "",
+                "estado": f["estado"] or "",
+                "participantes": json.loads(f["participantes"]),
+            }
+    except Exception:
+        pass
+    if numero.isdigit():
+        guardada = lo_guardado(f"carrera:{url}:{numero}")
+        if guardada and guardada.get("participantes"):
+            return guardada
+    return None
+
+
 @app.get("/api/tabulada")
 def api_tabulada():
     """
@@ -4341,27 +4457,19 @@ def api_tabulada():
         return jsonify(ok=False, error="Dirección inválida."), 400
 
     clave = f"tabulada:{url}:{numero}"
-    cacheado, fresco = cache_get(clave, TTL_DETALLE_CARRERA)
-    if cacheado is not None and fresco:
+    # NADIE VA AL SITIO. Una carrera corrida no cambia nunca: la tabulada
+    # guardada vale para siempre. Antes vencia a los 30 dias, iba al Stud
+    # Book y, si el sitio fallaba, mostraba ERROR teniendola guardada
+    # (medido el 4/10/2026: 5 s de espera y error).
+    cacheado, _ = cache_get(clave, TTL_DETALLE_CARRERA)
+    if cacheado is not None:
         return jsonify(ok=True, **cacheado)
 
-    try:
-        soup = fetch(url)
-    except Exception as e:
-        return jsonify(ok=False, error=f"No se pudo abrir la carrera: {e}"), 502
-
-    # La pagina de una carrera suele traer una sola; la de reunion, varias.
-    data = None
-    if numero.isdigit():
-        data = parse_race(soup, int(numero))
-    if not data:
-        # Probar con el primer numero de carrera que aparezca en la pagina.
-        for n in range(1, 21):
-            data = parse_race(soup, n)
-            if data and data.get("participantes"):
-                break
+    data = _carrera_guardada_para_tabulada(url, numero)
     if not data or not data.get("participantes"):
-        return jsonify(ok=False, error="No se encontraron los participantes."), 404
+        # La pantalla muestra este texto y sigue; no es un error.
+        return jsonify(ok=False, sin_datos=True,
+                       error="Todavía no hay datos de esta carrera."), 404
 
     participantes = [p for p in data["participantes"] if not p.get("retirado")]
     # Ordenar por puesto de llegada; los que no tienen puesto van al final.
@@ -4387,7 +4495,7 @@ def api_tabulada():
             "perfil": p.get("perfil", ""),
         })
 
-    detalle = detalle_de_carrera(url)
+    detalle = detalle_de_carrera(url, ir_al_sitio=False)
 
     resultado = {
         "carrera": data.get("carrera"),
@@ -5574,23 +5682,6 @@ ADELANTO = {
 }
 
 
-def _guardar_una_carrera(url, numero, forzar=False):
-    """Trae una carrera y la deja guardada. True si salio bien."""
-    clave = f"carrera:{url}:{numero}"
-    if not forzar:
-        guardada, _ = cache_get(clave, TTL_CARRERA)
-        _, fresca = cache_get(
-            clave, _cuanto_vale_guardada(guardada, meeting_date_from_url(url)))
-        if guardada is not None and fresca:
-            return True
-    try:
-        data = parse_race(fetch(url), int(numero))
-        if not data:
-            return False
-        cache_set(clave, data)
-        return True
-    except Exception:
-        return False
 
 
 def _dejar_todo_listo(data, reunion, carrera):
@@ -7260,32 +7351,27 @@ def _fichas_incompletas(tope=3000):
     Esto las vuelve a poner en la cola para completarlas.
     No pide nada al sitio: solo mira la base.
     """
+    # MEMORIA: antes traia las 9.398 fichas ENTERAS (con toda su campaña)
+    # en cada tanda del historico, y Python no devolvia esa memoria.
+    # Medido el 4/10/2026 con una base del tamaño real: +64 MB por tanda.
+    # Ahora la base contesta SOLO los perfiles que faltan.
     try:
         con = db()
-        filas = con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall()
-        en_cola = {f["url"] for f in
-                   con.execute("SELECT url FROM por_explorar "
-                               "WHERE tipo='caballo' AND hecho=0").fetchall()}
+        rehacer = [f["perfil"] for f in con.execute("""
+            SELECT perfil FROM fichas
+            WHERE perfil NOT IN (SELECT url FROM por_explorar
+                                 WHERE tipo='caballo' AND hecho=0)
+              AND (datos IS NULL OR datos = ''
+                   OR NOT json_valid(COALESCE(carreras, '[]'))
+                   OR (json_array_length(COALESCE(carreras, '[]')) > 0
+                       AND json_type(carreras, '$[0].tiempo') IS NULL))
+            ORDER BY rowid LIMIT ?""", (tope,)).fetchall()]
         con.close()
     except Exception:
-        return 0
-
-    rehacer = []
-    for f in filas:
-        if f["perfil"] in en_cola:
-            continue
-        # Sin los datos del caballo, o sin el tiempo en sus carreras.
-        falta = not f["datos"]
-        if not falta:
-            try:
-                cs = json.loads(f["carreras"] or "[]")
-                falta = bool(cs) and "tiempo" not in (cs[0] or {})
-            except (json.JSONDecodeError, TypeError, IndexError):
-                falta = True
-        if falta:
-            rehacer.append(f["perfil"])
-            if len(rehacer) >= tope:
-                break
+        # Si la base de Render no entendiera JSON, la forma vieja.
+        rehacer = _fichas_incompletas_a_la_vieja(tope)
+        if rehacer is None:
+            return 0
 
     if not rehacer:
         return 0
@@ -7309,7 +7395,93 @@ def _fichas_incompletas(tope=3000):
     return len(rehacer)
 
 
+
+def _fichas_incompletas_a_la_vieja(tope=3000):
+    """
+    Las fichas guardadas antes de este cambio no tienen el tiempo, la
+    categoria, el pago ni los datos del caballo (edad, sexo, padre).
+    Sin eso, el algoritmo no puede medir esas variables.
+    Esto las vuelve a poner en la cola para completarlas.
+    No pide nada al sitio: solo mira la base.
+    """
+    try:
+        con = db()
+        filas = con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall()
+        en_cola = {f["url"] for f in
+                   con.execute("SELECT url FROM por_explorar "
+                               "WHERE tipo='caballo' AND hecho=0").fetchall()}
+        con.close()
+    except Exception:
+        return None
+
+    rehacer = []
+    for f in filas:
+        if f["perfil"] in en_cola:
+            continue
+        # Sin los datos del caballo, o sin el tiempo en sus carreras.
+        falta = not f["datos"]
+        if not falta:
+            try:
+                cs = json.loads(f["carreras"] or "[]")
+                falta = bool(cs) and "tiempo" not in (cs[0] or {})
+            except (json.JSONDecodeError, TypeError, IndexError):
+                falta = True
+        if falta:
+            rehacer.append(f["perfil"])
+            if len(rehacer) >= tope:
+                break
+
+    return rehacer
+
 def _fichas_que_faltan(tope=3000):
+    """
+    Busca los caballos que aparecen en carreras YA GUARDADAS pero que
+    todavia no tienen su ficha, y los pone en la cola.
+
+    Es lo que desbloquea las variables nuevas: el tiempo, la edad, el
+    padre, la categoria y las demas salen de la ficha, no de la carrera.
+    Sin ficha, el algoritmo no las puede medir y quedan en cero.
+
+    No pide nada al sitio: solo mira lo que ya esta en la base.
+    """
+    # MEMORIA: antes traia las 16.188 carreras, todas las fichas y toda
+    # la cola a la memoria en cada tanda del historico (medido 4/10/2026:
+    # +78 MB que no se devolvian). Ahora la base contesta solo los que
+    # faltan: medido +5 MB y 0,5 s con una base del tamaño real.
+    # Mismo orden que antes: el de las carreras y, adentro, el de largada.
+    # Se lee de a una fila (sin fetchall) y se corta al llegar al tope.
+    try:
+        con = db()
+        faltan, vistos = [], set()
+        for f in con.execute("""
+                SELECT json_extract(j.value, '$.perfil') perfil
+                FROM historico h, json_each(h.participantes) j
+                WHERE h.participantes IS NOT NULL
+                  AND json_valid(h.participantes)
+                  AND COALESCE(json_extract(j.value, '$.perfil'), '') != ''
+                  AND json_extract(j.value, '$.perfil') NOT IN
+                      (SELECT perfil FROM fichas)
+                  AND json_extract(j.value, '$.perfil') NOT IN
+                      (SELECT url FROM por_explorar WHERE tipo='caballo')"""):
+            if f["perfil"] not in vistos:
+                vistos.add(f["perfil"])
+                faltan.append(f["perfil"])
+                if len(faltan) >= tope:
+                    break
+        con.close()
+    except Exception:
+        faltan = _fichas_que_faltan_a_la_vieja(tope)
+        if faltan is None:
+            return 0
+
+    for perfil in faltan:
+        _sumar_a_la_cola(perfil, "caballo")
+
+    return len(faltan)
+
+
+
+def _fichas_que_faltan_a_la_vieja(tope=3000):
     """
     Busca los caballos que aparecen en carreras YA GUARDADAS pero que
     todavia no tienen su ficha, y los pone en la cola.
@@ -7336,7 +7508,7 @@ def _fichas_que_faltan(tope=3000):
         ).fetchall()
         con.close()
     except Exception:
-        return 0
+        return None
 
     faltan = []
     vistos = set()
@@ -7355,11 +7527,7 @@ def _fichas_que_faltan(tope=3000):
         if len(faltan) >= tope:
             break
 
-    for perfil in faltan:
-        _sumar_a_la_cola(perfil, "caballo")
-
-    return len(faltan)
-
+    return faltan
 
 def _completar_lo_que_falta():
     """
@@ -7373,24 +7541,23 @@ def _completar_lo_que_falta():
 
     NO SE BORRA NADA: lo que hay se conserva y se completa encima.
     """
+    # MEMORIA: antes traia las 16.188 carreras enteras. Ahora la base
+    # contesta solo las que no tienen el perfil de ningun caballo.
     try:
         con = db()
-        filas = con.execute(
-            "SELECT url, participantes FROM historico"
-        ).fetchall()
+        a_rehacer = [f["url"] for f in con.execute("""
+            SELECT url FROM historico h
+            WHERE json_valid(h.participantes)
+              AND json_array_length(h.participantes) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM json_each(h.participantes) j
+                  WHERE COALESCE(json_extract(j.value, '$.perfil'), '') != '')
+            ORDER BY rowid""").fetchall()]
         con.close()
     except Exception:
-        return 0
-
-    a_rehacer = []
-    for f in filas:
-        try:
-            ps = json.loads(f["participantes"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        # Si ninguno tiene perfil, esa carrera se guardo incompleta.
-        if ps and not any(p.get("perfil") for p in ps):
-            a_rehacer.append(f["url"])
+        a_rehacer = _completar_a_la_vieja()
+        if a_rehacer is None:
+            return 0
 
     if not a_rehacer:
         return 0
@@ -7412,6 +7579,29 @@ def _completar_lo_que_falta():
 
     return len(a_rehacer)
 
+
+
+def _completar_a_la_vieja():
+    """La forma anterior, por si la base no entiende JSON."""
+    try:
+        con = db()
+        filas = con.execute(
+            "SELECT url, participantes FROM historico"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return None
+
+    a_rehacer = []
+    for f in filas:
+        try:
+            ps = json.loads(f["participantes"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # Si ninguno tiene perfil, esa carrera se guardo incompleta.
+        if ps and not any(p.get("perfil") for p in ps):
+            a_rehacer.append(f["url"])
+    return a_rehacer
 
 def _sembrar_si_hace_falta():
     """
@@ -8158,8 +8348,8 @@ def api_buscar_fechas():
 
     # 1) Lo que el sitio publica ahora.
     try:
-        cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
-                           lambda: calendario_completo())
+        # NADIE VA AL SITIO: el calendario guardado, sin vencimiento.
+        cal = lo_guardado("calendario") or []
         for r in cal or []:
             f = r["fecha"]
             hip = _limpiar_nombre_hipodromo(r["hipodromo"])
@@ -8247,10 +8437,11 @@ def api_carreras_de():
     if guardadas:
         return jsonify(ok=True, carreras=guardadas, fuente="histórico")
 
-    # 2) Si no esta guardada, se pide al sitio.
+    # 2) Si no esta en el historico, las reuniones que guardo la tarea de
+    #    las 2 de la mañana. NADIE VA AL SITIO (antes aca se hacia fetch).
     try:
-        cal, _ = con_cache("calendario", TTL_CALENDARIO, False,
-                           lambda: calendario_completo())
+        # NADIE VA AL SITIO: el calendario guardado, sin vencimiento.
+        cal = lo_guardado("calendario") or []
         buscado = normalize_text(_limpiar_nombre_hipodromo(hip)) if hip else ""
         for r in cal or []:
             if r["fecha"] != fecha:
@@ -8258,11 +8449,16 @@ def api_carreras_de():
             if buscado and normalize_text(
                     _limpiar_nombre_hipodromo(r["hipodromo"])) != buscado:
                 continue
-            cs = extract_races_from_meeting(fetch(r["url"]))
+            cs = []
+            for nombre in {r["hipodromo"], _limpiar_nombre_hipodromo(r["hipodromo"])}:
+                for reu in lo_guardado(
+                        f"reuniones:{fecha}:{normalize_text(nombre)}") or []:
+                    if reu.get("url") == r["url"] and reu.get("carreras"):
+                        cs = reu["carreras"]
             if cs:
-                return jsonify(ok=True, fuente="Stud Book", url=r["url"],
+                return jsonify(ok=True, fuente="guardado", url=r["url"],
                                hipodromo=_limpiar_nombre_hipodromo(r["hipodromo"]),
-                               carreras=[{**c, "de": "sitio"} for c in cs])
+                               carreras=[{**c, "de": "guardada"} for c in cs])
     except Exception:
         pass
 
