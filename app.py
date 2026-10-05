@@ -1355,8 +1355,22 @@ def enrich_horse(horse, ir_al_sitio=False):
         f = con.execute("SELECT carreras, datos FROM fichas WHERE perfil=?",
                         (profile,)).fetchone()
         con.close()
-        if f and f["carreras"]:
+        if f and f["carreras"] is not None:
             carreras = json.loads(f["carreras"])
+            if not carreras:
+                # Guardado y SIN campaña = nunca corrio: debutante.
+                # Antes caia en "sin ficha" y la pantalla quedaba en
+                # "Buscando la campaña…" para siempre (04/10/2026).
+                if f["datos"]:
+                    for k, v in json.loads(f["datos"]).items():
+                        if v and not horse.get(k):
+                            horse[k] = v
+                horse.update({"carreras": [], "victorias": 0, "podios": 0,
+                              "corridas": 0, "actuaciones": [],
+                              "cargado": True, "de_lo_guardado": True})
+                horse.setdefault("sexo", "")
+                horse.setdefault("campana", "")
+                return horse
             if carreras:
                 horse["carreras"] = carreras[:20]
                 if f["datos"]:
@@ -1386,9 +1400,17 @@ def enrich_horse(horse, ir_al_sitio=False):
         if guardada is not None:
             horse.update(guardada)
             return horse
-        # No hay nada guardado: se muestra sin campaña. La ficha la trae
-        # esa noche el historico, que si puede salir.
-        horse["sin_ficha"] = True
+        # No hay nada guardado. Idea de Leandro (04/10/2026): si no tiene
+        # campaña, no corrio -> se muestra como DEBUTANTE, no "Buscando…"
+        # para siempre. Y se anota PRIMERO en la cola del historico para
+        # que esa noche traiga su ficha (padre, madre, campaña) y se pueda
+        # seguir. La visita no va al sitio: solo escribe una fila.
+        horse.setdefault("sexo", "")
+        horse.setdefault("campana", "")
+        horse.update({"carreras": horse.get("carreras") or [],
+                      "actuaciones": horse.get("actuaciones") or [],
+                      "cargado": True, "sin_ficha": True})
+        _sumar_a_la_cola(profile, "caballo", "9999-12-31")
         return horse
 
     try:
