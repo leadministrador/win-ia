@@ -2234,6 +2234,7 @@ async function apiGet(url){
     err.necesitaCuenta = !!data.necesita_cuenta;
     err.necesitaPagar = !!data.necesita_pagar;
     err.noExiste = !!data.no_existe;
+    err.sinDatos = !!data.sin_datos;
     err.sinCelular = !!data.sin_celular;
     err.reintentar = !!data.reintentar;
     err.queHacer = data.que_hacer || '';
@@ -3454,11 +3455,20 @@ async function pintarCuadricula(carreras){
       tabuladasCache[c.enlace] = t;
       const el = document.getElementById('mini-' + i);
       if (el) el.innerHTML = miniHTML(c, t);
-    }catch(e){ /* si falla, queda la version simple */ }
+    }catch(e){
+      // Antes esto quedaba vacio y la tarjeta mostraba "Buscando la
+      // tabulada..." para siempre, aunque el servidor ya hubiera
+      // contestado que todavia no la tiene. Decia que buscaba y no
+      // buscaba nada.
+      const el = document.getElementById('mini-' + i);
+      if (el) el.innerHTML = miniHTML(c, null,
+        e.sinDatos ? 'Todavía no hay datos de esta carrera'
+                   : 'No se pudo traer la tabulada');
+    }
   });
 }
 
-function miniHTML(c, tab){
+function miniHTML(c, tab, aviso){
   const nombreCaballo = (caballoActual && caballoActual.nombre) || '';
   let filas = '', acum = '';
 
@@ -3485,6 +3495,9 @@ function miniHTML(c, tab){
             ? 'A <b>' + yo.acumulado + '</b> del ganador'
             : 'Llegó <b>' + yo.puesto + 'º</b> de ' + tab.competidores);
     }
+  } else if (aviso){
+    filas = '<div class="mini-cargando" style="padding:8px 0;">'
+          + aviso + '</div>';
   } else {
     filas = '<div class="mini-cargando" style="padding:8px 0;">Buscando la tabulada…</div>';
   }
