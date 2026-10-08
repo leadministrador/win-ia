@@ -10467,6 +10467,129 @@ def admin_detener():
     return jsonify(ok=True, mensaje="Se pidió detener la recolección.")
 
 
+@app.get("/api/admin/medir-tabuladas")
+def admin_medir_tabuladas():
+    """
+    Cuenta cuantas TABULADAS FALTAN para las carreras que vienen.
+
+    Por que existe: el pronostico se arma con la campaña de cada caballo,
+    pero la tabulada de esas carreras viejas puede no estar guardada. Si
+    no esta, la pantalla no tiene con que llenar la tarjeta.
+
+    NO VA AL SITIO. Solo cuenta lo que hay guardado. Sirve para saber el
+    numero REAL antes de cambiar nada.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    dias = int(request.args.get("dias", "7"))
+    anios = int(request.args.get("anios", "2"))
+
+    hoy = hoy_argentina()
+    hasta = (ahora_argentina() + timedelta(days=dias)).strftime("%Y-%m-%d")
+    # La campaña del caballo trae la fecha como 26/07/2025. El calendario
+    # la trae como 2025-07-26. Hay que comparar en el mismo idioma.
+    limite = ahora_argentina() - timedelta(days=365 * anios)
+
+    def _es_reciente(fecha_ficha):
+        try:
+            d, m, a = fecha_ficha.split("/")
+            return datetime(int(a), int(m), int(d)) >= limite.replace(tzinfo=None)
+        except Exception:
+            return False
+
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted(
+        [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
+        key=lambda r: r["fecha"])
+
+    con = db()
+    try:
+        # 1) Los caballos que corren en esos dias, de lo guardado.
+        perfiles, detalle = set(), []
+        for reunion in proximas:
+            clave = (f"reuniones:{reunion['fecha']}:"
+                     f"{normalize_text(reunion['hipodromo'])}")
+            guardada = lo_guardado(clave) or []
+            if not guardada:
+                detalle.append({
+                    "fecha": reunion["fecha"],
+                    "hipodromo": reunion.get("hipodromo", ""),
+                    "nota": "la reunion todavia no se guardo",
+                })
+                continue
+            bloque = guardada[0]
+            antes_de_esta = len(perfiles)
+            con_datos = 0
+            for c in bloque.get("carreras", []):
+                data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+                if not data:
+                    continue
+                con_datos += 1
+                for p in data.get("participantes", []):
+                    if p.get("perfil") and not p.get("retirado"):
+                        perfiles.add(p["perfil"])
+            detalle.append({
+                "fecha": reunion["fecha"],
+                "hipodromo": reunion.get("hipodromo", ""),
+                "carreras_guardadas": con_datos,
+                "caballos_nuevos": len(perfiles) - antes_de_esta,
+            })
+
+        # 2) De la ficha de cada uno, sus carreras de los ultimos años.
+        #    Se usa un conjunto: la misma carrera la corrieron varios, y
+        #    se pide UNA sola vez.
+        enlaces, sin_ficha, sin_enlace = set(), 0, 0
+        for perfil in perfiles:
+            fila = con.execute(
+                "SELECT carreras FROM fichas WHERE perfil=?",
+                (perfil,)).fetchone()
+            if not fila or fila["carreras"] is None:
+                sin_ficha += 1
+                continue
+            try:
+                for c in json.loads(fila["carreras"]):
+                    if not _es_reciente(c.get("fecha", "")):
+                        continue
+                    if c.get("enlace"):
+                        enlaces.add(c["enlace"])
+                    else:
+                        sin_enlace += 1
+            except Exception:
+                continue
+
+        # 3) Cuantas de esas tabuladas YA estan guardadas.
+        ya_estan = 0
+        for enlace in enlaces:
+            if con.execute("SELECT 1 FROM historico WHERE url=?",
+                           (enlace,)).fetchone():
+                ya_estan += 1
+    finally:
+        con.close()
+
+    faltan = len(enlaces) - ya_estan
+    # Medido antes: una pagina del sitio tarda ~6,75 s con la pausa.
+    minutos = round(faltan * 6.75 / 60)
+
+    return jsonify(
+        ok=True,
+        PARA_LEER=(
+            f"Faltan {faltan} tabuladas para las carreras de los proximos "
+            f"{dias} dias. Traerlas tardaria {minutos} minutos."),
+        reuniones=len(proximas),
+        caballos_que_corren=len(perfiles),
+        caballos_sin_ficha=sin_ficha,
+        tabuladas_necesarias=len(enlaces),
+        tabuladas_ya_guardadas=ya_estan,
+        TABULADAS_QUE_FALTAN=faltan,
+        minutos_para_traerlas=minutos,
+        carreras_sin_enlace=sin_enlace,
+        dias_mirados=dias,
+        anios_de_campana=anios,
+        por_reunion=detalle,
+    )
+
+
 @app.get("/api/admin/estado")
 def admin_estado():
     if not es_admin():
