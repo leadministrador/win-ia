@@ -1,0 +1,10821 @@
+from flask import Flask, render_template, request, jsonify
+import requests, re, sqlite3, json, os, time, threading, hashlib, secrets
+from concurrent.futures import ThreadPoolExecutor
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, quote_plus, quote
+from datetime import datetime, timedelta, timezone
+
+# El servidor de Render trabaja en horario UTC, que va 3 horas adelante de
+# Argentina. Sin esto, la app da por corridas carreras que todavia no salieron.
+HUSO_ARGENTINA = timezone(timedelta(hours=-3))
+
+def ahora_argentina():
+    """La hora de Argentina, sin importar donde este el servidor."""
+    return datetime.now(HUSO_ARGENTINA)
+
+def hoy_argentina():
+    return ahora_argentina().strftime("%Y-%m-%d")
+
+def hora_argentina():
+    return ahora_argentina().strftime("%H:%M")
+
+app = Flask(__name__)
+
+
+@app.before_request
+def _cuidar_el_servidor():
+    """
+    Frena a quien hace demasiados pedidos. Asi una sola persona no
+    puede dejar la app inservible para el resto.
+    """
+    if request.path.startswith("/static/"):
+        return None
+    quien = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+             or request.remote_addr or "?")
+    if _demasiados_pedidos(quien):
+        return jsonify(
+            ok=False, demasiado_rapido=True,
+            error="Estás haciendo muchos pedidos. Esperá unos segundos.",
+        ), 429
+    return None
+
+
+@app.after_request
+def _poner_seguridad(resp):
+    """
+    Cabeceras que le dicen al navegador como cuidar la app:
+    - que nadie la meta dentro de otra pagina para engañar al usuario
+    - que no adivine tipos de archivo
+    - que no filtre la direccion a otros sitios
+    """
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    # OJO: NO poner "same-origin" acá. Eso le saca al navegador el dato
+    # de que viene de nuestra app, y YouTube RECHAZA el video con
+    # "error 153 - configuración del reproductor". Rompió todos los
+    # videos de las carreras cuando se agregó.
+    # "strict-origin-when-cross-origin" es lo que YouTube pide, y es
+    # el valor que usan los navegadores por defecto.
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy",
+                            "geolocation=(), microphone=(), camera=()")
+    return resp
+BASE = "https://www.studbook.org.ar"
+# Como se presenta la app cuando le pide una pagina al Stud Book.
+#
+# Antes decia "LEA-WIN-IA/1.0", que la delataba como programa. Desde el
+# 17 de septiembre el sitio empezo a contestar 403 (prohibido) y dejaron
+# de entrar los resultados: la misma pagina que a la app le da 403 abre
+# perfecto desde un navegador comun.
+#
+# Ahora se presenta como un navegador normal y manda las mismas cabeceras
+# que manda Chrome. Se puede cambiar desde Render sin tocar el codigo,
+# con la variable NAVEGADOR.
+# Como se presenta la app ante el Stud Book.
+#
+# OJO: ESTAS CABECERAS SON EXACTAS. No tocarlas "para modernizarlas".
+# Comprobado en el servidor el 2/10/2026, en el mismo minuto y con la
+# misma direccion:
+#     Chrome/126.0 + Referer  ->  200 OK
+#     Chrome/140.0 + Referer  ->  403 Forbidden
+# El sitio mira el texto del navegador. Con Chrome/140 lo rechaza y deja
+# de entrar TODO: resultados, campañas e historico.
+# Son las mismas que usa _sesion_studbook(), que nunca fallo.
+HEADERS = {
+    "User-Agent": os.getenv(
+        "NAVEGADOR",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "es-AR,es;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+}
+DB = os.getenv("LEA_DB", "lea_win.db")
+# Version de los terminos. Al cambiarlos, subir esta fecha: asi queda
+# registrado que version acepto cada usuario.
+FECHA_LEGALES = os.getenv("LEGAL_FECHA", "18 de agosto de 2026")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+def clean(v):
+    return re.sub(r"\s+", " ", v or "").strip()
+
+
+# ============================================================
+# CUIDAR EL SERVIDOR
+# Sin esto, una sola persona puede hacer miles de pedidos por minuto
+# y dejar la app inservible para todos los demas.
+# ============================================================
+
+PEDIDOS_POR_MINUTO = int(os.getenv("PEDIDOS_POR_MINUTO", "120"))
+_pedidos = {}
+_candado_pedidos = threading.Lock()
+
+
+def _demasiados_pedidos(quien):
+    """True si esa persona esta haciendo mas pedidos de la cuenta."""
+    ahora = time.time()
+    with _candado_pedidos:
+        # Limpiar lo viejo, para que no crezca la memoria.
+        if len(_pedidos) > 2000:
+            for k in [k for k, v in _pedidos.items() if ahora - v[0] > 120]:
+                _pedidos.pop(k, None)
+
+        desde, cuantos = _pedidos.get(quien, (ahora, 0))
+        if ahora - desde > 60:
+            desde, cuantos = ahora, 0
+        cuantos += 1
+        _pedidos[quien] = (desde, cuantos)
+        return cuantos > PEDIDOS_POR_MINUTO
+
+# Cuanto se espera al sitio oficial antes de darse por vencido.
+# Poco a proposito: las carreras se traen de madrugada y quedan
+# guardadas, asi que si el sitio tarda se usa lo guardado enseguida
+# en vez de hacer esperar al usuario.
+ESPERA_CONECTAR = float(os.getenv("ESPERA_CONECTAR", "4"))
+ESPERA_RESPUESTA = float(os.getenv("ESPERA_RESPUESTA", "5"))
+
+
+# Una sesion por hilo: conserva las galletitas del sitio y reusa la
+# conexion. No se comparte entre hilos para no pisarse.
+_SESIONES = threading.local()
+
+
+def _sesion():
+    """
+    La sesion con la que se le pide al Stud Book.
+
+    POR QUE: pedir "a secas", sin sesion y sin Referer, el sitio lo
+    contesta con 403 (prohibido) y deja de entrar TODO: resultados,
+    campañas e historico. Comprobado el 2/10/2026 en el servidor, en el
+    mismo minuto y con la misma direccion:
+        sin sesion ni Referer -> 403
+        con sesion y Referer  -> 200
+    Es la misma forma que ya usaba _sesion_studbook() para traer los
+    meses viejos, que nunca fallo.
+    """
+    s = getattr(_SESIONES, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        s.headers["Referer"] = BASE + "/reuniones"
+        _SESIONES.s = s
+    return s
+
+
+def fetch(url, espera=None):
+    r = _sesion().get(url,
+                      timeout=(ESPERA_CONECTAR, espera or ESPERA_RESPUESTA))
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def db():
+    """
+    Abre la base.
+
+    Dos cosas importantes, aprendidas de un error real: el historico
+    escribe miles de fichas seguidas, y mientras tanto alguien puede
+    estar usando la app. Sin esto, la app fallaba con "database is
+    locked" y no cargaba ni el calendario.
+
+    - timeout: si esta ocupada, ESPERA en vez de fallar.
+    - WAL: deja LEER mientras otro escribe. Sin esto, cada escritura
+      bloquea a todos los que quieren leer.
+    """
+    con = sqlite3.connect(DB, timeout=float(os.getenv("ESPERA_BASE", "20")))
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=20000")
+        # No esperar a que el disco confirme cada escritura: es mucho
+        # mas rapido y para esta app el riesgo es despreciable.
+        con.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return con
+
+def init_db():
+    con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS carreras(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fecha TEXT NOT NULL, hipodromo TEXT NOT NULL, numero INTEGER NOT NULL,
+      premio TEXT, distancia INTEGER, superficie TEXT, estado_publicado TEXT,
+      condicion TEXT, pista_dia TEXT, clima TEXT, viento TEXT, retiros TEXT,
+      observaciones TEXT, participantes TEXT NOT NULL, analisis TEXT,
+      resultado_real TEXT, creado_en TEXT NOT NULL,
+      UNIQUE(fecha,hipodromo,numero)
+    );
+    CREATE TABLE IF NOT EXISTS cache(
+      clave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL,
+      actualizado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pronosticos(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL, numero INTEGER NOT NULL,
+      fecha TEXT, hipodromo TEXT,
+      ranking TEXT NOT NULL,        -- lo que predijo la app
+      resultado TEXT,               -- puestos reales, cuando la carrera se corre
+      acierto_ganador INTEGER,      -- 1 si acerto el 1o, 0 si no, NULL si no corrio
+      aciertos_top4 INTEGER,        -- cuantos de los 4 predichos entraron entre los 4
+      pesos_usados TEXT,            -- version del algoritmo con la que se predijo
+      creado_en TEXT NOT NULL,
+      comparado_en TEXT,
+      UNIQUE(url,numero)
+    );
+    CREATE TABLE IF NOT EXISTS algoritmo(
+      clave TEXT PRIMARY KEY,
+      valor REAL NOT NULL,
+      actualizado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS condiciones(
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      pista TEXT, estado TEXT, viento TEXT, clima TEXT,
+      observaciones TEXT,
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(fecha, hipodromo)
+    );
+    CREATE TABLE IF NOT EXISTS usuarios(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      usuario TEXT NOT NULL UNIQUE,       -- en minusculas, para no repetir
+      usuario_visible TEXT NOT NULL,      -- como lo escribio el
+      clave_hash TEXT NOT NULL,
+      telefono TEXT,                      -- opcional, para recuperar la clave
+      email TEXT,                         -- opcional
+      creado_en TEXT NOT NULL,
+      ultimo_ingreso TEXT,
+      bloqueado INTEGER DEFAULT 0,
+      es_admin INTEGER DEFAULT 0,    -- 1 = puede cargar datos oficiales
+      acepto_en TEXT,                -- cuando acepto los terminos
+      acepto_version TEXT            -- que version acepto
+    );
+    CREATE TABLE IF NOT EXISTS sesiones(
+      token TEXT PRIMARY KEY,
+      usuario_id INTEGER NOT NULL,
+      creada_en TEXT NOT NULL,
+      ultima_vez TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS suscripciones(
+      endpoint TEXT PRIMARY KEY,      -- la direccion del celular
+      usuario_id INTEGER,
+      p256dh TEXT NOT NULL,           -- claves que da el navegador
+      auth TEXT NOT NULL,
+      creada_en TEXT NOT NULL,
+      ultimo_aviso TEXT,
+      fallos INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS seguidos(
+      usuario_id INTEGER NOT NULL,
+      caballo TEXT NOT NULL,          -- en minusculas, para no repetir
+      caballo_visible TEXT NOT NULL,
+      perfil TEXT,
+      creado_en TEXT NOT NULL,
+      PRIMARY KEY(usuario_id, caballo)
+    );
+    CREATE TABLE IF NOT EXISTS avisos_enviados(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      usuario_id INTEGER,
+      caballo TEXT,
+      tipo TEXT NOT NULL,             -- inscripto | una_hora | general
+      fecha TEXT,                     -- fecha de la carrera
+      hipodromo TEXT,
+      enviado_en TEXT NOT NULL,
+      UNIQUE(usuario_id, caballo, tipo, fecha, hipodromo)
+    );
+    CREATE TABLE IF NOT EXISTS pedidos_clave(
+      codigo TEXT PRIMARY KEY,        -- el enlace que se manda al celular
+      usuario_id INTEGER NOT NULL,
+      creado_en TEXT NOT NULL,
+      usado INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS anuncios(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rotulo TEXT,                    -- "Novedades", "Torneo", etc.
+      titulo TEXT NOT NULL,
+      texto TEXT,
+      boton_texto TEXT,               -- si se deja vacio, no aparece boton
+      boton_url TEXT,
+      desde TEXT NOT NULL,            -- AAAA-MM-DD
+      hasta TEXT NOT NULL,
+      creado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ajustes(
+      clave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL,
+      cambiado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS datos_caballo(
+      usuario_id INTEGER NOT NULL,
+      caballo TEXT NOT NULL,          -- en minusculas
+      caballo_visible TEXT NOT NULL,
+      fecha TEXT NOT NULL,            -- fecha de la carrera
+      hipodromo TEXT,
+      numero_carrera INTEGER,
+      datos TEXT NOT NULL,            -- lo que cargo, en formato JSON
+      puesto INTEGER,                 -- se completa cuando corre
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(usuario_id, caballo, fecha, hipodromo)
+    );
+    CREATE TABLE IF NOT EXISTS datos_oficiales(
+      caballo TEXT NOT NULL,          -- en minusculas
+      caballo_visible TEXT NOT NULL,
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      numero_carrera INTEGER,
+      peso_corporal INTEGER,          -- los kilos del animal
+      herraje TEXT,                   -- las cuatro letras
+      cargado_en TEXT NOT NULL,
+      PRIMARY KEY(caballo, fecha, hipodromo)
+    );
+    CREATE TABLE IF NOT EXISTS suscripciones_pago(
+      usuario_id INTEGER PRIMARY KEY,
+      estado TEXT NOT NULL,           -- al_dia | vencida | cancelada | pendiente
+      id_mercadopago TEXT,            -- el numero que da Mercado Pago
+      paga_hasta TEXT,                -- AAAA-MM-DD: hasta cuando tiene acceso
+      ultimo_pago TEXT,
+      monto REAL,
+      plan TEXT DEFAULT 'normal',     -- normal | premium
+      -- El arrepentimiento: por ley tiene 10 dias para arrepentirse.
+      -- Una sola vez: despues el boton no le aparece mas.
+      se_arrepintio INTEGER DEFAULT 0,
+      arrepentido_en TEXT,
+      monto_devuelto REAL,
+      creada_en TEXT NOT NULL,
+      actualizada_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS intentos(
+      quien TEXT PRIMARY KEY,     -- el usuario que se intento
+      fallos INTEGER DEFAULT 0,
+      ultimo TEXT,
+      bloqueado_hasta TEXT
+    );
+    CREATE TABLE IF NOT EXISTS transmisiones(
+      fecha TEXT NOT NULL,
+      hipodromo TEXT NOT NULL,
+      video TEXT,                 -- el id del video de YouTube
+      buscada INTEGER DEFAULT 0,  -- 1 si ya se busco, para no repetir
+      a_mano INTEGER DEFAULT 0,   -- 1 si la cargo el admin
+      guardada_en TEXT,
+      PRIMARY KEY(fecha, hipodromo)
+    );
+    CREATE TABLE IF NOT EXISTS uso(
+      tipo TEXT NOT NULL,        -- pantalla | caballo | carrera | hipodromo
+      cosa TEXT NOT NULL,        -- que se miro
+      veces INTEGER DEFAULT 0,
+      primera_vez TEXT,
+      ultima_vez TEXT,
+      PRIMARY KEY(tipo, cosa)
+    );
+    CREATE TABLE IF NOT EXISTS uso_por_dia(
+      fecha TEXT NOT NULL,
+      tipo TEXT NOT NULL,
+      veces INTEGER DEFAULT 0,
+      PRIMARY KEY(fecha, tipo)
+    );
+    CREATE TABLE IF NOT EXISTS contactos(
+      usuario_id INTEGER PRIMARY KEY,
+      correo TEXT,
+      telefono TEXT,
+      quiere_avisos INTEGER DEFAULT 1,   -- si acepta que le escribamos
+      guardado_en TEXT NOT NULL,
+      actualizado_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pagos(
+      id TEXT PRIMARY KEY,            -- el numero del pago en Mercado Pago
+      usuario_id INTEGER,
+      monto REAL,
+      estado TEXT,
+      fecha TEXT,
+      detalle TEXT,
+      guardado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS planes(
+      clave TEXT PRIMARY KEY,     -- gratis | normal | premium
+      nombre TEXT,
+      precio REAL,
+      resumen TEXT,
+      incluye TEXT,               -- una linea por punto
+      no_incluye TEXT,
+      cambiado_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS promocion(
+      id INTEGER PRIMARY KEY CHECK (id = 1),   -- una sola fila
+      desde TEXT,                 -- AAAA-MM-DD: desde cuando hay prueba
+      hasta TEXT,                 -- AAAA-MM-DD
+      actualizada_en TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pruebas_usadas(
+      telefono TEXT PRIMARY KEY,  -- un telefono, una sola prueba
+      usuario_id INTEGER,
+      usada_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS historico(
+      url TEXT PRIMARY KEY,           -- la direccion de la carrera
+      fecha TEXT,                     -- AAAA-MM-DD
+      hipodromo TEXT,
+      numero INTEGER,
+      distancia TEXT,
+      pista TEXT,
+      estado TEXT,
+      participantes TEXT,             -- todos los que corrieron, en JSON
+      guardado_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS fichas(
+      perfil TEXT PRIMARY KEY,        -- la direccion de su ficha
+      nombre TEXT,
+      carreras TEXT,                  -- toda su campaña, en JSON
+      datos TEXT,                     -- edad, sexo, padre, madre... en JSON
+      actualizada_en TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS por_explorar(
+      url TEXT PRIMARY KEY,           -- ficha de caballo o carrera
+      tipo TEXT NOT NULL,             -- caballo | carrera
+      fecha TEXT,                     -- para ir de lo nuevo a lo viejo
+      hecho INTEGER DEFAULT 0,
+      intentos INTEGER DEFAULT 0,
+      agregado_en TEXT NOT NULL
+    );
+    """)
+    # Agregar columnas nuevas a bases que ya existian, sin perder datos.
+    try:
+        columnas = [f[1] for f in con.execute("PRAGMA table_info(usuarios)").fetchall()]
+        if "es_admin" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN es_admin INTEGER DEFAULT 0")
+        if "acepto_en" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN acepto_en TEXT")
+        if "acepto_version" not in columnas:
+            con.execute("ALTER TABLE usuarios ADD COLUMN acepto_version TEXT")
+        cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
+        if cols_cola and "fecha" not in cols_cola:
+            con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
+        # Prioridad: lo que necesitan las carreras que vienen va primero.
+        if cols_cola and "prioridad" not in cols_cola:
+            con.execute("ALTER TABLE por_explorar "
+                        "ADD COLUMN prioridad INTEGER DEFAULT 0")
+        cols_arr = [f[1] for f in con.execute(
+            "PRAGMA table_info(suscripciones_pago)").fetchall()]
+        for col, tipo in (("se_arrepintio", "INTEGER DEFAULT 0"),
+                          ("arrepentido_en", "TEXT"),
+                          ("monto_devuelto", "REAL")):
+            if cols_arr and col not in cols_arr:
+                con.execute(
+                    f"ALTER TABLE suscripciones_pago ADD COLUMN {col} {tipo}")
+        cols_fic = [f[1] for f in con.execute(
+            "PRAGMA table_info(fichas)").fetchall()]
+        if cols_fic and "datos" not in cols_fic:
+            con.execute("ALTER TABLE fichas ADD COLUMN datos TEXT")
+        cols_sus = [f[1] for f in con.execute(
+            "PRAGMA table_info(suscripciones_pago)").fetchall()]
+        if cols_sus and "plan" not in cols_sus:
+            con.execute("ALTER TABLE suscripciones_pago "
+                        "ADD COLUMN plan TEXT DEFAULT 'normal'")
+    except Exception:
+        pass
+
+    # Los telefonos guardados antes de limpiarlos bien: se emparejan
+    # ahora, para que el mismo numero escrito distinto no pase dos veces.
+    try:
+        ya = con.execute(
+            "SELECT valor FROM ajustes WHERE clave='telefonos_limpios'"
+        ).fetchone()
+        if not ya:
+            for f in con.execute(
+                    "SELECT id, telefono FROM usuarios "
+                    "WHERE telefono IS NOT NULL AND telefono != ''").fetchall():
+                limpio = _limpiar_telefono(f["telefono"])
+                if limpio and limpio != f["telefono"]:
+                    con.execute("UPDATE usuarios SET telefono=? WHERE id=?",
+                                (limpio, f["id"]))
+            for f in con.execute("SELECT telefono FROM pruebas_usadas").fetchall():
+                limpio = _limpiar_telefono(f["telefono"])
+                if limpio and limpio != f["telefono"]:
+                    con.execute(
+                        "UPDATE OR IGNORE pruebas_usadas SET telefono=? "
+                        "WHERE telefono=?", (limpio, f["telefono"]))
+            con.execute(
+                "INSERT OR REPLACE INTO ajustes(clave, valor, cambiado_en) "
+                "VALUES('telefonos_limpios','1',?)",
+                (datetime.now().isoformat(timespec="seconds"),))
+    except Exception:
+        pass
+
+    # Si en Render se puso ADMIN_USUARIO, ese usuario queda como admin.
+    # Asi no hay que marcarlo a mano la primera vez.
+    admin_inicial = os.getenv("ADMIN_USUARIO", "").strip()
+    if admin_inicial:
+        try:
+            con.execute("UPDATE usuarios SET es_admin=1 WHERE usuario=?",
+                        (normalize_text(admin_inicial),))
+        except Exception:
+            pass
+
+    con.commit()
+    con.close()
+
+# --- Cache genérico con TTL, para no depender de scrapear en cada request ---
+# El calendario se revisa de madrugada, cuando el historico trabaja.
+# Antes valia 2 horas y la app iba al sitio todo el dia a buscarlo,
+# haciendo esperar al usuario de gusto. Las reuniones se publican con
+# dias de anticipacion: no cambian cada dos horas.
+TTL_CALENDARIO = int(os.getenv("TTL_CALENDARIO", str(20 * 60 * 60)))
+# Cuanto vale lo guardado de una carrera.
+# Si YA SE CORRIO, mucho: el resultado no cambia mas.
+# Si TODAVIA NO, poco: hay que volver a pedirla para que aparezcan los
+# retiros y despues el resultado.
+TTL_REUNION = int(os.getenv("TTL_REUNION", str(12 * 60 * 60)))
+TTL_CARRERA = int(os.getenv("TTL_CARRERA", str(12 * 60 * 60)))
+TTL_CARRERA_SIN_CORRER = int(os.getenv("TTL_SIN_CORRER", str(40 * 60)))
+# Una reunion que YA PASO no cambia nunca mas: la lista de carreras del
+# 27 no se va a modificar hoy. Antes valia 12 horas igual que la de hoy,
+# asi que al dia siguiente la app volvia al Stud Book de gusto, tardaba
+# los 9 segundos de espera y despues mostraba el cartel rojo de
+# "los datos oficiales estan tardando". Eso era lo que se veia en las
+# jornadas ya corridas.
+TTL_REUNION_VIEJA = int(os.getenv("TTL_REUNION_VIEJA", str(30 * 24 * 60 * 60)))
+# Una carrera CON RESULTADO tampoco cambia mas. Mismo valor que usa la
+# tabulada desde siempre (TTL_DETALLE_CARRERA).
+TTL_RESULTADO = int(os.getenv("TTL_RESULTADO", str(30 * 24 * 60 * 60)))
+
+
+
+
+def _cuanto_vale_guardada(data, fecha="", hora=""):
+    """
+    Cuanto tiempo sirve lo guardado de esta carrera, o sea cuando la app
+    puede volver a pedirla al sitio.
+
+    La regla, tal como la definimos:
+
+      - YA TIENE RESULTADO  -> para siempre. No cambia mas.
+      - ES DE OTRO DIA      -> para siempre por hoy. Una carrera del 15
+                               no puede tener retiros hoy.
+      - ES DE HOY Y NO CORRIO -> tampoco se toca. El repaso de hora y
+                               media antes ya se encarga de los cambios.
+      - YA CORRIO Y NO HAY RESULTADO -> 40 minutos, hasta que aparezca.
+                               Ese pedido trae el resultado Y los cambios
+                               de la reunion, en un solo viaje.
+
+    Antes valia 40 minutos siempre, sin mirar nada: la app iba al sitio
+    a buscar carreras de dentro de tres dias, y el usuario esperaba de
+    gusto.
+    """
+    try:
+        if any(p.get("puesto") for p in (data or {}).get("participantes", [])):
+            # Ya tiene resultado: no cambia mas.
+            # OJO: antes esto devolvia TTL_CARRERA, que son 12 HORAS, no
+            # "para siempre". Al dia siguiente la app volvia a pedir una
+            # carrera que ya tenia el resultado puesto, esperaba los 9
+            # segundos y mostraba el cartel rojo de "los datos oficiales
+            # estan tardando". Es el mismo valor que ya usa la tabulada.
+            return TTL_RESULTADO
+    except Exception:
+        pass
+
+    if fecha and fecha != hoy_argentina():
+        return TTL_CARRERA          # de otro dia
+
+    # De hoy: solo se vuelve a pedir si YA se corrio y falta el resultado.
+    if hora:
+        try:
+            h, m = [int(x) for x in str(hora).split(":")[:2]]
+            ahora = ahora_argentina()
+            largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+            if ahora > largada:
+                return TTL_CARRERA_SIN_CORRER   # buscar el resultado
+        except (ValueError, TypeError):
+            pass
+        return TTL_CARRERA          # todavia no corrio: no se toca
+
+    # Sin hora no se puede saber: se deja el comportamiento de antes.
+    return TTL_CARRERA_SIN_CORRER
+
+
+
+TTL_HORARIOS = int(os.getenv("TTL_HORARIOS", str(20 * 60 * 60)))
+
+
+def _horas_de_la_reunion(url, fecha="", hipodromo=""):
+    """
+    Las horas de largada de una reunion, SIN molestar al sitio si ya las
+    tenemos.
+
+    Para que sirve: el calendario necesita saber si la jornada de hoy
+    termino, y para eso mira la hora de la ultima carrera. Antes lo
+    resolvia pidiendole la reunion al Stud Book EN CADA VISITA de cada
+    persona. Con el sitio lento, la PRIMERA PANTALLA de la app tardaba
+    9 segundos. Y las horas de largada no cambian en todo el dia.
+
+    Se busca en este orden:
+      1) lo guardado por url (lo deja el trabajo de la madrugada)
+      2) la lista de carreras de esa reunion, que ya estaba guardada
+      3) recien ahi, el sitio; y si el sitio falla, lo ultimo que haya
+    """
+    clave = f"horarios:{url}"
+    guardado, fresco = cache_get(clave, TTL_HORARIOS)
+    if guardado is not None and fresco:
+        return guardado
+
+    # Lo que ya trajo la pantalla de carreras, para no pedir de nuevo.
+    if fecha and hipodromo:
+        try:
+            otra, _ = cache_get(
+                f"reuniones:{fecha}:{normalize_text(hipodromo)}", TTL_REUNION)
+            for r in (otra or []):
+                if r.get("url") == url and r.get("carreras"):
+                    horas = [c.get("hora", "") for c in r["carreras"]]
+                    cache_set(clave, horas)
+                    return horas
+        except Exception:
+            pass
+
+    # NADIE VA AL SITIO: la primera pantalla de la app no puede esperar
+    # al Stud Book (medido el 4/10/2026: 5 s con el sitio colgado). Lo
+    # guardado vale sin importar la edad: las horas de largada no cambian.
+    # Las guarda la tarea de las 2 de la mañana (traer_las_que_vienen).
+    # Si no hay nada, None: quien llama ya sabe tratarlo.
+    return guardado
+
+
+def cache_get(clave, ttl_seg):
+    con = db()
+    row = con.execute(
+        "SELECT valor, actualizado_en FROM cache WHERE clave=?", (clave,)
+    ).fetchone()
+    con.close()
+    if not row:
+        return None, False
+    edad = (datetime.now() - datetime.fromisoformat(row["actualizado_en"])).total_seconds()
+    fresco = edad <= ttl_seg
+    try:
+        return json.loads(row["valor"]), fresco
+    except (json.JSONDecodeError, TypeError):
+        return None, False
+
+def cache_set(clave, valor):
+    con = db()
+    con.execute("""
+        INSERT INTO cache(clave, valor, actualizado_en) VALUES(?,?,?)
+        ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, actualizado_en=excluded.actualizado_en
+    """, (clave, json.dumps(valor, ensure_ascii=False), datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+def lo_guardado(clave):
+    """
+    Lo guardado, sin fijarse hace cuanto se guardo.
+
+    LA REGLA, tal como la puso Leandro: "nadie debe ir al sitio".
+    Ninguna visita de un usuario pide nada al Stud Book. Si la carrera,
+    la reunion o el calendario estan guardados, se devuelven y listo.
+    Al sitio van SOLO las tareas de fondo.
+
+    Por que: antes lo guardado "vencia" a las 12 horas. La busqueda de
+    las 2 de la mañana traia la reunion del 5/10 con tres dias de
+    anticipacion, y 12 horas despues la app la daba por vieja. El
+    usuario que la abria salia al Stud Book, esperaba 9 segundos y veia
+    el cartel rojo de "los datos oficiales estan tardando", teniendo
+    todo guardado y correcto.
+    """
+    guardado, _ = cache_get(clave, 10 ** 9)
+    return guardado
+
+
+def _carreras_guardadas_de(url):
+    """
+    Las carreras de una reunion (numero y hora), SIN ir al sitio.
+    Se buscan en lo que dejo guardado la pantalla de reuniones.
+    Se busca por la FECHA de la direccion y se compara la direccion
+    entera, para no depender de como este escrito el hipodromo.
+    """
+    fecha = meeting_date_from_url(url)
+    if not fecha:
+        return []
+    try:
+        con = db()
+        filas = con.execute("SELECT valor FROM cache WHERE clave LIKE ?",
+                            (f"reuniones:{fecha}:%",)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    for f in filas:
+        try:
+            for r in (json.loads(f["valor"]) or []):
+                if r.get("url") == url and r.get("carreras"):
+                    return r["carreras"]
+        except Exception:
+            continue
+    return []
+
+
+def con_cache(clave, ttl_seg, forzar, fetch_fn):
+    """
+    Usa cache fresco si existe. Si está vencido o no existe (o se fuerza refresh),
+    intenta traer datos en vivo. Si la fuente en vivo falla, devuelve el cache
+    aunque esté viejo (mejor dato viejo que error), indicando el origen.
+    """
+    cacheado, fresco = cache_get(clave, ttl_seg)
+    if cacheado is not None and fresco and not forzar:
+        return cacheado, "cache"
+    try:
+        dato_vivo = fetch_fn()
+        cache_set(clave, dato_vivo)
+        return dato_vivo, "vivo"
+    except Exception:
+        if cacheado is not None:
+            return cacheado, "cache_vencido"
+        raise
+
+def extract_races_from_meeting(soup):
+    """
+    Lee las carreras de una reunion. Ademas del numero y el titulo,
+    saca la HORA, que hace falta para saber cual es la proxima a correrse.
+    """
+    races = []
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        texto = clean(h.get_text(" "))
+        m = re.search(r"(\d+)\s*[º°ª]?\s*Carrera\b", texto, re.I)
+        if not m:
+            continue
+        # La hora viene en el mismo titulo: "1º Carrera - 13:30"
+        mh = re.search(r"(\d{1,2}):(\d{2})", texto)
+        hora = ""
+        if mh:
+            h_, mi = int(mh.group(1)), int(mh.group(2))
+            if 0 <= h_ <= 23 and 0 <= mi <= 59:
+                hora = f"{h_:02d}:{mi:02d}"
+        races.append({
+            "numero": int(m.group(1)),
+            "titulo": texto,
+            "hora": hora,
+        })
+    # Sin repetidos, en orden de numero.
+    vistos, unicas = set(), []
+    for r in races:
+        if r["numero"] in vistos:
+            continue
+        vistos.add(r["numero"])
+        unicas.append(r)
+    unicas.sort(key=lambda r: r["numero"])
+    return unicas
+
+def _cell_text(cell):
+    return clean(cell.get_text(" ", strip=True))
+
+
+def _map_headers(header_cells):
+    """
+    Mapea los encabezados de la tabla a indices de columna.
+    La tabla del Stud Book usa: P | O | Ejemplar | S | P | E | Kg | Jockey | Kg |
+    Entrenador | Caballeriza | Cpos | Acum. | Pago
+    Hay DOS columnas 'Kg': la anterior al jockey es el peso corporal del animal,
+    la posterior es el peso que lleva encima (la que importa para el analisis).
+    """
+    idx = {}
+    kg_positions = []
+    # En la tabla de RESULTADOS el puesto es la primera 'P'. En la de PROGRAMA
+    # no hay puesto, y esa 'P' es el pelaje. Se distinguen porque la de
+    # resultados trae columnas que la otra no tiene.
+    hay_resultado = any(
+        _cell_text(c).lower().rstrip(".") in ("cpos", "acum", "pago")
+        for c in header_cells
+    )
+    p_usada = False
+    for i, cell in enumerate(header_cells):
+        h = _cell_text(cell).lower().rstrip(".")
+        if h == "ejemplar" and "nombre" not in idx:
+            idx["nombre"] = i
+        elif h == "jockey" and "jockey" not in idx:
+            idx["jockey"] = i
+        elif h == "entrenador" and "entrenador" not in idx:
+            idx["entrenador"] = i
+        elif h.startswith("caballeriza") and "caballeriza" not in idx:
+            idx["caballeriza"] = i
+        elif h == "o" and "numero" not in idx:
+            idx["numero"] = i
+        elif h == "p" and not p_usada:
+            p_usada = True
+            if hay_resultado:
+                idx["puesto"] = i      # tabla de resultados
+            else:
+                idx["pelaje"] = i      # tabla de programa
+        elif h == "e" and "edad" not in idx:
+            idx["edad"] = i
+        elif h == "s" and "sexo" not in idx:
+            idx["sexo"] = i
+        elif h == "kg":
+            kg_positions.append(i)
+        elif h in ("cpos", "cuerpos"):
+            idx["cuerpos"] = i
+        elif h in ("acum", "acumulado"):
+            idx["acumulado"] = i
+        elif h == "pago":
+            idx["pago"] = i
+        elif "ultimas" in h or "últimas" in h:
+            idx["ultimas"] = i
+        elif "campa" in h:
+            idx["campana_resumen"] = i
+
+    # Resolver cual de los dos 'Kg' es el peso que lleva encima.
+    jockey_i = idx.get("jockey")
+    if kg_positions:
+        if jockey_i is not None:
+            despues = [k for k in kg_positions if k > jockey_i]
+            antes = [k for k in kg_positions if k < jockey_i]
+            if despues:
+                idx["peso"] = despues[0]
+            if antes:
+                idx["peso_corporal"] = antes[-1]
+        if "peso" not in idx:
+            idx["peso"] = kg_positions[-1]
+    return idx
+
+
+def _find_header_row(table):
+    """Devuelve las celdas del encabezado, sea <th> o la primera fila."""
+    for tr in table.find_all("tr"):
+        ths = tr.find_all("th")
+        if ths:
+            return ths
+    first = table.find("tr")
+    return first.find_all(["th", "td"]) if first else []
+
+
+def _parse_participants_table(table):
+    """Lee una tabla de participantes y devuelve la lista de caballos."""
+    header_cells = _find_header_row(table)
+    if not header_cells:
+        return []
+    idx = _map_headers(header_cells)
+    if "nombre" not in idx:
+        return []
+
+    participants = []
+    header_texts = {_cell_text(c).lower() for c in header_cells}
+
+    for tr in table.find_all("tr"):
+        cells = tr.find_all("td")
+        if not cells or len(cells) <= idx["nombre"]:
+            continue
+        # saltear la fila de encabezado si vino como td
+        if {_cell_text(c).lower() for c in cells} & header_texts == {
+            _cell_text(c).lower() for c in cells
+        }:
+            continue
+
+        name_cell = cells[idx["nombre"]]
+        link = name_cell.find("a", href=True)
+        name = clean(link.get_text(" ")) if link else _cell_text(name_cell)
+        if not name:
+            continue
+
+        # El sitio marca al retirado DENTRO del nombre: "NOMBRE (RETIRADO)".
+        # Hay que sacarlo del nombre y anotarlo aparte.
+        texto_celda = _cell_text(name_cell)
+        retirado_aqui = bool(re.search(r"\(\s*RETIRADO\s*\)", texto_celda, re.I))
+        name = re.sub(r"\s*\(\s*RETIRADO\s*\)\s*", "", name, flags=re.I).strip()
+        if not name:
+            continue
+
+        def col(key):
+            i = idx.get(key)
+            if i is None or i >= len(cells):
+                return ""
+            return _cell_text(cells[i])
+
+        peso = col("peso").replace(",", ".")
+        peso = peso if re.fullmatch(r"\d{2}(\.\d)?", peso or "") else ""
+
+        # "8 últimas": trae la forma reciente (1S1S) y los dias sin correr.
+        celda_ultimas = col("ultimas")
+        forma = ""
+        dias_sin_correr = None
+        if celda_ultimas:
+            m_dias = re.search(r"\((\d+)\s*d[ií]as?\)", celda_ultimas, re.I)
+            if m_dias:
+                dias_sin_correr = int(m_dias.group(1))
+            # La forma son letras y numeros pegados, antes del parentesis.
+            m_forma = re.match(r"\s*([0-9A-Za-z]+)", celda_ultimas)
+            if m_forma and not m_forma.group(1).isdigit():
+                forma = m_forma.group(1)
+
+        # "Campaña (efect.)": 6 - 2 - 2 - 0 - 2 - 0 - 0 (33.3%) - $ 25.165.500
+        celda_campana = col("campana_resumen")
+        campana_nums, efectividad, ganado = [], "", ""
+        if celda_campana:
+            m_n = re.match(r"\s*((?:\d+\s*-\s*)+\d+)", celda_campana)
+            if m_n:
+                campana_nums = [int(x) for x in re.findall(r"\d+", m_n.group(1))]
+            m_e = re.search(r"\(([\d.,]+)\s*%\)", celda_campana)
+            if m_e:
+                efectividad = m_e.group(1) + "%"
+            m_g = re.search(r"\$\s*([\d.,]+)", celda_campana)
+            if m_g:
+                ganado = "$" + m_g.group(1)
+
+        numero_raw = col("numero")
+        numero = int(numero_raw) if numero_raw.isdigit() else None
+
+        puesto_raw = col("puesto")
+        puesto = int(puesto_raw) if puesto_raw.isdigit() else None
+
+        detalle_partes = [
+            f"Jockey: {col('jockey')}" if col("jockey") else "",
+            f"Entrenador: {col('entrenador')}" if col("entrenador") else "",
+            f"Caballeriza: {col('caballeriza')}" if col("caballeriza") else "",
+            f"Edad: {col('edad')}" if col("edad") else "",
+            f"Sexo: {col('sexo')}" if col("sexo") else "",
+        ]
+
+        participants.append({
+            "numero": numero,
+            "nombre": name,
+            "perfil": urljoin(BASE, link["href"]) if link else "",
+            "jockey": col("jockey"),
+            "entrenador": col("entrenador"),
+            "caballeriza": col("caballeriza"),
+            "edad": col("edad"),
+            "sexo_tabla": col("sexo"),
+            "peso": peso,
+            "peso_corporal": col("peso_corporal"),
+            "puesto": puesto,
+            "cuerpos": col("cuerpos"),
+            "acumulado": col("acumulado"),
+            "pago": col("pago"),
+            "detalle": " · ".join(p for p in detalle_partes if p)[:700],
+            "retirado": retirado_aqui,
+            # Datos de la tabla PROGRAMA
+            "forma": forma,                    # las ultimas, ej "4P1P2S"
+            "dias_sin_correr": dias_sin_correr,
+            "campana_nums": campana_nums,      # corridas, 1os, 2os, 3os...
+            "efectividad": efectividad,
+            "ganado": ganado,
+        })
+
+    return participants
+
+
+def _rendimientos_de_la_carrera(soup):
+    """
+    Lee el rendimiento de jockey, entrenador y caballeriza que publica el
+    Stud Book al costado de cada carrera. Vienen en dos formatos:
+        Año: 603 C / 146 G      /      Año: 146 CC / 18 CG - (12.3%)
+        SIS: 278 C / 71 G       /      ARG: 76 CC / 10 CG - (13.2%)
+    La sigla es el hipodromo: ese numero vale mas que el general, porque
+    dice como le va EN ESA PISTA.
+    Devuelve {nombre en minusculas: {corridas, ganadas, pct, ...}}
+    """
+    texto = re.sub(r"[ \t]+", " ", soup.get_text("\n"))
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+
+    # "Año: 603 C / 146 G"  o  "Año: 146 CC / 18 CG - (12.3%)"
+    re_anio = re.compile(r"^A\w*o\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G", re.I)
+    # "SIS: 278 C / 71 G"  — la sigla es el hipodromo
+    re_hip = re.compile(r"^([A-Za-z]{2,5})\s*:\s*(\d+)\s*C+\s*/\s*(\d+)\s*C?G")
+
+    rendimientos = {}
+    for i, linea in enumerate(lineas):
+        m = re_anio.match(linea)
+        if not m or i == 0:
+            continue
+        nombre = clean(lineas[i - 1])
+        # La linea anterior tiene que ser un nombre, no otro dato.
+        if not nombre or len(nombre) < 3 or ":" in nombre:
+            continue
+
+        corridas, ganadas = int(m.group(1)), int(m.group(2))
+        dato = {
+            "corridas_anio": corridas,
+            "ganadas_anio": ganadas,
+            "pct_anio": round(ganadas / corridas * 100, 1) if corridas else 0.0,
+        }
+        if i + 1 < len(lineas):
+            mh = re_hip.match(lineas[i + 1])
+            # Que no sea otra vez la linea del año.
+            if mh and not re_anio.match(lineas[i + 1]):
+                c_h, g_h = int(mh.group(2)), int(mh.group(3))
+                dato["hipodromo"] = mh.group(1).upper()
+                dato["corridas_hip"] = c_h
+                dato["ganadas_hip"] = g_h
+                dato["pct_hip"] = round(g_h / c_h * 100, 1) if c_h else 0.0
+
+        rendimientos[normalize_text(nombre)] = dato
+    return rendimientos
+
+
+def _buscar_rendimiento(rendimientos, nombre):
+    """
+    Busca el rendimiento de una persona. Los nombres no siempre coinciden
+    exactamente: en la tabla dice "Candia Gutierrez E." y al costado
+    "Candia Gutierrez Elvio G.". Se compara por las primeras palabras.
+    """
+    if not nombre or not rendimientos:
+        return None
+    clave = normalize_text(nombre).replace(".", "").replace("-", " ").strip()
+    if clave in rendimientos:
+        return rendimientos[clave]
+
+    palabras = [p for p in clave.split() if len(p) > 2]
+    if not palabras:
+        return None
+    # El apellido y el nombre alcanzan para reconocerlo.
+    inicio = " ".join(palabras[:2])
+    for k, v in rendimientos.items():
+        limpio = k.replace(".", "").replace("-", " ")
+        if limpio.startswith(inicio) or inicio in limpio:
+            return v
+    return None
+
+
+def parse_race(soup, numero):
+    heading = None
+    pat = re.compile(rf"^{numero}\s*[º°ª]?\s*Carrera\b", re.I)
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        if pat.search(clean(h.get_text(" "))):
+            heading = h
+            break
+    if not heading:
+        return None
+
+    # Recolectar todo lo que va desde este encabezado hasta el de la carrera siguiente.
+    nodes = []
+    for node in heading.find_all_next():
+        if node is not heading and node.name in ["h1", "h2", "h3", "h4"] and re.search(
+            r"\d+\s*[º°ª]?\s*Carrera\b", clean(node.get_text(" ")), re.I
+        ):
+            break
+        nodes.append(node)
+
+    block = clean(" ".join(
+        n.get_text(" ", strip=True) for n in nodes if hasattr(n, "get_text")
+    ))
+
+    def get(pattern):
+        m = re.search(pattern, block, re.I)
+        return clean(m.group(1)) if m else ""
+
+    # Buscar la tabla de participantes: la primera que tenga columna 'Ejemplar'
+    # y filas con enlaces a /ejemplares/.
+    # Se recorre en orden: todo lo que aparezca DESPUES de un titulo
+    # 'RETIRADOS' corresponde a caballos que no corren.
+    participants = []
+    tablas_vistas = set()
+    en_retirados = False
+    for node in nodes:
+        texto_nodo = clean(node.get_text(" ")) if hasattr(node, "get_text") else ""
+        if getattr(node, "name", None) != "table":
+            # Un titulo/celda corto que diga RETIRADOS marca el corte.
+            if re.fullmatch(r"RETIRADOS?", texto_nodo, re.I):
+                en_retirados = True
+            continue
+        if id(node) in tablas_vistas:
+            continue
+        tablas_vistas.add(id(node))
+        filas = _parse_participants_table(node)
+        for fila in filas:
+            # Si ya venía marcado en el nombre, se respeta.
+            fila["retirado"] = fila.get("retirado") or en_retirados
+        if filas:
+            participants.extend(filas)
+
+    # Deduplicar por nombre conservando el orden de aparicion.
+    vistos, unicos = set(), []
+    for p in participants:
+        if p["nombre"] in vistos:
+            continue
+        vistos.add(p["nombre"])
+        unicos.append(p)
+    participants = unicos
+
+    # Rendimiento de jockey, entrenador y caballeriza, que el sitio publica
+    # al costado de la carrera.
+    rendimientos = _rendimientos_de_la_carrera(soup)
+    for p in participants:
+        for quien, campo in [("jockey", "jockey"),
+                             ("entrenador", "entrenador"),
+                             ("caballeriza", "caballeriza")]:
+            r = _buscar_rendimiento(rendimientos, p.get(campo, ""))
+            if r:
+                p[f"rend_{quien}"] = r
+
+    return {
+        "carrera": numero,
+        "premio": get(r"Premio:\s*(.+?)\s+Distancia:"),
+        "distancia": get(r"Distancia:\s*(\d+)\s*mts"),
+        "condicion": get(r"Condición:\s*(.+?)\s+Pista:"),
+        "superficie": get(r"Pista:\s*(.+?)\s*\|\s*Estado:"),
+        "estado": get(r"Estado:\s*(.+?)\s*\|\s*Categoria:"),
+        "categoria": get(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)"),
+        "participantes": participants
+    }
+
+
+# Codigos que usa el Stud Book en la ficha del caballo, comprobados en el sitio.
+CODIGOS_HIPODROMO = {
+    "ARG": "Palermo", "SIS": "San Isidro", "LPA": "La Plata",
+    "ROS": "Rosario", "TAN": "Tandil", "DOL": "Dolores",
+    "AZL": "Azul", "TUC": "Tucumán", "SLU": "La Punta",
+    "CBA": "Córdoba", "MZA": "Mendoza", "SFE": "Santa Fe",
+    "NQN": "Neuquén", "SR": "San Rafael", "TDL": "Tandil",
+    "LP": "La Plata", "SI": "San Isidro",
+}
+
+def nombre_hipodromo(codigo):
+    """Devuelve el nombre del hipodromo a partir de su codigo."""
+    c = clean(codigo).upper()
+    return CODIGOS_HIPODROMO.get(c, codigo)
+
+
+def _tabla_carreras_del_perfil(soup):
+    """
+    Busca la tabla CARRERAS de la ficha del ejemplar y la lee por columnas:
+    Fecha | video | Hip. | Nº | O | Dist. | Tiempo | Premio | Cat. | Cond. |
+    P | E | Kg | Jockey | Caballeriza
+    Devuelve una lista de carreras corridas, cada una con su video si lo tiene.
+    """
+    mejor = []
+    for table in soup.find_all("table"):
+        encabezados = [
+            clean(th.get_text(" ")).lower().rstrip(".")
+            for th in (table.find_all("th") or [])
+        ]
+        # La tabla de campaña se reconoce por tener Dist. y Jockey.
+        if not any("dist" in h for h in encabezados):
+            continue
+        if not any("jockey" in h for h in encabezados):
+            continue
+
+        idx = {}
+        for i, h in enumerate(encabezados):
+            # OJO con el orden de estas condiciones. Comprobado en el sitio,
+            # los encabezados son:
+            #   Hip. | N° | O | Dist. | Tiempo | Premio | Cat. | Cond. |
+            #   P | E | Kg | Jockey | Caballeriza | Pos. | Importe | Pago
+            # 'Pos.' es el PUESTO de llegada. 'N°' es el numero de reunion
+            # y 'O' el numero que llevo el caballo. No confundirlos.
+            if h.startswith("pos") and "puesto" not in idx: idx["puesto"] = i
+            elif "hip" in h and "hipodromo" not in idx: idx["hipodromo"] = i
+            elif h in ("n°", "n", "nº") and "reunion" not in idx: idx["reunion"] = i
+            elif h == "o" and "numero" not in idx: idx["numero"] = i
+            elif "dist" in h and "distancia" not in idx: idx["distancia"] = i
+            elif "tiempo" in h and "tiempo" not in idx: idx["tiempo"] = i
+            elif "premio" in h and "premio" not in idx: idx["premio"] = i
+            elif h == "cat" and "categoria" not in idx: idx["categoria"] = i
+            elif h == "cond" and "condicion" not in idx: idx["condicion"] = i
+            elif h == "p" and "pista" not in idx: idx["pista"] = i
+            elif h == "e" and "estado" not in idx: idx["estado"] = i
+            elif h == "kg" and "kilos" not in idx: idx["kilos"] = i
+            elif "jockey" in h and "jockey" not in idx: idx["jockey"] = i
+            elif "caballeriza" in h and "caballeriza" not in idx: idx["caballeriza"] = i
+            elif "importe" in h and "importe" not in idx: idx["importe"] = i
+            elif h == "pago" and "pago" not in idx: idx["pago"] = i
+
+        filas = []
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all("td")
+            if not celdas:
+                continue
+            texto_fila = clean(tr.get_text(" "))
+            m_fecha = re.search(r"(\d{2}/\d{2}/\d{4})", texto_fila)
+            if not m_fecha:
+                continue
+
+            def col(clave):
+                i = idx.get(clave)
+                if i is None or i >= len(celdas):
+                    return ""
+                return clean(celdas[i].get_text(" "))
+
+            # El video es un enlace a youtube dentro de la fila.
+            video = ""
+            for a in tr.find_all("a", href=True):
+                m_yt = re.search(r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]+)", a["href"])
+                if m_yt:
+                    video = m_yt.group(1)
+                    break
+
+            enlace_carrera = ""
+            for a in tr.find_all("a", href=True):
+                if "/reuniones/carrera/" in a["href"]:
+                    enlace_carrera = urljoin(BASE, a["href"])
+                    break
+
+            puesto_txt = col("puesto")
+            filas.append({
+                "fecha": m_fecha.group(1),
+                "hipodromo": nombre_hipodromo(col("hipodromo")),
+                "hipodromo_codigo": col("hipodromo"),
+                "puesto": int(puesto_txt) if puesto_txt.isdigit() else None,
+                "numero": col("numero"),
+                "reunion": col("reunion"),
+                "distancia": col("distancia"),
+                "tiempo": col("tiempo"),
+                "premio": col("premio"),
+                "categoria": col("categoria"),
+                "condicion": col("condicion"),
+                "pista": col("pista"),
+                "estado": col("estado"),
+                "kilos": col("kilos"),
+                "jockey": col("jockey"),
+                "caballeriza": col("caballeriza"),
+                "importe": col("importe"),
+                "pago": col("pago"),
+                "video": video,
+                "enlace": enlace_carrera,
+            })
+
+        if len(filas) > len(mejor):
+            mejor = filas
+    return mejor
+
+
+def _resumen_del_perfil(soup, texto):
+    """Saca un resumen corto y legible, sin el bloque gigante de porcentajes."""
+    resumen = {}
+
+    m = re.search(r"\b(Macho|Hembra)\b", texto, re.I)
+    resumen["sexo"] = m.group(1) if m else ""
+
+    m = re.search(r"(\d{2}/\d{2}/\d{4})\s*\((\d+)\s*años?\)", texto)
+    if m:
+        resumen["nacimiento"] = m.group(1)
+        resumen["edad"] = m.group(2)
+
+    # Padre y madre: aparecen como "por PADRE y MADRE"
+    m = re.search(r"\bpor\s+(.+?)\s+y\s+(.+?)\s+por\b", texto)
+    if m:
+        resumen["padre"] = clean(m.group(1))[:60]
+        resumen["madre"] = clean(m.group(2))[:60]
+
+    # Frase resumen que el propio sitio arma, ej:
+    # "Ganadora de 4 carreras en Palermo - $31.320.000, a los 4 y 5 años."
+    # Se corta en el punto final real, no en los puntos de miles.
+    m = re.search(
+        r"(Ganador[a]?\s+de\s+\d+\s+carreras?.{0,160}?\.)(?:\s|$)",
+        texto, re.I
+    )
+    if m:
+        frase = clean(m.group(1))
+        # Si se cortó dentro de un número (ej "$31."), estirar hasta el punto siguiente.
+        if re.search(r"\$[\d.]*\.$", frase):
+            m2 = re.search(
+                r"(Ganador[a]?\s+de\s+\d+\s+carreras?.{0,200}?años?\.)",
+                texto, re.I
+            )
+            if m2:
+                frase = clean(m2.group(1))
+        resumen["logro"] = frase
+
+    m = re.search(r"CARRERAS\s*\((\d+)\)", texto, re.I)
+    if m:
+        resumen["total_carreras"] = m.group(1)
+
+    return resumen
+
+
+TTL_DETALLE_CARRERA = 30 * 24 * 60 * 60   # 30 dias: una carrera corrida ya no cambia
+
+
+def detalle_de_carrera(url_carrera, ir_al_sitio=True):
+    """
+    Entra a la pagina de una carrera y saca, en palabras, la condicion
+    y el estado de la pista. Se guarda en cache porque una carrera ya
+    corrida no cambia nunca.
+
+    ir_al_sitio=False: lo usan las VISITAS. Solo lo guardado, sin
+    importar la edad (una carrera corrida no cambia). Las tareas de fondo
+    siguen llamando con True y son las que lo traen del sitio.
+    """
+    if not url_carrera:
+        return {}
+
+    clave = f"detalle_carrera:{url_carrera}"
+    cacheado, fresco = cache_get(clave, TTL_DETALLE_CARRERA)
+    if cacheado is not None and (fresco or not ir_al_sitio):
+        return cacheado
+    if not ir_al_sitio:
+        return {}
+
+    try:
+        soup = fetch(url_carrera)
+        texto = clean(soup.get_text(" "))
+
+        def sacar(patron):
+            m = re.search(patron, texto, re.I)
+            return clean(m.group(1)) if m else ""
+
+        detalle = {
+            "condicion_txt": sacar(r"Condición:\s*(.+?)\s*Pista:"),
+            "pista_txt": sacar(r"Pista:\s*(.+?)\s*\|\s*Estado:"),
+            "estado_txt": sacar(r"Estado:\s*(.+?)\s*\|\s*Categoria"),
+            "categoria_txt": sacar(
+                r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+de\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)\b"
+            ),
+            # La hora sirve para saber si corrio de dia o de noche.
+            "hora": sacar(r"Carrera\s*-?\s*(\d{1,2}:\d{2})"),
+        }
+        cache_set(clave, detalle)
+        return detalle
+    except Exception:
+        return cacheado or {}
+
+
+TTL_FICHA_CABALLO = 6 * 60 * 60   # 6 horas: la campaña no cambia en el día
+
+
+def enrich_horse(horse, ir_al_sitio=False):
+    """
+    Completa el caballo con su campaña.
+
+    ir_al_sitio=False (lo normal): usa SOLO lo guardado. Si el caballo no
+    tiene ficha, se devuelve sin campaña y listo.
+    ir_al_sitio=True: lo usan las TAREAS DE FONDO, que si pueden salir.
+
+    POR QUE: esto era lo ultimo que hacia esperar al usuario. Al abrir
+    una carrera, /api/enriquecer pedia la ficha de CADA caballo que no
+    estuviera guardado. De a 8, con 9 segundos de espera cada tanda:
+    14 caballos = hasta 18 segundos con la pantalla trabada. Y como el
+    servidor atiende de a uno, ese usuario dejaba a todos los demas
+    esperando.
+    """
+    profile = horse.get("perfil", "")
+    if not profile:
+        return horse
+
+    # Si ya se consultó hace poco, se usa lo guardado y no se vuelve a pedir.
+    clave = f"ficha:{profile}"
+    guardada, fresca = cache_get(clave, TTL_FICHA_CABALLO)
+    if guardada is not None and fresca:
+        horse.update(guardada)
+        return horse
+
+    # Antes de ir al sitio: ¿está en las fichas que junto el histórico?
+    # Esas quedan guardadas PARA SIEMPRE. Sin esto, la app tenia miles
+    # de campañas guardadas y no las usaba: iba al sitio igual.
+    try:
+        con = db()
+        f = con.execute("SELECT carreras, datos FROM fichas WHERE perfil=?",
+                        (profile,)).fetchone()
+        con.close()
+        if f and f["carreras"] is not None:
+            carreras = json.loads(f["carreras"])
+            if not carreras:
+                # Guardado y SIN campaña = nunca corrio: debutante.
+                # Antes caia en "sin ficha" y la pantalla quedaba en
+                # "Buscando la campaña…" para siempre (04/10/2026).
+                if f["datos"]:
+                    for k, v in json.loads(f["datos"]).items():
+                        if v and not horse.get(k):
+                            horse[k] = v
+                horse.update({"carreras": [], "victorias": 0, "podios": 0,
+                              "corridas": 0, "actuaciones": [],
+                              "cargado": True, "de_lo_guardado": True})
+                horse.setdefault("sexo", "")
+                horse.setdefault("campana", "")
+                return horse
+            if carreras:
+                horse["carreras"] = carreras[:20]
+                if f["datos"]:
+                    for k, v in json.loads(f["datos"]).items():
+                        if v and not horse.get(k):
+                            horse[k] = v
+                puestos = [x["puesto"] for x in carreras if x.get("puesto")]
+                horse["victorias"] = sum(1 for p in puestos if p == 1)
+                horse["podios"] = sum(1 for p in puestos if p <= 3)
+                horse["corridas"] = len(carreras)
+                horse["actuaciones"] = [
+                    f"{x.get('fecha','')} {x.get('hipodromo','')} {x['puesto']}º"
+                    for x in carreras if x.get("puesto")][:20]
+                horse.setdefault("sexo", "")
+                horse.setdefault("campana", horse.get("logro", ""))
+                horse["cargado"] = True
+                horse["de_lo_guardado"] = True
+                return horse
+    except Exception:
+        pass
+
+    # NADIE VA AL SITIO. Hasta aca se busco en lo guardado.
+    if not ir_al_sitio:
+        # Ultimo intento antes de rendirse: el cache VIEJO. Mas arriba se
+        # descarto por tener mas de 6 horas, pero una campaña de ayer es
+        # muchisimo mejor que no mostrar nada.
+        if guardada is not None:
+            horse.update(guardada)
+            return horse
+        # No hay nada guardado. Idea de Leandro (04/10/2026): si no tiene
+        # campaña, no corrio -> se muestra como DEBUTANTE, no "Buscando…"
+        # para siempre. Y se anota PRIMERO en la cola del historico para
+        # que esa noche traiga su ficha (padre, madre, campaña) y se pueda
+        # seguir. La visita no va al sitio: solo escribe una fila.
+        horse.setdefault("sexo", "")
+        horse.setdefault("campana", "")
+        horse.update({"carreras": horse.get("carreras") or [],
+                      "actuaciones": horse.get("actuaciones") or [],
+                      "cargado": True, "sin_ficha": True})
+        _sumar_a_la_cola(profile, "caballo", "9999-12-31")
+        return horse
+
+    try:
+        soup = fetch(profile)
+        texto = clean(soup.get_text(" "))
+
+        resumen = _resumen_del_perfil(soup, texto)
+        horse.update({k: v for k, v in resumen.items() if v})
+        horse.setdefault("sexo", "")
+
+        carreras = _tabla_carreras_del_perfil(soup)
+        horse["carreras"] = carreras[:20]
+
+        # El estado de la pista de cada carrera viene como codigo ("5", "A").
+        # Para que el algoritmo pueda compararlo con la pista del dia hace
+        # falta la palabra. Se traen las 4 mas recientes, TODAS JUNTAS.
+        recientes = [c for c in horse["carreras"][:4] if c.get("enlace")]
+        if recientes:
+            def traer(c):
+                try:
+                    c.update(detalle_de_carrera(c["enlace"]))
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(traer, recientes))
+
+        # Contadores para el pronostico y para mostrar.
+        puestos = [c["puesto"] for c in carreras if c["puesto"]]
+        horse["victorias"] = sum(1 for p in puestos if p == 1)
+        horse["podios"] = sum(1 for p in puestos if p <= 3)
+        horse["corridas"] = len(carreras)
+
+        # Compatibilidad con el resto del codigo que espera 'actuaciones'.
+        horse["actuaciones"] = [
+            f"{c['fecha']} {c['hipodromo']} {c['puesto']}º {c['distancia']}m"
+            for c in carreras if c["puesto"]
+        ][:20]
+        horse["campana"] = resumen.get("logro", "")
+        horse["cargado"] = True
+
+        # Guardar solo lo que se trajo del Stud Book, para no volver a pedirlo.
+        cache_set(clave, {
+            k: horse[k] for k in
+            ("sexo", "edad", "nacimiento", "padre", "madre", "logro",
+             "carreras", "victorias", "podios", "corridas",
+             "actuaciones", "campana", "cargado")
+            if k in horse
+        })
+    except Exception:
+        horse.setdefault("sexo", "")
+        horse.setdefault("campana", "")
+        horse.setdefault("actuaciones", [])
+        horse.setdefault("carreras", [])
+        horse["cargado"] = True   # se intentó; no queda "cargando" para siempre
+    return horse
+
+# ============================================================
+# APRENDIZAJE: los valores del algoritmo dejan de ser fijos.
+# Se guardan en la base y se ajustan comparando pronostico vs resultado.
+# ============================================================
+
+PESOS_INICIALES = {
+    "campana_disponible": 1.2,
+    "registra_victorias": 8.0,
+    "hipodromos_principales": 4.0,
+    "peso_liviano": 5.0,
+    "peso_pesado": -3.0,
+    "victoria_reciente": 4.0,
+    "podio_reciente": 2.0,
+    "pista_compatible": 7.0,
+    # Rendimiento de la gente que rodea al caballo. Empiezan sin castigar
+    # al que no gana: el aprendizaje decide despues si conviene castigarlo.
+    "jockey_ganador": 8.0,
+    "jockey_en_esa_pista": 5.0,
+    "jockey_sin_ganar": 0.0,
+    "entrenador_ganador": 5.0,
+    "caballeriza_ganadora": 3.0,
+    # Peso corporal del animal, que carga el admin el dia de la carrera.
+    "peso_corporal": 4.0,
+    # Posicion de largada: como le fue a ESE caballo saliendo desde ahi.
+    "largada_favorable": 5.0,
+    # De dia o de noche: hay caballos que rinden distinto con luz artificial.
+    "horario_favorable": 4.0,
+    # Distancia: no es lo mismo un caballo de 1000 que uno de 2000 metros.
+    "distancia_favorable": 6.0,
+
+    # ---------- LAS NUEVAS ----------
+    # Arrancan PRENDIDAS en 4, no en cero.
+    #
+    # Por que: en cero no se usaban para nada, y habia que esperar a que
+    # el afinamiento las midiera para que sirvieran. Asi arrancan
+    # trabajando desde el primer dia, con lo poco que haya, y el
+    # afinamiento las sube o las baja con el tiempo segun lo que midan.
+    #
+    # Si una no sirve, el afinamiento la va a bajar sola.
+    "tiempo_bueno": 4.0,        # tardo menos que los demas en esa distancia
+    "edad_favorable": 4.0,      # como le fue a la edad que tiene hoy
+    "padre_ganador": 4.0,       # como andan los hijos de su padre
+    "madre_ganadora": 4.0,      # lo mismo por el lado de la madre
+    "categoria_alta": 4.0,      # viene de correr contra mejores
+    "condicion_conocida": 4.0,  # ya corrio este tipo de carrera
+    "sexo_favorable": 4.0,      # en carreras mixtas
+    "kilos_conocidos": 4.0,     # como le fue con este peso encima
+    "pago_bajo": 4.0,           # el publico lo daba favorito
+    "importe_ganado": 4.0,      # cuanta plata junto en su campaña
+}
+
+def cargar_pesos():
+    """
+    Lee los pesos del algoritmo. Si no existen todavia, usa los iniciales.
+
+    OJO con las variables nuevas: si en la base quedaron en CERO porque
+    antes arrancaban asi, se prenden con su valor de fabrica. Si no,
+    seguirian apagadas para siempre y no se usarian nunca.
+    Una vez que el afinamiento las toque, manda lo que diga la base.
+    """
+    try:
+        con = db()
+        filas = con.execute("SELECT clave, valor FROM algoritmo").fetchall()
+        con.close()
+        guardados = {f["clave"]: f["valor"] for f in filas}
+    except Exception:
+        guardados = {}
+    pesos = dict(PESOS_INICIALES)
+    for k, v in guardados.items():
+        if k not in PESOS_INICIALES:
+            continue
+        # Si quedo en cero pero de fabrica vale algo, se prende.
+        if v == 0 and PESOS_INICIALES[k] != 0:
+            continue
+        pesos[k] = v
+    return pesos
+
+def guardar_pesos(pesos):
+    con = db()
+    ahora = datetime.now().isoformat(timespec="seconds")
+    for clave, valor in pesos.items():
+        con.execute("""
+            INSERT INTO algoritmo(clave, valor, actualizado_en) VALUES(?,?,?)
+            ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                            actualizado_en=excluded.actualizado_en
+        """, (clave, float(valor), ahora))
+    con.commit()
+    con.close()
+
+
+def score_horse(h, context, pesos=None):
+    # Puntaje transparente. Solo usa datos detectados o cargados.
+    P = pesos if pesos is not None else cargar_pesos()
+    score, reasons = 50.0, []
+    acts = h.get("actuaciones", [])
+    campaign = h.get("campana", "").lower()
+    detail = h.get("detalle", "").lower()
+
+    # La campaña puede venir de dos lados: de la ficha del caballo, o del
+    # programa de la carrera. Se toma la que esté disponible.
+    nums = h.get("campana_nums") or []
+    if len(nums) >= 4 and not h.get("corridas"):
+        # [corridas, 1os, 2os, 3os, 4os, 5os, NP]
+        h = dict(h)
+        h["corridas"] = nums[0]
+        h["victorias"] = nums[1]
+        h["podios"] = nums[1] + nums[2] + nums[3]
+
+    # Estos dos suman puntaje pero NO se anuncian: los cumple casi cualquier
+    # caballo con campaña, y como motivo no le dicen nada al usuario.
+    if acts:
+        score += min(14, len(acts) * P["campana_disponible"])
+    if "ganador" in campaign or "ganadora" in campaign:
+        score += P["registra_victorias"]
+    corridas = h.get("corridas")
+    es_debutante = (corridas == 0) if isinstance(corridas, int) else (not acts)
+    if "debut" in campaign or es_debutante:
+        score += 1
+        reasons.append("debuta o tiene historial limitado")
+    elif isinstance(corridas, int) and corridas > 0:
+        # Premia la experiencia, con tope.
+        score += min(8, corridas * 0.7)
+        reasons.append(f"{corridas} carreras corridas")
+    # Como le fue EN ESTE hipodromo, no solo si corrio en uno grande.
+    # Antes sumaba puntos por haber corrido en Palermo o San Isidro,
+    # sin mirar el resultado. Eso no distinguia a nadie.
+    hip_hoy = normalize_text(context.get("hipodromo", ""))
+    if hip_hoy and h.get("carreras"):
+        aca = [c for c in h.get("carreras", [])
+               if c.get("puesto")
+               and normalize_text(c.get("hipodromo", "")) == hip_hoy]
+        if len(aca) >= 2:
+            entro = sum(1 for c in aca if c["puesto"] <= 3)
+            if entro >= len(aca) * 0.5:
+                score += P["hipodromos_principales"]
+                reasons.append(
+                    f"en esta pista entró {entro} de {len(aca)} veces")
+            elif entro == 0:
+                score -= P["hipodromos_principales"] * 0.7
+                reasons.append("en esta pista todavía no entró entre los tres")
+    elif any(x in campaign for x in ["palermo","san isidro","la plata"]):
+        # Respaldo: si no hay campaña cargada, lo de antes.
+        score += P["hipodromos_principales"] * 0.4
+        reasons.append("experiencia en hipódromos principales")
+    # Peso relativo al resto de la carrera (no un umbral fijo).
+    peso_propio = _to_float(h.get("peso"))
+    pesos_carrera = [
+        _to_float(x.get("peso"))
+        for x in context.get("participantes", [])
+        if _to_float(x.get("peso")) is not None
+    ]
+    if peso_propio is not None and len(pesos_carrera) >= 2:
+        promedio = sum(pesos_carrera) / len(pesos_carrera)
+        diferencia = promedio - peso_propio
+        if diferencia >= 1.5:
+            score += P["peso_liviano"]
+            reasons.append(f"lleva {diferencia:.1f} kg menos que el promedio de la carrera")
+        elif diferencia <= -1.5:
+            score += P["peso_pesado"]
+            reasons.append(f"lleva {abs(diferencia):.1f} kg más que el promedio de la carrera")
+
+    # Victorias y podios: si vienen contados de la ficha se usan directo;
+    # si no, se intentan leer del texto de las actuaciones.
+    if h.get("corridas") is not None:
+        victorias = h.get("victorias", 0)
+        podios = h.get("podios", 0)
+    else:
+        victorias = len(re.findall(r"\b1\s*[º°]", " ".join(acts)))
+        podios = len(re.findall(r"\b[123]\s*[º°]", " ".join(acts)))
+    if victorias:
+        score += min(10, victorias * P["victoria_reciente"])
+        reasons.append(f"{victorias} victoria(s) en su campaña")
+    if podios > victorias:
+        score += min(6, (podios - victorias) * P["podio_reciente"])
+        reasons.append(f"{podios} llegada(s) entre los tres primeros")
+
+    # Pista exigente: se premia el antecedente en ESE estado.
+    # El dato correcto esta en cada carrera de la campana (campo 'estado'),
+    # NO en la frase resumen, donde nunca figura el tipo de piso.
+    estado_dia = context.get("estado") or context.get("pista_dia") or ""
+    if estado_dia:
+        clave_estado = normalize_text(estado_dia)
+        PARECIDOS = {
+            "pesada": ["barrosa", "humeda"],
+            "barrosa": ["pesada", "humeda"],
+            "humeda": ["pesada", "barrosa"],
+            "liviana": ["normal"],
+            "normal": ["liviana"],
+        }
+
+        # Como le fue en ese estado de pista, y en los parecidos.
+        exactas, parecidas = [], []
+        for c in h.get("carreras", []):
+            est = normalize_text(c.get("estado_txt") or c.get("estado") or "")
+            if not est or not c.get("puesto"):
+                continue
+            if est == clave_estado:
+                exactas.append(c["puesto"])
+            elif est in PARECIDOS.get(clave_estado, []):
+                parecidas.append(c["puesto"])
+
+        def rinde_bien(puestos):
+            # Entro entre los tres primeros en al menos un tercio de esas salidas.
+            if not puestos:
+                return False
+            return sum(1 for p in puestos if p <= 3) >= max(1, len(puestos) / 3)
+
+        if exactas:
+            if rinde_bien(exactas):
+                score += P["pista_compatible"]
+                reasons.append(
+                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} y anduvo bien")
+            else:
+                score -= P["pista_compatible"] * 0.6
+                reasons.append(
+                    f"corrió {len(exactas)} vez/veces en pista {estado_dia.lower()} sin buen resultado")
+        elif parecidas and rinde_bien(parecidas):
+            score += P["pista_compatible"] * 0.5
+            reasons.append(f"anduvo bien en pista parecida a {estado_dia.lower()}")
+
+        # Respaldo: si no hay campana cargada, se mira la frase resumen.
+        elif not h.get("carreras"):
+            if clave_estado in normalize_text(campaign + " " + detail):
+                score += P["pista_compatible"] * 0.5
+                reasons.append(f"antecedente en pista {estado_dia.lower()}")
+
+    # Viento en contra: castiga a los que llevan más peso que el promedio.
+    if context.get("viento") == "En contra" and peso_propio is not None:
+        if pesos_carrera and peso_propio > (sum(pesos_carrera)/len(pesos_carrera)):
+            score += P["peso_pesado"] * 0.6
+            reasons.append("viento en contra y lleva peso por encima del promedio")
+
+    # Césped: es una superficie muy distinta, el que nunca corrió ahí arranca en desventaja.
+    if normalize_text(context.get("pista", "")).startswith("cesped"):
+        en_cesped = [c for c in h.get("carreras", [])
+                     if "cesped" in normalize_text(c.get("pista_txt") or c.get("pista") or "")]
+        if h.get("carreras") and not en_cesped:
+            score -= P["pista_compatible"] * 0.5
+            reasons.append("nunca corrió en césped")
+        elif en_cesped:
+            score += P["pista_compatible"] * 0.4
+            reasons.append(f"tiene {len(en_cesped)} carrera(s) en césped")
+
+    # --- Datos del programa: forma reciente, descanso y efectividad ---
+    # Vienen de la tabla que publica el Stud Book antes de cada carrera.
+
+    # "8 últimas": los numeros son los puestos, del mas reciente al mas viejo.
+    forma = h.get("forma", "")
+    if forma:
+        puestos_recientes = [int(x) for x in re.findall(r"\d", forma)][:6]
+        if puestos_recientes:
+            buenos = sum(1 for p in puestos_recientes if p <= 3)
+            if buenos >= len(puestos_recientes) * 0.6:
+                score += P["podio_reciente"] * 2
+                reasons.append(
+                    f"viene fino: {buenos} de sus últimas {len(puestos_recientes)} entre los tres primeros")
+            elif buenos == 0:
+                score -= P["podio_reciente"] * 1.5
+                reasons.append("no entra entre los tres primeros hace varias salidas")
+            # La ultima carrera pesa mas que las anteriores.
+            if puestos_recientes[0] == 1:
+                score += P["victoria_reciente"] * 0.8
+                reasons.append("ganó su última carrera")
+
+    # Días sin correr: muy poco descanso o demasiado, los dos restan.
+    dias = h.get("dias_sin_correr")
+    if isinstance(dias, int):
+        if dias < 10:
+            score -= 2
+            reasons.append(f"corrió hace apenas {dias} días")
+        elif 15 <= dias <= 45:
+            score += 3
+            reasons.append(f"descanso justo: {dias} días")
+        elif dias > 120:
+            score -= 4
+            reasons.append(f"hace {dias} días que no corre")
+
+    # Efectividad: el porcentaje de carreras ganadas que publica el sitio.
+    efec = h.get("efectividad", "")
+    if efec:
+        try:
+            valor = float(efec.replace("%", "").replace(",", "."))
+            if valor >= 30:
+                score += 6
+                reasons.append(f"gana el {efec} de las carreras que corre")
+            elif valor >= 15:
+                score += 3
+                reasons.append(f"efectividad del {efec}")
+        except ValueError:
+            pass
+
+    # --- Jockey, entrenador y caballeriza ---
+    # El sitio publica cuántas corrió y cuántas ganó cada uno, en el año y
+    # en ESE hipódromo. Lo del hipódromo pesa distinto porque dice cómo le
+    # va en esa pista.
+    def sumar_rendimiento(clave, titulo, peso_gana, peso_pista=None):
+        nonlocal score
+        r = h.get("clave_no_existe") if False else h.get(clave)
+        if not r:
+            return
+        # Rendimiento del año
+        pct = r.get("pct_anio", 0)
+        corridas = r.get("corridas_anio", 0)
+        if corridas >= 10:
+            if pct >= 18:
+                score += peso_gana
+                reasons.append(f"{titulo} gana el {pct}% este año")
+            elif pct >= 10:
+                score += peso_gana * 0.5
+                reasons.append(f"{titulo} gana el {pct}% este año")
+            elif pct == 0:
+                # Arranca sin castigo: el peso vale 0 hasta que el
+                # aprendizaje diga otra cosa.
+                score -= P["jockey_sin_ganar"]
+                if P["jockey_sin_ganar"] > 0:
+                    reasons.append(f"{titulo} no ganó ninguna en {corridas} salidas")
+
+        # Rendimiento en ese hipódromo
+        if peso_pista and r.get("corridas_hip", 0) >= 8:
+            pct_h = r.get("pct_hip", 0)
+            if pct_h >= 18:
+                score += peso_pista
+                reasons.append(
+                    f"{titulo} gana el {pct_h}% en {r.get('hipodromo','esa pista')}")
+
+    sumar_rendimiento("rend_jockey", "el jockey",
+                      P["jockey_ganador"], P["jockey_en_esa_pista"])
+    sumar_rendimiento("rend_entrenador", "el entrenador",
+                      P["entrenador_ganador"])
+    sumar_rendimiento("rend_caballeriza", "la caballeriza",
+                      P["caballeriza_ganadora"])
+
+    # --- Peso corporal del animal ---
+    # Lo carga el admin el dia de la carrera. Un caballo muy por debajo o
+    # muy por encima del promedio de SU carrera suele rendir distinto.
+    mio = _to_float(h.get("peso_corporal_oficial"))
+    if mio:
+        cuerpos = [
+            _to_float(x.get("peso_corporal_oficial"))
+            for x in context.get("participantes", [])
+            if _to_float(x.get("peso_corporal_oficial"))
+        ]
+        if len(cuerpos) >= 3:
+            promedio = sum(cuerpos) / len(cuerpos)
+            dif = mio - promedio
+            if dif >= 25:
+                score += P["peso_corporal"]
+                reasons.append(f"pesa {int(dif)} kg más que el promedio de la carrera")
+            elif dif <= -25:
+                score -= P["peso_corporal"]
+                reasons.append(f"pesa {int(abs(dif))} kg menos que el promedio de la carrera")
+
+    # --- Posicion de largada ---
+    # Se compara el numero que lleva HOY con como le fue las veces que
+    # largo desde cerca de ahi. No es lo mismo salir por adentro que por
+    # afuera, y cada caballo tiene su historia.
+    numero_hoy = h.get("numero")
+    if numero_hoy and h.get("carreras"):
+        cercanas, lejanas = [], []
+        for c in h.get("carreras", []):
+            n = c.get("numero")
+            try:
+                n = int(str(n).strip())
+            except (TypeError, ValueError):
+                continue
+            if not c.get("puesto"):
+                continue
+            # "Cerca" es hasta dos numeros de diferencia.
+            if abs(n - int(numero_hoy)) <= 2:
+                cercanas.append(c["puesto"])
+            else:
+                lejanas.append(c["puesto"])
+
+        if len(cercanas) >= 2:
+            prom_cerca = sum(cercanas) / len(cercanas)
+            entro = sum(1 for p in cercanas if p <= 3)
+            if entro >= len(cercanas) * 0.5:
+                score += P["largada_favorable"]
+                reasons.append(
+                    f"largando cerca del {numero_hoy} entró {entro} de {len(cercanas)} veces")
+            elif lejanas:
+                prom_lejos = sum(lejanas) / len(lejanas)
+                if prom_cerca > prom_lejos + 1.5:
+                    score -= P["largada_favorable"] * 0.7
+                    reasons.append(
+                        f"largando cerca del {numero_hoy} le fue peor que desde otros lugares")
+
+    # --- De dia o de noche ---
+    # Se deduce de la hora de la carrera. Hay caballos que rinden distinto
+    # con luz artificial.
+    hora_carrera = context.get("hora", "")
+    if hora_carrera and h.get("carreras"):
+        def es_de_noche(hhmm):
+            try:
+                return int(str(hhmm).split(":")[0]) >= 19
+            except (ValueError, IndexError):
+                return None
+
+        noche_hoy = es_de_noche(hora_carrera)
+        if noche_hoy is not None:
+            iguales = []
+            for c in h.get("carreras", []):
+                n = es_de_noche(c.get("hora", ""))
+                if n is None or not c.get("puesto"):
+                    continue
+                if n == noche_hoy:
+                    iguales.append(c["puesto"])
+            if len(iguales) >= 3:
+                entro = sum(1 for p in iguales if p <= 3)
+                cuando = "de noche" if noche_hoy else "de día"
+                if entro >= len(iguales) * 0.5:
+                    score += P["horario_favorable"]
+                    reasons.append(f"corriendo {cuando} entró {entro} de {len(iguales)} veces")
+                elif entro == 0:
+                    score -= P["horario_favorable"] * 0.7
+                    reasons.append(f"corriendo {cuando} no entró entre los tres primeros")
+
+    # --- Distancia ---
+    # No es lo mismo un caballo de 1000 metros que uno de 2000. Se mira
+    # como le fue en distancias PARECIDAS a la de hoy.
+    dist_hoy = _to_float(context.get("distancia"))
+    if dist_hoy and h.get("carreras"):
+        cercanas, lejanas = [], []
+        for c in h.get("carreras", []):
+            d = _to_float(c.get("distancia"))
+            if not d or not c.get("puesto"):
+                continue
+            # "Parecida" es hasta 200 metros de diferencia.
+            if abs(d - dist_hoy) <= 200:
+                cercanas.append(c["puesto"])
+            else:
+                lejanas.append(c["puesto"])
+
+        if len(cercanas) >= 2:
+            entro = sum(1 for p in cercanas if p <= 3)
+            metros = int(dist_hoy)
+            if entro >= len(cercanas) * 0.5:
+                score += P["distancia_favorable"]
+                reasons.append(
+                    f"en {metros} metros entró {entro} de {len(cercanas)} veces")
+            elif entro == 0:
+                score -= P["distancia_favorable"] * 0.8
+                reasons.append(
+                    f"en {metros} metros no entró entre los tres primeros")
+        elif not cercanas and lejanas:
+            # Nunca corrio esa distancia: es una incognita.
+            score -= P["distancia_favorable"] * 0.4
+            reasons.append(f"nunca corrió en {int(dist_hoy)} metros")
+
+    # ============================================================
+    # LAS VARIABLES NUEVAS
+    # Todas arrancan en cero. Si el peso es cero, no suman ni restan
+    # ni aparecen como motivo: es como si no existieran. El
+    # afinamiento las sube solo si miden que sirven.
+    # ============================================================
+
+    def _seg(t):
+        """Pasa un tiempo del tipo 1'24\"35 a segundos."""
+        if not t:
+            return None
+        m = re.match(r"(?:(\d+)['´])?\s*(\d+)[\"”]?\s*(\d+)?", str(t).strip())
+        if not m:
+            return None
+        try:
+            mins = int(m.group(1) or 0)
+            segs = int(m.group(2) or 0)
+            cent = int((m.group(3) or "0")[:2])
+            return mins * 60 + segs + cent / 100
+        except (ValueError, TypeError):
+            return None
+
+    # --- 1) EL TIEMPO ---
+    # Lo mas directo que hay: cuanto tardo de verdad en esta distancia.
+    if P["tiempo_bueno"] and dist_hoy and h.get("carreras"):
+        mios = []
+        for c in h.get("carreras", []):
+            d = _to_float(c.get("distancia"))
+            s = _seg(c.get("tiempo"))
+            if d and s and abs(d - dist_hoy) <= 100:
+                mios.append(s / d * 1000)   # segundos cada mil metros
+        if mios:
+            mi_ritmo = min(mios)
+            # Contra el resto de la carrera.
+            otros = []
+            for x in context.get("participantes", []):
+                for c in (x.get("carreras") or []):
+                    d = _to_float(c.get("distancia"))
+                    s = _seg(c.get("tiempo"))
+                    if d and s and abs(d - dist_hoy) <= 100:
+                        otros.append(s / d * 1000)
+            if len(otros) >= 5:
+                promedio = sum(otros) / len(otros)
+                if mi_ritmo < promedio - 0.5:
+                    score += P["tiempo_bueno"]
+                    reasons.append("corrió esta distancia más rápido que el promedio")
+                elif mi_ritmo > promedio + 0.5:
+                    score -= P["tiempo_bueno"] * 0.7
+                    reasons.append("sus tiempos en esta distancia son flojos")
+
+    # --- 2) LA EDAD ---
+    edad = _to_float(h.get("edad"))
+    if P["edad_favorable"] and edad:
+        # Los de 4 y 5 suelen estar en su mejor momento.
+        if 4 <= edad <= 6:
+            score += P["edad_favorable"]
+            reasons.append(f"{int(edad)} años, en su mejor momento")
+        elif edad >= 9:
+            score -= P["edad_favorable"] * 0.8
+            reasons.append(f"ya tiene {int(edad)} años")
+        elif edad <= 2:
+            score -= P["edad_favorable"] * 0.4
+            reasons.append("todavía es muy joven")
+
+    # --- 3 y 4) PADRE Y MADRE ---
+    # Como andan los otros hijos de esa sangre. Sirve sobre todo con
+    # los que casi no corrieron.
+    for quien, peso_clave in (("padre", "padre_ganador"),
+                              ("madre", "madre_ganadora")):
+        if not P[peso_clave]:
+            continue
+        sangre = normalize_text(h.get(quien, ""))
+        if not sangre or len(sangre) < 3:
+            continue
+        # Los hermanos que corren hoy en esta misma carrera.
+        hermanos = [
+            x for x in context.get("participantes", [])
+            if normalize_text(x.get(quien, "")) == sangre
+            and x.get("nombre") != h.get("nombre")
+        ]
+        if hermanos:
+            gana = sum(x.get("victorias", 0) or 0 for x in hermanos)
+            corre = sum(x.get("corridas", 0) or 0 for x in hermanos)
+            if corre >= 10 and gana / corre >= 0.15:
+                score += P[peso_clave]
+                reasons.append(f"su {quien} da ganadores")
+
+    # --- 5) LA CATEGORIA ---
+    # No es lo mismo venir de un clasico que de un condicional.
+    ESCALA = {"grupo": 5, "clasico": 4, "especial": 3,
+              "condicional": 2, "handicap": 2, "invitacion": 1}
+
+    def _nivel(txt):
+        t = normalize_text(txt or "")
+        for nombre, n in ESCALA.items():
+            if nombre in t:
+                return n
+        return 0
+
+    if P["categoria_alta"] and h.get("carreras"):
+        niveles = [_nivel(c.get("categoria_txt") or c.get("categoria"))
+                   for c in h.get("carreras", [])[:8]]
+        niveles = [n for n in niveles if n]
+        if niveles:
+            mi_nivel = max(niveles)
+            hoy_nivel = _nivel(context.get("categoria", ""))
+            if hoy_nivel and mi_nivel > hoy_nivel:
+                score += P["categoria_alta"]
+                reasons.append("viene de correr en categorías más altas")
+            elif hoy_nivel and mi_nivel < hoy_nivel:
+                score -= P["categoria_alta"] * 0.6
+                reasons.append("sube de categoría")
+
+    # --- 6) LA CONDICION ---
+    if P["condicion_conocida"] and h.get("carreras"):
+        cond_hoy = normalize_text(context.get("condicion", ""))[:30]
+        if cond_hoy:
+            iguales = [c for c in h.get("carreras", [])
+                       if cond_hoy in normalize_text(c.get("condicion", ""))
+                       and c.get("puesto")]
+            if len(iguales) >= 2:
+                entro = sum(1 for c in iguales if c["puesto"] <= 3)
+                if entro >= len(iguales) * 0.5:
+                    score += P["condicion_conocida"]
+                    reasons.append("anduvo bien en carreras de esta condición")
+
+    # --- 7) EL SEXO ---
+    if P["sexo_favorable"]:
+        mio = normalize_text(h.get("sexo") or h.get("sexo_tabla", ""))
+        if mio:
+            sexos = [normalize_text(x.get("sexo") or x.get("sexo_tabla", ""))
+                     for x in context.get("participantes", [])]
+            sexos = [s for s in sexos if s]
+            # En carreras mixtas, ver si es de los pocos de su sexo.
+            if len(set(sexos)) > 1 and len(sexos) >= 5:
+                cuantos = sexos.count(mio)
+                if cuantos <= len(sexos) * 0.3:
+                    score += P["sexo_favorable"]
+                    reasons.append("corre contra caballos de otro sexo")
+
+    # --- 8) LOS KILOS ---
+    peso_hoy = _to_float(h.get("peso"))
+    if P["kilos_conocidos"] and peso_hoy and h.get("carreras"):
+        parecidos = [c for c in h.get("carreras", [])
+                     if c.get("puesto") and _to_float(c.get("kilos"))
+                     and abs(_to_float(c.get("kilos")) - peso_hoy) <= 1.5]
+        if len(parecidos) >= 2:
+            entro = sum(1 for c in parecidos if c["puesto"] <= 3)
+            if entro >= len(parecidos) * 0.5:
+                score += P["kilos_conocidos"]
+                reasons.append(f"con {peso_hoy:.0f} kilos encima anduvo bien")
+
+    # --- 9) LO QUE PAGO ---
+    # Si pagaba poco, el publico lo daba favorito. Y muchas veces acierta.
+    if P["pago_bajo"] and h.get("carreras"):
+        pagos = [_to_float(str(c.get("pago", "")).replace("$", ""))
+                 for c in h.get("carreras", [])[:6]]
+        pagos = [p for p in pagos if p and p > 0]
+        if len(pagos) >= 3:
+            promedio = sum(pagos) / len(pagos)
+            if promedio <= 4:
+                score += P["pago_bajo"]
+                reasons.append("suele salir entre los favoritos")
+            elif promedio >= 20:
+                score -= P["pago_bajo"] * 0.6
+                reasons.append("casi siempre sale muy pagador")
+
+    # --- 10) LA PLATA GANADA ---
+    if P["importe_ganado"]:
+        def _plata(t):
+            n = re.sub(r"[^\d]", "", str(t or ""))
+            return float(n) if n else 0.0
+        mia = _plata(h.get("ganado"))
+        if mia:
+            otras = [_plata(x.get("ganado")) for x in context.get("participantes", [])]
+            otras = [x for x in otras if x]
+            if len(otras) >= 3:
+                promedio = sum(otras) / len(otras)
+                if mia >= promedio * 1.8:
+                    score += P["importe_ganado"]
+                    reasons.append("ganó bastante más plata que el resto")
+
+    # Los motivos se ordenan por lo que mas distingue a un caballo de otro.
+    # Sin esto, los genericos tapan a los que de verdad explican el puesto.
+    PRIORIDAD = [
+        "viene fino", "no entra entre", "ganó su última",
+        "el jockey gana", "el jockey no ganó",
+        "gana el", "efectividad",
+        "corrió", "anduvo bien", "nunca corrió",
+        "el entrenador", "la caballeriza",
+        "descanso justo", "hace", "corrió hace",
+        "victoria", "llegada",
+        "en 1", "en 2", "nunca corrió en",
+        "largando", "corriendo de", "lleva", "pesa", "viento",
+        "carreras corridas", "experiencia", "debuta",
+    ]
+
+    def peso_motivo(m):
+        bajo = m.lower()
+        for i, clave in enumerate(PRIORIDAD):
+            if clave in bajo:
+                return i
+        return len(PRIORIDAD)
+
+    reasons.sort(key=peso_motivo)
+    return round(max(1, score), 1), reasons
+
+
+def _to_float(value):
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_text(value):
+    value = clean(value).lower()
+    for source, target in {
+        "á": "a", "é": "e", "í": "i",
+        "ó": "o", "ú": "u", "ü": "u",
+    }.items():
+        value = value.replace(source, target)
+    return value
+
+
+def meeting_date_from_url(url):
+    match = re.search(r"(?<!\d)(20\d{6})(?!\d)", url or "")
+    if not match:
+        return ""
+    try:
+        return datetime.strptime(
+            match.group(1),
+            "%Y%m%d",
+        ).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _limpiar_nombre_hipodromo(bruto):
+    """
+    El sitio devuelve el nombre con basura pegada, por ejemplo:
+        "SIS San Isidro 13 131"  ->  "San Isidro"
+        "ARG Palermo 16 128"     ->  "Palermo"
+    Los numeros son la cantidad de carreras y los ejemplares, no van
+    en el nombre. La sigla del principio tampoco.
+    """
+    n = clean(bruto)
+    if not n:
+        return "Hipódromo"
+    # Sacar la sigla del principio: dos a cuatro mayusculas sueltas.
+    n = re.sub(r"^[A-Z]{2,4}\s+", "", n)
+    # Sacar los numeros del final.
+    n = re.sub(r"(\s+\d+)+\s*$", "", n)
+    return clean(n) or clean(bruto)
+
+
+def calendar_from_meetings(soup):
+    meetings = []
+    seen = set()
+
+    for link in soup.select('a[href*="/reuniones/detalle/"]'):
+        href = urljoin(BASE, link.get("href", ""))
+        date = meeting_date_from_url(href)
+        racecourse = _limpiar_nombre_hipodromo(link.get_text(" "))
+
+        if not date:
+            continue
+
+        key = (normalize_text(racecourse), date, href)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        meetings.append({
+            "hipodromo": racecourse,
+            "fecha": date,
+            "url": href,
+        })
+
+    meetings.sort(
+        key=lambda item: (
+            item["fecha"],
+            normalize_text(item["hipodromo"]),
+        )
+    )
+    return meetings
+
+
+def _codigo_recaptcha(soup):
+    """
+    El sitio exige un codigo 'recaptcha' en la direccion para cambiar de mes.
+    Ese codigo viene dentro de la propia pagina de reuniones.
+    """
+    # 1) En algun enlace de la propia pagina.
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"[?&]recaptcha=([^&\"']+)", a["href"])
+        if m:
+            return m.group(1)
+    # 2) En un campo oculto del formulario.
+    campo = soup.find("input", attrs={"name": "recaptcha"})
+    if campo and campo.get("value"):
+        return campo["value"]
+    # 3) En el codigo de la pagina.
+    m = re.search(r"recaptcha['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-]{40,})", str(soup))
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _sesion_studbook():
+    """
+    Una sesion que conserva las cookies y se presenta como un navegador
+    real. Hace falta porque el sitio puede recordar el mes elegido en la
+    sesion, y porque puede rechazar pedidos que no parezcan de un navegador.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/126.0 Safari/537.36"),
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8"),
+        "Accept-Language": "es-AR,es;q=0.9",
+        "Referer": BASE + "/reuniones",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return s
+
+
+def _datos_del_formulario(soup):
+    """
+    Lee el formulario de la pagina de reuniones y devuelve como se llaman
+    sus campos y si se envia por GET o por POST. No se adivina: se lee.
+    """
+    for form in soup.find_all("form"):
+        campos = {}
+        nombres = []
+        for inp in form.find_all(["input", "select"]):
+            n = inp.get("name")
+            if not n:
+                continue
+            nombres.append(n)
+            if inp.name == "input":
+                campos[n] = inp.get("value", "")
+            else:
+                sel = inp.find("option", selected=True) or inp.find("option")
+                campos[n] = sel.get("value", "") if sel else ""
+        # El formulario del calendario tiene los campos de mes y año.
+        texto = " ".join(nombres).lower()
+        if any(x in texto for x in ["mes", "month", "anio", "año", "year"]):
+            return {
+                "accion": urljoin(BASE, form.get("action") or "/reuniones"),
+                "metodo": (form.get("method") or "get").lower(),
+                "campos": campos,
+                "nombres": nombres,
+            }
+    return None
+
+
+def _traer_mes(anio, mes):
+    """
+    Trae la pagina de un mes concreto. Prueba, en orden, las tres vias
+    posibles, cada una con la sesion abierta para conservar las cookies:
+      1) el formulario tal como lo declara la pagina
+      2) por direccion, con el codigo que traiga la pagina
+      3) por direccion pelada
+    Devuelve (reuniones, via_que_funciono).
+    """
+    prefijo = f"{anio}-{mes:02d}-"
+    s = _sesion_studbook()
+
+    # Primero se abre la pagina normal: asi se obtienen cookies y el formulario.
+    r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
+    r0.raise_for_status()
+    soup0 = BeautifulSoup(r0.text, "html.parser")
+
+    formulario = _datos_del_formulario(soup0)
+    codigo = _codigo_recaptcha(soup0)
+
+    intentos = []
+
+    # 1) El formulario, tal como lo declara la pagina.
+    if formulario:
+        campos = dict(formulario["campos"])
+        for n in formulario["nombres"]:
+            bajo = n.lower()
+            if "mes" in bajo or "month" in bajo:
+                campos[n] = f"{mes:02d}"
+            elif "anio" in bajo or "año" in bajo or "year" in bajo:
+                campos[n] = str(anio)
+        intentos.append(("formulario", formulario["metodo"],
+                         formulario["accion"], campos))
+
+    # 2) Con el campo recaptcha VACIO, tal como lo declara el formulario.
+    params_vacio = {"recaptcha": "", "mes": f"{mes:02d}", "anio": str(anio)}
+    intentos.append(("recaptcha vacio", "get", BASE + "/reuniones", params_vacio))
+
+    # 3) Por direccion, con el codigo si aparecio.
+    params = {"mes": f"{mes:02d}", "anio": str(anio)}
+    if codigo:
+        intentos.append(("direccion con codigo", "get", BASE + "/reuniones",
+                         {**params, "recaptcha": codigo}))
+    # 4) Por direccion pelada, ya con las cookies de la sesion.
+    intentos.append(("direccion con sesion", "get", BASE + "/reuniones", params))
+    # 5) Por direccion, como POST.
+    intentos.append(("direccion como POST", "post", BASE + "/reuniones", params))
+    # 6) Con el orden de campos tal cual el formulario los declara.
+    intentos.append(("orden del formulario", "get", BASE + "/reuniones",
+                     {"recaptcha": "", "mes": str(mes), "anio": str(anio)}))
+
+    detalle = []
+    for etiqueta, metodo, accion, datos in intentos:
+        try:
+            if metodo == "post":
+                r = s.post(accion, data=datos, timeout=(5, 15))
+            else:
+                r = s.get(accion, params=datos, timeout=(5, 15))
+            reuniones = calendar_from_meetings(BeautifulSoup(r.text, "html.parser"))
+            del_mes = [x for x in reuniones if x["fecha"].startswith(prefijo)]
+            meses = sorted({x["fecha"][:7] for x in reuniones})
+            detalle.append({
+                "via": etiqueta, "metodo": metodo.upper(),
+                "status": r.status_code, "url": r.url[:120],
+                "total": len(reuniones), "DEL_MES": len(del_mes),
+                "meses_que_trajo": meses,
+            })
+            if del_mes:
+                return del_mes, etiqueta, detalle
+        except Exception as e:
+            detalle.append({"via": etiqueta, "error": str(e)[:120]})
+
+    return [], "", detalle
+
+
+def calendario_del_mes(anio, mes):
+    """
+    Devuelve las reuniones de un mes concreto (anio=2024, mes=3).
+    Guarda en cache: un mes que ya paso no cambia mas.
+    """
+    clave = f"calendario_mes:{anio}-{mes:02d}"
+    hoy = datetime.now()
+    es_pasado = (anio, mes) < (hoy.year, hoy.month)
+    ttl = 90 * 24 * 60 * 60 if es_pasado else TTL_CALENDARIO
+
+    cacheado, fresco = cache_get(clave, ttl)
+    if cacheado is not None and fresco:
+        return cacheado
+
+    try:
+        reuniones, via, _ = _traer_mes(anio, mes)
+        if reuniones:
+            cache_set(clave, reuniones)
+        return reuniones
+    except Exception:
+        return cacheado or []
+
+
+def calendario_completo():
+    """
+    El calendario que usa la app: el mes ANTERIOR, el ACTUAL y el SIGUIENTE.
+
+    Por que: la pagina de reuniones del Stud Book muestra UN SOLO MES.
+    El 30 de septiembre las reuniones de octubre ya estaban publicadas,
+    pero no aparecian: la app solo miraba esa pagina y la pantalla no
+    mostraba ninguna fecha futura. Y el dia 1 de cada mes pasaba lo
+    contrario: desaparecian las fechas pasadas.
+
+    Pedidos al sitio: la pagina del mes actual, como antes. El mes
+    siguiente se guarda 20 horas y el anterior 90 dias (ya no cambia),
+    asi que casi siempre salen de lo guardado.
+    """
+    # Si esta pagina falla, el error sube como antes y se usa lo guardado.
+    actual = calendar_from_meetings(fetch(BASE + "/reuniones"))
+
+    hoy = ahora_argentina()
+    a, m = hoy.year, hoy.month
+    anterior = (a, m - 1) if m > 1 else (a - 1, 12)
+    siguiente = (a, m + 1) if m < 12 else (a + 1, 1)
+
+    juntas = list(actual)
+    vistas = {r["url"] for r in actual}
+    for anio, mes in (anterior, siguiente):
+        try:
+            for r in calendario_del_mes(anio, mes):
+                if r.get("url") and r["url"] not in vistas:
+                    vistas.add(r["url"])
+                    juntas.append(r)
+        except Exception:
+            # Si el otro mes no se pudo traer, se sigue con lo que hay:
+            # nunca dejar la app sin calendario por un mes extra.
+            continue
+
+    juntas.sort(key=lambda r: (r["fecha"], normalize_text(r["hipodromo"])))
+    return juntas
+
+
+def calendario_entre(desde, hasta):
+    """Junta las reuniones de todos los meses entre dos fechas (AAAA-MM-DD)."""
+    try:
+        d = datetime.strptime(desde, "%Y-%m-%d")
+        h = datetime.strptime(hasta, "%Y-%m-%d")
+    except ValueError:
+        return []
+
+    todas = []
+    anio, mes = d.year, d.month
+    while (anio, mes) <= (h.year, h.month):
+        todas.extend(calendario_del_mes(anio, mes))
+        mes += 1
+        if mes > 12:
+            mes = 1
+            anio += 1
+    return todas
+
+
+def saved_calendar():
+    con = db()
+    rows = con.execute(
+        """
+        SELECT DISTINCT fecha, hipodromo
+        FROM carreras
+        ORDER BY fecha DESC, hipodromo
+        """
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "fecha": row["fecha"],
+            "hipodromo": row["hipodromo"],
+            "url": "",
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/calendario")
+def calendario():
+    forzar = request.args.get("refresh") == "1"
+    try:
+        # NADIE VA AL SITIO. El calendario guardado vale siempre: lo
+        # renuevan las tareas de fondo. Antes valia 20 horas, y pasadas
+        # esas horas la PRIMERA PANTALLA de la app salia al Stud Book y
+        # mostraba el cartel rojo aunque las 40 fechas estuvieran bien.
+        guardado = lo_guardado("calendario")
+        if guardado:
+            meetings, origen = guardado, "cache"
+        else:
+            meetings, origen = con_cache(
+                "calendario", TTL_CALENDARIO, forzar,
+                lambda: calendario_completo()
+            )
+        if meetings:
+            # El cache puede tener nombres viejos, con la sigla y los numeros
+            # pegados. Se limpian aca tambien, para no depender de vaciarlo.
+            for m in meetings:
+                m["hipodromo"] = _limpiar_nombre_hipodromo(m.get("hipodromo", ""))
+
+            hoy = hoy_argentina()
+            ahora = hora_argentina()
+            fechas = sorted({m["fecha"] for m in meetings})
+
+            # Cual es la fecha donde hay que entrar: hoy si todavia queda
+            # alguna carrera por correrse, si no la siguiente con reunion.
+            fecha_activa = hoy if hoy in fechas else ""
+            jornada_terminada = False
+            if fecha_activa:
+                try:
+                    de_hoy = [m for m in meetings if m["fecha"] == hoy]
+                    quedan = False
+                    for m in de_hoy:
+                        # Antes esto era fetch(m["url"]) a secas: un pedido
+                        # al Stud Book por reunion CADA VEZ que alguien abria
+                        # la app. Ahora usa lo guardado.
+                        horas = _horas_de_la_reunion(
+                            m["url"], hoy, m.get("hipodromo", ""))
+                        if horas is None:
+                            # El sitio no contesta y no hay nada guardado.
+                            # No tiene sentido esperar 9 segundos por cada
+                            # reunion que falta: se deja el dia como esta.
+                            quedan = True
+                            break
+                        if any(h and h >= ahora for h in horas):
+                            quedan = True
+                            break
+                    jornada_terminada = not quedan
+                except Exception:
+                    jornada_terminada = False
+            if not fecha_activa or jornada_terminada:
+                futuras = [f for f in fechas if f > hoy]
+                fecha_activa = futuras[0] if futuras else fecha_activa
+
+            resp = {
+                "ok": True, "reuniones": meetings, "fuente": "Stud Book",
+                "hoy": hoy,
+                "ahora": ahora,
+                # La unica fecha que se marca: donde hay que entrar.
+                "fecha_activa": fecha_activa,
+                "jornada_terminada": jornada_terminada,
+            }
+            if origen == "cache_vencido":
+                resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                                 "Te mostramos la última versión que guardamos.")
+            return jsonify(**resp)
+    except Exception:
+        pass
+
+    saved = saved_calendar()
+    if saved:
+        return jsonify(
+            ok=True,
+            reuniones=saved,
+            fuente="Carreras guardadas",
+            aviso=("Los datos oficiales están tardando en llegar. "
+                   "Te mostramos las fechas que teníamos guardadas."),
+        )
+
+    return jsonify(
+        ok=False,
+        error=("Los datos oficiales están tardando en llegar."),
+        que_hacer=("Deslizá la pantalla hacia abajo o tocá Actualizar "
+                   "para volver a intentar."),
+        reintentar=True,
+        reuniones=[],
+    ), 503
+
+
+@app.get("/")
+def home():
+    return render_template("index.html")
+
+@app.get("/api/reuniones")
+def reuniones():
+    fecha = request.args.get("fecha", "").strip()
+    hipodromo = request.args.get("hipodromo", "").strip()
+
+    if not fecha or not hipodromo:
+        return jsonify(
+            ok=False,
+            error="Elegí hipódromo y fecha.",
+        ), 400
+
+    try:
+        datetime.strptime(fecha, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(ok=False, error="Fecha inválida."), 400
+
+    forzar = request.args.get("refresh") == "1"
+    clave = f"reuniones:{fecha}:{normalize_text(hipodromo)}"
+
+    def traer():
+        # El completo: si no, una reunion del mes que viene no se encontraba.
+        calendar = calendario_completo()
+        # El nombre puede venir sucio del cache viejo ("SIS San Isidro 13 131"),
+        # asi que se compara con los dos limpios.
+        buscado = normalize_text(_limpiar_nombre_hipodromo(hipodromo))
+        selected = [
+            meeting
+            for meeting in calendar
+            if meeting["fecha"] == fecha
+            and normalize_text(_limpiar_nombre_hipodromo(meeting["hipodromo"])) == buscado
+        ]
+        output = []
+        for meeting in selected:
+            detail = fetch(meeting["url"])
+            races = extract_races_from_meeting(detail)
+            if races:
+                output.append({
+                    "hipodromo": meeting["hipodromo"],
+                    "url": meeting["url"],
+                    "carreras": races,
+                })
+        if not output:
+            raise ValueError("sin carreras")
+        return output
+
+    # NADIE VA AL SITIO. Si la lista de carreras esta guardada, se
+    # devuelve, sin importar hace cuanto. Antes valia 12 horas para las
+    # fechas de hoy y las que vienen, asi que la reunion del 5/10 traida
+    # el 2/10 de madrugada se daba por vieja y la visita salia a
+    # buscarla.
+    guardado = lo_guardado(clave)
+    if guardado:
+        for r in guardado:
+            r["hipodromo"] = _limpiar_nombre_hipodromo(r.get("hipodromo", ""))
+        return jsonify(ok=True, reuniones=guardado,
+                       hoy=hoy_argentina(), ahora=hora_argentina())
+
+    try:
+        # Sin nada guardado si se va al sitio: es la unica forma de
+        # mostrarle algo.
+        cuanto = TTL_REUNION
+        output, origen = con_cache(clave, cuanto, forzar, traer)
+        # Por si el cache guardo el nombre sucio.
+        for r in output:
+            r["hipodromo"] = _limpiar_nombre_hipodromo(r.get("hipodromo", ""))
+        resp = {
+            "ok": True,
+            "reuniones": output,
+            # La hora y la fecha de Argentina, para que la pantalla marque
+            # lo mismo que el servidor sin importar el reloj del usuario.
+            "hoy": hoy_argentina(),
+            "ahora": hora_argentina(),
+        }
+        if origen == "cache_vencido":
+            resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                             "Te mostramos la última versión que guardamos.")
+        return jsonify(**resp)
+    except Exception:
+        return jsonify(
+            ok=False,
+            error=(
+                "No se encontraron carreras confirmadas para esa reunión, "
+                "o la fuente oficial no respondió."
+            ),
+            reuniones=[],
+        ), 404
+
+
+def _es_la_proxima(url, numero):
+    """
+    Dice si esa carrera es una de las que el visitante sin cuenta puede ver.
+    Vale la proxima de CADA hipodromo, sean uno o diez el mismo dia.
+    Si ya termino la jornada de hoy, valen las primeras de la fecha siguiente.
+    """
+    fecha_url = meeting_date_from_url(url)
+    hoy = hoy_argentina()
+    ahora = hora_argentina()
+
+    # NADIE VA AL SITIO. Antes esto hacia fetch(url) en CADA visita de
+    # un usuario sin suscripcion, sin guardar nada y sin respaldo: con
+    # el Stud Book devolviendo 403, el permiso no se podia confirmar y
+    # la app contestaba 401 en TODAS las carreras. El visitante sin
+    # cuenta no podia abrir ninguna.
+    carreras = _carreras_guardadas_de(url)
+    if not carreras:
+        # Nada guardado de esa reunion: es el unico caso en que se va al
+        # sitio, porque si no, no hay con que decidir.
+        try:
+            carreras = extract_races_from_meeting(fetch(url))
+        except Exception:
+            return False
+    if not carreras:
+        return False
+
+    if fecha_url == hoy:
+        pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
+        if pendientes:
+            return int(numero) == pendientes[0]["numero"]
+        # Ya corrieron todas las de hoy: la jornada de hoy no habilita nada,
+        # se pasa a la fecha siguiente (se resuelve mas abajo).
+        return False
+
+    # Una reunion posterior: vale su PRIMERA carrera, pero solo si hoy ya
+    # termino o si esa reunion es la mas proxima que viene.
+    if fecha_url and fecha_url > hoy:
+        if int(numero) != carreras[0]["numero"]:
+            return False
+        return _hoy_ya_termino() and _es_la_fecha_mas_proxima(fecha_url)
+
+    return False
+
+
+def _hoy_ya_termino():
+    """
+    True si no queda ninguna carrera por correrse hoy.
+
+    NADIE VA AL SITIO: antes pedia el calendario Y CADA reunion de hoy
+    al Stud Book, en cada visita de un usuario sin suscripcion.
+    """
+    hoy = hoy_argentina()
+    ahora = hora_argentina()
+    calendario = lo_guardado("calendario")
+    if not calendario:
+        return False
+    for r in [x for x in calendario if x["fecha"] == hoy]:
+        carreras = _carreras_guardadas_de(r["url"])
+        if not carreras:
+            continue
+        if any(c.get("hora") and c["hora"] >= ahora for c in carreras):
+            return False
+    return True
+
+
+def _es_la_fecha_mas_proxima(fecha):
+    """
+    True si no hay ninguna reunion entre hoy y esa fecha.
+    NADIE VA AL SITIO: usa el calendario guardado.
+    """
+    hoy = hoy_argentina()
+    calendario = lo_guardado("calendario")
+    if not calendario:
+        return False
+    futuras = sorted({r["fecha"] for r in calendario if r["fecha"] > hoy})
+    return bool(futuras) and fecha == futuras[0]
+
+
+@app.get("/api/carrera")
+def carrera():
+    url = request.args.get("url","")
+    numero = request.args.get("numero","")
+    forzar = request.args.get("refresh") == "1"
+    if not url.startswith(BASE) or not numero.isdigit():
+        return jsonify(ok=False,error="Datos inválidos."),400
+
+    # Sin la suscripcion al dia solo se ve la proxima carrera a correrse.
+    # Con el cobro apagado, esta_al_dia() da True para todos y la app
+    # funciona igual que antes.
+    if not puede_ver_todo():
+        if not _es_la_proxima(url, numero):
+            hay_usuario = bool(usuario_actual())
+            return jsonify(
+                ok=False,
+                necesita_cuenta=not hay_usuario,
+                necesita_pagar=hay_usuario,
+                error=("Con la suscripción al día vas a poder ver todas las "
+                       "carreras, de todas las fechas."
+                       if hay_usuario else
+                       "Sin cuenta solo podés ver la carrera que está por "
+                       "correrse. Creá tu cuenta gratis."),
+            ), 401
+
+    clave = f"carrera:{url}:{numero}"
+
+    def traer():
+        data = parse_race(fetch(url), int(numero))
+        if not data:
+            raise ValueError("carrera no encontrada")
+        return data
+
+    def _anotar():
+        try:
+            f = meeting_date_from_url(url)
+            m = re.search(r"/\d{8}-([a-z\-]+?)-\d+", url)
+            hip = m.group(1).replace("-", " ").title() if m else ""
+            anotar_uso("carrera", f"{f} · {hip} · {numero}ª" if f else url[-40:])
+            if hip:
+                anotar_uso("hipodromo", hip)
+        except Exception:
+            pass
+
+    # NADIE VA AL SITIO. Si la carrera esta guardada, se devuelve lo
+    # guardado, haga 1 minuto o 3 dias. Quien la mantiene al dia son las
+    # tareas de fondo: el refresco de hora y media antes (retiros) y el
+    # que completa los resultados cada 15 minutos.
+    # El boton Actualizar tampoco sale al sitio: vuelve a leer lo
+    # guardado, que las tareas de fondo ya dejaron fresco.
+    guardada = lo_guardado(clave)
+    if guardada is not None:
+        _anotar()
+        return jsonify(ok=True, **guardada)
+
+    # Solo si NO hay nada guardado se va al sitio: es la unica forma de
+    # mostrarle algo. Con el trabajo de las 2 de la mañana al dia, esto
+    # no deberia pasar nunca.
+    cuanto = TTL_CARRERA_SIN_CORRER
+
+    try:
+        data, origen = con_cache(clave, cuanto, forzar, traer)
+        # Anotar que se miro esta carrera, para saber que interesa mas.
+        try:
+            f = meeting_date_from_url(url)
+            m = re.search(r"/\d{8}-([a-z\-]+?)-\d+", url)
+            hip = m.group(1).replace("-", " ").title() if m else ""
+            anotar_uso("carrera", f"{f} · {hip} · {numero}ª" if f else url[-40:])
+            if hip:
+                anotar_uso("hipodromo", hip)
+        except Exception:
+            pass
+        resp = {"ok": True, **data}
+        if origen == "cache_vencido":
+            resp["aviso"] = ("Los datos oficiales están tardando en llegar. "
+                             "Te mostramos la última versión que guardamos.")
+            resp["reintentar"] = True
+        return jsonify(**resp)
+    except Exception as e:
+        # Si tardo demasiado, se le explica y se le dice que hacer.
+        lento = "timed out" in str(e).lower() or "timeout" in str(e).lower()
+        return jsonify(
+            ok=False,
+            error=("Los datos oficiales están tardando en llegar y no los "
+                   "tenemos guardados todavía." if lento else
+                   "No se pudo cargar la carrera."),
+            que_hacer=("Deslizá la pantalla hacia abajo o tocá Actualizar "
+                       "para volver a intentar."),
+            reintentar=True,
+            detalle=str(e),
+        ), 502
+
+TTL_BUSQUEDA = 6 * 60 * 60   # 6 horas
+
+# Buscador real del Stud Book, verificado en el sitio:
+# /ejemplares/autocomplete?tipo=1&muerto=1&term=NOMBRE
+# Devuelve JSON con: id, text, leyenda, padre, madre, sexo, nacimiento,
+# pelo, url_friendly.
+RUTA_AUTOCOMPLETE = "/ejemplares/autocomplete?tipo=1&muerto=1&term={q}"
+
+
+def _consultar_autocomplete(termino, tipo="1", muerto="1", espera=10):
+    """
+    Consulta cruda al autocompletado del Stud Book.
+    Comprobado en el sitio: solo responde con UNA palabra (sin espacios) y
+    devuelve como maximo 15 resultados, en orden alfabetico.
+    El parametro 'tipo' filtra por categoria de ejemplar: con tipo=1 no
+    aparecen todos, por eso se prueban varias variantes.
+    """
+    cabeceras = dict(HEADERS)
+    cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
+    cabeceras["X-Requested-With"] = "XMLHttpRequest"
+    url = (f"{BASE}/ejemplares/autocomplete"
+           f"?tipo={tipo}&muerto={muerto}&term={quote(termino)}")
+    try:
+        r = requests.get(url, headers=cabeceras,
+                         timeout=(min(4, espera), espera))
+        r.raise_for_status()
+        datos = r.json()
+    except Exception:
+        # None (y no lista vacia): asi quien llama distingue "el sitio no
+        # contesto" de "el sitio contesto que no hay ninguno".
+        return None
+    if isinstance(datos, dict):
+        datos = datos.get("results") or datos.get("data") or []
+    return datos if isinstance(datos, list) else []
+
+
+# Variantes de categoria a probar. La primera es la que usa el sitio; las
+# demas existen porque se comprobo que con tipo=1 faltan ejemplares
+# (por ejemplo CANDY GIRL, que tiene ficha propia pero no aparecia).
+VARIANTES_TIPO = ["1", "2", "0", "", "3"]
+
+
+def _armar_resultado(item):
+    nombre = clean(item.get("text", ""))
+    idd = item.get("id")
+    if not nombre or idd is None or idd == "":
+        return None
+    slug = item.get("url_friendly") or normalize_text(nombre).replace(" ", "-")
+    partes = []
+    if item.get("leyenda"):
+        partes.append(clean(str(item["leyenda"])))
+    padres = " y ".join(
+        clean(str(item[k])) for k in ("padre", "madre") if item.get(k)
+    )
+    if padres:
+        partes.append("por " + padres)
+    return {
+        "nombre": nombre,
+        "perfil": f"{BASE}/ejemplares/perfil/{idd}/{slug}",
+        "detalle": " ".join(partes),
+        "sexo": clean(str(item.get("sexo", ""))),
+        "nacimiento": clean(str(item.get("nacimiento", ""))),
+        "pelo": clean(str(item.get("pelo", ""))),
+    }
+
+
+def _buscar_en_lo_guardado(termino):
+    """
+    Busca el caballo en la base propia, sin molestar al sitio.
+
+    Hay casi 25.000 caballos guardados en la tabla fichas. Antes el
+    buscador iba al Stud Book SIEMPRE, hasta diez consultas por
+    busqueda: con el sitio caido no encontraba nada, aunque el caballo
+    estuviera guardado.
+    """
+    objetivo = normalize_text(termino)
+    if len(objetivo) < 3:
+        return []
+    try:
+        con = db()
+        filas = con.execute(
+            "SELECT perfil, nombre, datos FROM fichas WHERE nombre LIKE ? "
+            "ORDER BY LENGTH(nombre) LIMIT 60",
+            (f"%{termino}%",)).fetchall()
+        con.close()
+    except Exception:
+        return []
+
+    salida = []
+    for f in filas:
+        nombre = clean(f["nombre"] or "")
+        if not nombre or objetivo not in normalize_text(nombre):
+            continue
+        try:
+            d = json.loads(f["datos"] or "{}") or {}
+        except Exception:
+            d = {}
+        partes = []
+        if d.get("logro"):
+            partes.append(clean(str(d["logro"])))
+        padres = " y ".join(clean(str(d[k])) for k in ("padre", "madre")
+                            if d.get(k))
+        if padres:
+            partes.append("por " + padres)
+        salida.append({
+            "nombre": nombre,
+            "perfil": f["perfil"],
+            "detalle": " ".join(partes),
+            "sexo": clean(str(d.get("sexo", ""))),
+            "nacimiento": clean(str(d.get("nacimiento", ""))),
+            "pelo": clean(str(d.get("pelo", ""))),
+            "guardado": True,
+        })
+
+    # El que se escribio igual, primero.
+    pegado = objetivo.replace(" ", "")
+    salida.sort(key=lambda r: (
+        normalize_text(r["nombre"]).replace(" ", "") != pegado,
+        len(r["nombre"])))
+    return salida[:15]
+
+
+def guardar_ficha_de_caballo(perfil, nombre, carreras, datos):
+    """
+    Deja el caballo en la tabla fichas, que es la que lee el algoritmo.
+
+    IMPORTANTE: se guarda TAMBIEN si no corrio nunca. Un caballo sin
+    campaña igual trae padre, madre, sexo y edad, y eso sirve para los
+    cruces de pedigree. Antes la ficha de un caballo abierto a mano
+    quedaba solo en el cache, que vence, y nunca entraba a fichas.
+    """
+    if not perfil or not nombre:
+        return False
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, datos,
+                                          actualizada_en)
+            VALUES(?,?,?,?,?)
+        """, (perfil, nombre,
+              json.dumps(carreras or [], ensure_ascii=False),
+              json.dumps(datos or {}, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def buscar_ejemplares(termino):
+    """
+    Busca caballos por nombre. Sortea las dos limitaciones del buscador del
+    Stud Book, comprobadas en el sitio:
+      1) con espacios devuelve vacio -> se consulta solo la primera palabra
+      2) devuelve como maximo 15, en orden alfabetico -> si el buscado no
+         entra en esa tanda, se agregan letras hasta alcanzarlo
+    """
+    termino = clean(termino)
+    if len(termino) < 3:
+        return []
+
+    clave = f"busqueda4:{normalize_text(termino)}"
+
+    # PRIMERO lo guardado. Si el caballo ya esta en la base, se contesta
+    # al instante y no se molesta al sitio.
+    propios = _buscar_en_lo_guardado(termino)
+    if propios:
+        cache_set(clave, propios)
+        return propios
+
+    # Una busqueda anterior que el sitio SI contesto vale siempre, sin
+    # importar hace cuanto (regla de Leandro: nadie va al sitio si esta
+    # guardado). Una lista vacia no cuenta: pudo ser el sitio caido.
+    cacheado, _ = cache_get(clave, TTL_BUSQUEDA)
+    if cacheado:
+        return cacheado
+
+    # LA UNICA EXCEPCION a "nadie va al sitio": un caballo que la app no
+    # tiene (por ejemplo, uno que nunca corrio). Medido el 4/10/2026 con el
+    # sitio colgado: hacia hasta 7 consultas de 10 s = 70 s, y 8 busquedas
+    # asi ocupaban los 8 hilos y frenaban a TODOS los usuarios.
+    # Ahora: como maximo 2 busquedas al sitio a la vez, 3 consultas cada
+    # una y 10 s en total. La 3a no espera: recibe "probá en un minuto".
+    if not _TURNOS_STUDBOOK.acquire(blocking=False):
+        raise SitioOcupado()
+    try:
+        return _buscar_en_el_sitio(termino, clave)
+    finally:
+        _TURNOS_STUDBOOK.release()
+
+
+class SitioOcupado(Exception):
+    """Ya hay 2 visitas esperando al Stud Book: no se suma otra."""
+
+
+class SitioNoContesto(Exception):
+    """El Stud Book no respondio dentro del tiempo limite."""
+
+
+# Cuantas visitas pueden estar esperando al Stud Book al mismo tiempo.
+# Las tareas de fondo NO usan esto: tienen su propio hilo.
+_TURNOS_STUDBOOK = threading.BoundedSemaphore(
+    int(os.getenv("VISITAS_AL_SITIO", "2")))
+TIEMPO_MAXIMO_SITIO = float(os.getenv("TIEMPO_MAXIMO_SITIO", "10"))
+
+
+def _buscar_en_el_sitio(termino, clave):
+
+    objetivo = normalize_text(termino)
+    objetivo_pegado = objetivo.replace(" ", "")
+    palabras = termino.split()
+
+    vistos, encontrados = set(), []
+    consultas = 0
+    contesto = False            # ¿el sitio respondio al menos una vez?
+    MAX_CONSULTAS = int(os.getenv("CONSULTAS_AL_SITIO", "3"))
+    hasta = time.time() + TIEMPO_MAXIMO_SITIO
+
+    def agregar(lista):
+        nonlocal contesto
+        if lista is None:
+            return
+        contesto = True
+        for item in lista:
+            if not isinstance(item, dict):
+                continue
+            r = _armar_resultado(item)
+            if not r or r["perfil"] in vistos:
+                continue
+            vistos.add(r["perfil"])
+            encontrados.append(r)
+
+    def ya_esta():
+        return any(
+            normalize_text(e["nombre"]).replace(" ", "") == objetivo_pegado
+            for e in encontrados
+        )
+
+    def consultar(q, tipo="1", muerto="1"):
+        nonlocal consultas
+        if consultas >= MAX_CONSULTAS or not q:
+            return
+        queda = hasta - time.time()
+        if queda < 1:
+            return
+        consultas += 1
+        agregar(_consultar_autocomplete(q, tipo, muerto, espera=queda))
+
+    # 1) El termino TAL COMO SE ESCRIBIO, con espacios y todo.
+    #    Comprobado con el diagnostico: el sitio si acepta espacios.
+    consultar(termino)
+
+    # 2) Si no aparecio, probar las otras categorias de ejemplar.
+    if not ya_esta():
+        for tipo in VARIANTES_TIPO[1:]:
+            if ya_esta():
+                break
+            consultar(termino, tipo)
+
+    # 3) Todavia no: probar sin el filtro de fallecidos.
+    if not ya_esta():
+        consultar(termino, "1", "0")
+
+    # 4) Ultimo recurso: el nombre pegado, por si el sitio lo indexa asi.
+    if not ya_esta() and len(palabras) > 1:
+        consultar(termino.replace(" ", ""))
+
+    # 5) Si aun asi no hay NADA, mostrar al menos los parecidos de la
+    #    primera palabra, para que el usuario elija.
+    if not encontrados:
+        consultar(palabras[0])
+
+    # 6) Quedarse con los que contengan TODAS las palabras buscadas.
+    piezas = [normalize_text(p) for p in palabras if p]
+    filtrados = [
+        e for e in encontrados
+        if all(p in normalize_text(e["nombre"]) for p in piezas)
+    ]
+    # El nombre exacto va primero, despues los que empiezan igual.
+    def orden(e):
+        n = normalize_text(e["nombre"]).replace(" ", "")
+        if n == objetivo_pegado:
+            return (0, e["nombre"])
+        if n.startswith(objetivo_pegado):
+            return (1, e["nombre"])
+        return (2, e["nombre"])
+
+    filtrados.sort(key=orden)
+    resultado = filtrados[:25] if filtrados else sorted(encontrados, key=orden)[:25]
+    if not contesto:
+        raise SitioNoContesto()
+    if resultado:
+        # Solo se guarda lo que encontro: guardar una lista vacia haria
+        # que despues nunca se vuelva a buscar ese nombre.
+        cache_set(clave, resultado)
+    return resultado
+
+
+@app.get("/api/buscar-caballo")
+def api_buscar_caballo():
+    if not puede_ver_todo():
+        hay_usuario = bool(usuario_actual())
+        return jsonify(
+            ok=False,
+            necesita_cuenta=not hay_usuario,
+            necesita_pagar=hay_usuario,
+            error=("El buscador de caballos viene con la suscripción."
+                   if hay_usuario else
+                   "Creá tu cuenta para buscar cualquier caballo."),
+            resultados=[],
+        ), 401
+    termino = request.args.get("q", "").strip()
+    if len(termino) < 3:
+        return jsonify(ok=False, error="Escribí al menos 3 letras."), 400
+    # Se contesta 404 (y no 502) a proposito: la pantalla reintenta sola
+    # cualquier otro error, y reintentar aca solo duplicaria la espera.
+    try:
+        resultados = buscar_ejemplares(termino)
+    except SitioOcupado:
+        return jsonify(ok=False, ocupado=True,
+                       error="Estamos buscando otros caballos. "
+                             "Probá en un minuto.", resultados=[]), 404
+    except Exception:
+        return jsonify(ok=False,
+                       error=f"No encontramos «{termino}» en lo guardado y "
+                             "el Stud Book no contesta. Probá en un rato.",
+                       resultados=[]), 404
+    if not resultados:
+        return jsonify(
+            ok=False,
+            error=f"No se encontró ningún caballo con «{termino}».",
+            resultados=[],
+        ), 404
+    anotar_uso("pantalla", "buscar caballo")
+    return jsonify(ok=True, resultados=resultados)
+
+
+def _caballo_guardado(perfil, cacheado):
+    """
+    La ficha del caballo armada con lo que la app ya tiene:
+      - la ficha completa que guardo una visita anterior (cache)
+      - la tabla fichas que llena el historico
+    Se usa la campaña MAS NUEVA de las dos. Las "proximas carreras" de una
+    copia vieja se filtran: una fecha que ya paso no es proxima.
+    """
+    ficha = None
+    try:
+        con = db()
+        ficha = con.execute(
+            "SELECT nombre, carreras, datos, actualizada_en FROM fichas "
+            "WHERE perfil=?", (perfil,)).fetchone()
+        guardado_en = con.execute(
+            "SELECT actualizado_en FROM cache WHERE clave=?",
+            (f"caballo:{perfil}",)).fetchone()
+        con.close()
+    except Exception:
+        guardado_en = None
+
+    if cacheado is None and ficha is None:
+        return None
+
+    caballo = dict(cacheado or {})
+    caballo["perfil"] = perfil
+    usar_ficha = ficha is not None and (
+        cacheado is None or not guardado_en
+        or (ficha["actualizada_en"] or "") > (guardado_en["actualizado_en"] or ""))
+    if usar_ficha:
+        try:
+            carreras = json.loads(ficha["carreras"] or "[]")
+            datos = json.loads(ficha["datos"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            carreras, datos = None, {}
+        if carreras is not None:
+            caballo["nombre"] = caballo.get("nombre") or ficha["nombre"] or ""
+            for k in ("sexo", "edad", "nacimiento", "pelo", "padre",
+                      "madre", "logro"):
+                if datos.get(k) and not caballo.get(k):
+                    caballo[k] = datos[k]
+            puestos = [c.get("puesto") for c in carreras if c.get("puesto")]
+            caballo["carreras"] = carreras[:30]
+            caballo["corridas"] = len(carreras)
+            caballo["victorias"] = sum(1 for p in puestos if p == 1)
+            caballo["podios"] = sum(1 for p in puestos
+                                    if isinstance(p, int) and p <= 3)
+
+    hoy = hoy_argentina()
+    proximas = []
+    for p in caballo.get("proximas") or []:
+        m = re.search(r"(\d{2})/(\d{2})/(\d{4})", p.get("texto", ""))
+        if not m or f"{m.group(3)}-{m.group(2)}-{m.group(1)}" >= hoy:
+            proximas.append(p)
+    caballo["proximas"] = proximas
+    # Sin copia completa no se sabe si tiene proximas: no se afirma nada.
+    caballo["sin_proximas"] = bool(cacheado) and not proximas \
+        and bool(cacheado.get("sin_proximas"))
+    caballo.setdefault("carreras", [])
+    return caballo
+
+
+@app.get("/api/caballo")
+def api_caballo():
+    """Ficha completa de un caballo: datos, próximas carreras y campaña."""
+    perfil = request.args.get("perfil", "")
+    if not (perfil.startswith(BASE) or perfil.startswith("https://studbook.org.ar")):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+
+    clave = f"caballo:{perfil}"
+    cacheado, _ = cache_get(clave, TTL_CARRERA)
+
+    # NADIE VA AL SITIO si la app ya lo tiene, sin importar la edad.
+    # La ficha guardada por el historico (9.398 al 3/10/2026) trae la
+    # campaña completa; antes se ignoraba y se iba al Stud Book.
+    propio = _caballo_guardado(perfil, cacheado)
+    if propio:
+        return jsonify(ok=True, **propio)
+
+    # LA UNICA EXCEPCION: un caballo que la app no tiene (por ejemplo,
+    # uno que nunca corrio). Mismo tope que el buscador: 2 a la vez.
+    if not _TURNOS_STUDBOOK.acquire(blocking=False):
+        return jsonify(ok=False, ocupado=True,
+                       error="Estamos buscando otros caballos. "
+                             "Probá en un minuto."), 404
+    try:
+        soup = fetch(perfil)
+        texto = clean(soup.get_text(" "))
+
+        nombre = ""
+        for etiqueta in ["h1", "h2"]:
+            h = soup.find(etiqueta)
+            if h and clean(h.get_text(" ")):
+                nombre = clean(h.get_text(" "))
+                break
+
+        caballo = {"nombre": nombre, "perfil": perfil}
+        caballo.update(_resumen_del_perfil(soup, texto))
+
+        carreras = _tabla_carreras_del_perfil(soup)
+        caballo["carreras"] = carreras[:30]
+        puestos = [c["puesto"] for c in carreras if c["puesto"]]
+        caballo["corridas"] = len(carreras)
+        caballo["victorias"] = sum(1 for p in puestos if p == 1)
+        caballo["podios"] = sum(1 for p in puestos if p <= 3)
+
+        # Proximas carreras: buscarlas solo dentro de esa seccion del documento,
+        # no en toda la pagina (sino se cuelan las carreras ya corridas).
+        proximas = []
+        titulo_prox = None
+        for etiqueta in soup.find_all(["h1", "h2", "h3", "h4", "div", "span", "p"]):
+            if re.fullmatch(r"PR[ÓO]XIMAS CARRERAS", clean(etiqueta.get_text(" ")), re.I):
+                titulo_prox = etiqueta
+                break
+
+        if titulo_prox:
+            for nodo in titulo_prox.find_all_next():
+                texto_nodo = clean(nodo.get_text(" ")) if hasattr(nodo, "get_text") else ""
+                # Cortar al llegar a la seccion siguiente.
+                if re.fullmatch(r"(CAMPA[ÑN]A|EXPORTACI[ÓO]N.*|SERVICIOS|PEDIGREE)",
+                                texto_nodo, re.I):
+                    break
+                if getattr(nodo, "name", None) == "a" and nodo.get("href"):
+                    t = clean(nodo.get_text(" "))
+                    if re.search(r"\d{2}/\d{2}/\d{4}", t):
+                        proximas.append({
+                            "texto": t,
+                            "enlace": urljoin(BASE, nodo["href"]),
+                        })
+
+        caballo["proximas"] = proximas[:5]
+        caballo["sin_proximas"] = len(proximas) == 0
+
+        anotar_uso("caballo", caballo.get("nombre", ""))
+        cache_set(clave, caballo)
+
+        # Y ademas a la tabla fichas, que es la que lee el algoritmo.
+        # Se guarda aunque NO HAYA CORRIDO NUNCA: igual trae padre,
+        # madre, sexo y edad, y eso sirve para los cruces de pedigree.
+        try:
+            guardar_ficha_de_caballo(
+                perfil, nombre, carreras,
+                {k: v for k, v in caballo.items()
+                 if k in ("sexo", "edad", "nacimiento", "pelo", "padre",
+                          "madre", "logro")})
+        except Exception:
+            pass
+
+        return jsonify(ok=True, **caballo)
+    except Exception as e:
+        # Si el sitio no contesta pero la campaña estaba guardada, se
+        # muestra la guardada. Antes se tiraba y salia un error, teniendo
+        # el dato a mano.
+        if cacheado is not None:
+            return jsonify(
+                ok=True, **cacheado,
+                aviso=("Los datos oficiales están tardando en llegar. "
+                       "Te mostramos la última versión que guardamos."))
+        return jsonify(ok=False,
+                       error="Todavía no tenemos los datos de este caballo "
+                             "y el Stud Book no contesta. Probá en un rato.",
+                       detalle=str(e)[:120]), 404
+    finally:
+        _TURNOS_STUDBOOK.release()
+
+
+@app.get("/api/detalle-carrera")
+def api_detalle_carrera():
+    """Devuelve pista, estado y condicion en palabras de una carrera puntual."""
+    url = request.args.get("url", "")
+    if not url.startswith(BASE) and not url.startswith("https://studbook.org.ar"):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+    # NADIE VA AL SITIO: solo lo guardado. Si no esta, la pantalla
+    # sigue sin el detalle (no muestra error); lo trae el fondo.
+    detalle = detalle_de_carrera(url, ir_al_sitio=False)
+    if not detalle:
+        return jsonify(ok=False, sin_datos=True,
+                       error="Todavía no hay datos de esta carrera."), 404
+    return jsonify(ok=True, **detalle)
+
+
+@app.post("/api/enriquecer")
+def enriquecer():
+    """
+    Trae la campaña de todos los participantes.
+    Se piden TODOS AL MISMO TIEMPO: antes se hacía uno por uno y con 14
+    caballos eso tardaba más de diez segundos.
+    """
+    data = request.get_json(silent=True) or {}
+    horses = data.get("participantes", [])
+    if not horses:
+        return jsonify(ok=True, participantes=[])
+
+    # Tope de pedidos simultáneos, para no castigar al Stud Book.
+    simultaneos = min(int(os.getenv("PEDIDOS_A_LA_VEZ", "8")), max(1, len(horses)))
+
+    with ThreadPoolExecutor(max_workers=simultaneos) as pool:
+        resultados = list(pool.map(lambda h: enrich_horse(dict(h)), horses))
+
+    return jsonify(ok=True, participantes=resultados)
+
+@app.post("/api/analizar")
+def analizar():
+    data = request.get_json(silent=True) or {}
+    todos = data.get("participantes", [])
+
+    # El usuario puede marcar como retirado a un caballo que el Stud Book
+    # todavia no actualizo. Eso cambia SU pronostico, nunca el oficial.
+    retirados_usuario = {
+        normalize_text(n) for n in (data.get("retirados_usuario") or [])
+    }
+
+    # Para el pronostico OFICIAL solo cuentan los retiros del Stud Book.
+    horses = [h for h in todos if not h.get("retirado")]
+    if len(horses) < 2:
+        return jsonify(ok=False,error="Se necesitan al menos dos participantes confirmados."),400
+
+    pesos = cargar_pesos()
+    fecha = data.get("fecha", "")
+    hipodromo = data.get("hipodromo", "")
+
+    # El peso corporal y el herraje que cargo el admin se suman a cada
+    # caballo antes de puntuar: entran al pronostico OFICIAL.
+    oficiales_cab = datos_oficiales_de(fecha, hipodromo)
+    if oficiales_cab:
+        for h in horses:
+            d_o = oficiales_cab.get(normalize_text(h.get("nombre", "")))
+            if d_o:
+                if d_o.get("peso_corporal"):
+                    h["peso_corporal_oficial"] = d_o["peso_corporal"]
+                if d_o.get("herraje"):
+                    h["herraje_oficial"] = d_o["herraje"]
+
+    # --- CONDICIONES OFICIALES: las que cargo el admin para esa reunion ---
+    oficiales = condiciones_de(fecha, hipodromo)
+    contexto_oficial = {
+        "participantes": horses,
+        "pista_dia": data.get("pista_dia", ""),
+        "hora": data.get("hora", ""),
+        "distancia": data.get("distancia", ""),
+        "hipodromo": hipodromo,
+        "categoria": data.get("categoria", ""),
+        "condicion": data.get("condicion", ""),
+    }
+    for campo in OPCIONES_CONDICIONES:
+        contexto_oficial[campo["clave"]] = oficiales.get(campo["clave"], "")
+
+    ranked_oficial, top_oficial = rankear(horses, contexto_oficial, pesos)
+
+    # SOLO el pronostico oficial se guarda y se compara con el resultado.
+    ya_corrida = any(h.get("puesto") for h in horses)
+    try:
+        registrar_pronostico(
+            url=data.get("url",""), numero=data.get("numero"),
+            fecha=fecha, hipodromo=hipodromo,
+            top=top_oficial, participantes=horses,
+            pesos=pesos, ya_corrida=ya_corrida,
+        )
+    except Exception:
+        pass  # que un fallo al guardar nunca rompa el pronostico al usuario
+
+    # --- CONDICIONES Y DATOS DEL USUARIO: recalculan SU pronostico ---
+    del_usuario = data.get("condiciones_usuario") or {}
+    cambiadas = {
+        c["clave"]: clean(del_usuario.get(c["clave"], ""))
+        for c in OPCIONES_CONDICIONES
+        if clean(del_usuario.get(c["clave"], ""))
+        and clean(del_usuario.get(c["clave"], "")) != contexto_oficial.get(c["clave"], "")
+    }
+
+    # Lo que cargo de cada caballo: {nombre: {campo: {valor, juicio}}}
+    datos_caballos = {}
+    u = usuario_actual()
+    if u:
+        con = db()
+        filas = con.execute("""
+            SELECT caballo, datos FROM datos_caballo
+            WHERE usuario_id=? AND fecha=? AND hipodromo=?
+        """, (u["id"], fecha, normalize_text(hipodromo))).fetchall()
+        con.close()
+        for f in filas:
+            try:
+                datos_caballos[f["caballo"]] = json.loads(f["datos"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    if cambiadas or retirados_usuario or datos_caballos:
+        contexto_usuario = dict(contexto_oficial)
+        contexto_usuario.update(cambiadas)
+        # Se sacan los que el usuario marco como retirados.
+        suyos = [h for h in horses
+                 if normalize_text(h.get("nombre","")) not in retirados_usuario]
+        if len(suyos) < 2:
+            suyos = horses   # no dejar la carrera sin participantes
+        contexto_usuario["participantes"] = suyos
+        _, top_usuario = rankear(suyos, contexto_usuario, pesos)
+
+        # Lo que cargo el usuario suma o resta sobre el puntaje ya calculado.
+        if datos_caballos:
+            todos_u, _ = rankear(suyos, contexto_usuario, pesos)
+            for h in todos_u:
+                d_c = datos_caballos.get(normalize_text(h.get("nombre", "")))
+                if not d_c:
+                    continue
+                extra, motivos_u = puntos_del_usuario(d_c)
+                h["score"] = round(h["score"] + extra, 1)
+                h["motivos"] = motivos_u + (h.get("motivos") or [])
+            todos_u.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
+            top_usuario = todos_u[:4]
+            # Se recalcula el porcentaje con los puntajes nuevos.
+            if top_usuario:
+                piso = min(x["score"] for x in todos_u)
+                ventajas = [max(1.0, x["score"] - piso) + 12 for x in top_usuario]
+                suma = sum(ventajas) or 1
+                for x, v in zip(top_usuario, ventajas):
+                    x["probabilidad_relativa"] = round(v / suma * 100, 1)
+                _cuadrar_porcentajes(top_usuario)
+
+        avisos = []
+        if cambiadas:
+            avisos.append("tus condiciones")
+        if retirados_usuario:
+            n = len(horses) - len(suyos)
+            if n:
+                avisos.append(f"{n} retiro(s) que marcaste")
+        if datos_caballos:
+            avisos.append(f"lo que cargaste de {len(datos_caballos)} caballo(s)")
+
+        return jsonify(
+            ok=True,
+            ranking=top_usuario,
+            ranking_oficial=top_oficial,
+            confianza=round(top_usuario[0]["score"], 1),
+            ya_corrida=ya_corrida,
+            condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
+                                   for c in OPCIONES_CONDICIONES},
+            condiciones_usadas=cambiadas,
+            retirados_usuario=sorted(retirados_usuario),
+            es_personal=True,
+            aviso=("Este pronóstico usa " + " y ".join(avisos) +
+                   ". No cambia el oficial ni las estadísticas de la app."),
+        )
+
+    return jsonify(ok=True, ranking=top_oficial,
+                   confianza=round(top_oficial[0]["score"], 1),
+                   ya_corrida=ya_corrida,
+                   condiciones_oficiales={c["clave"]: contexto_oficial.get(c["clave"], "")
+                                          for c in OPCIONES_CONDICIONES},
+                   es_personal=False)
+
+
+def registrar_pronostico(url, numero, fecha, hipodromo, top, participantes,
+                         pesos, ya_corrida):
+    """
+    Guarda lo que predijo la app. Si la carrera ya tiene puestos reales,
+    calcula el acierto y ajusta el algoritmo automaticamente.
+    IMPORTANTE: si ya habia un pronostico guardado, NO se pisa. El valor
+    del pronostico esta en haberse hecho antes de conocer el resultado.
+    """
+    if not url or numero is None:
+        return
+
+    predichos = [x["nombre"] for x in top]
+
+    # Si ya hay un pronostico guardado para esta carrera, se conserva ese.
+    con = db()
+    previo = con.execute(
+        "SELECT ranking FROM pronosticos WHERE url=? AND numero=?",
+        (url, int(numero))
+    ).fetchone()
+    con.close()
+    if previo:
+        try:
+            predichos = json.loads(previo["ranking"]) or predichos
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    resultado = None
+    acierto_ganador = None
+    aciertos_top4 = None
+
+    if ya_corrida:
+        llegados = sorted(
+            [h for h in participantes if h.get("puesto")],
+            key=lambda h: h["puesto"]
+        )
+        resultado = [h["nombre"] for h in llegados[:4]]
+        if resultado:
+            acierto_ganador = 1 if predichos[0] == resultado[0] else 0
+            aciertos_top4 = len(set(predichos) & set(resultado))
+
+    con = db()
+    con.execute("""
+        INSERT INTO pronosticos(url,numero,fecha,hipodromo,ranking,resultado,
+                                acierto_ganador,aciertos_top4,pesos_usados,
+                                creado_en,comparado_en)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(url,numero) DO UPDATE SET
+          resultado=COALESCE(excluded.resultado, pronosticos.resultado),
+          acierto_ganador=COALESCE(excluded.acierto_ganador, pronosticos.acierto_ganador),
+          aciertos_top4=COALESCE(excluded.aciertos_top4, pronosticos.aciertos_top4),
+          comparado_en=COALESCE(excluded.comparado_en, pronosticos.comparado_en)
+    """, (
+        url, int(numero), fecha, hipodromo,
+        json.dumps(predichos, ensure_ascii=False),
+        json.dumps(resultado, ensure_ascii=False) if resultado else None,
+        acierto_ganador, aciertos_top4,
+        json.dumps(pesos, ensure_ascii=False),
+        datetime.now().isoformat(timespec="seconds"),
+        datetime.now().isoformat(timespec="seconds") if resultado else None,
+    ))
+    con.commit()
+    con.close()
+
+    # El ajuste ya NO se hace aca: probar cada peso contra 400 carreras
+    # tarda demasiado para hacerlo en cada carrera. Corre una vez por
+    # noche, al terminar la recoleccion.
+
+
+def ordenar_para_pronosticar(participantes):
+    """
+    Ordena los caballos por su NUMERO antes de puntuarlos.
+    Es imprescindible: la tabla de una carrera ya corrida viene ordenada
+    por orden de llegada. Si se puntuara en ese orden y varios caballos
+    empataran, el desempate copiaria el resultado y el acierto seria falso.
+    """
+    return sorted(
+        participantes,
+        key=lambda p: (p.get("numero") is None, p.get("numero") or 0,
+                       p.get("nombre") or "")
+    )
+
+
+def _cuadrar_porcentajes(top):
+    """
+    Deja los porcentajes sumando 100 exacto y SIEMPRE en orden: el primero
+    nunca puede tener menos que el segundo. El sobrante se reparte de
+    arriba hacia abajo, respetando el orden.
+    """
+    if not top:
+        return
+    diferencia = round(100 - sum(x["probabilidad_relativa"] for x in top), 1)
+    if abs(diferencia) < 0.05:
+        return
+
+    if diferencia > 0:
+        # Sobra: se lo lleva el primero, que es el favorito.
+        top[0]["probabilidad_relativa"] = round(
+            top[0]["probabilidad_relativa"] + diferencia, 1)
+    else:
+        # Falta: se le saca al ultimo, para no bajar al favorito.
+        top[-1]["probabilidad_relativa"] = round(
+            top[-1]["probabilidad_relativa"] + diferencia, 1)
+
+    # Que nunca uno de mas abajo tenga mas porcentaje que el de arriba.
+    for i in range(1, len(top)):
+        if top[i]["probabilidad_relativa"] > top[i-1]["probabilidad_relativa"]:
+            top[i]["probabilidad_relativa"] = top[i-1]["probabilidad_relativa"]
+
+
+def rankear(participantes, contexto, pesos):
+    """Puntua y ordena a los participantes. Devuelve los cuatro primeros."""
+    base = ordenar_para_pronosticar(participantes)
+    ranked = []
+    for p in base:
+        score, motivos = score_horse(p, contexto, pesos)
+        ranked.append({**p, "score": score, "motivos": motivos})
+    # Desempate por nombre, para que nunca dependa del orden de llegada.
+    ranked.sort(key=lambda x: (-x["score"], x.get("nombre") or ""))
+    top = ranked[:4]
+
+    # El porcentaje se calcula sobre la DIFERENCIA entre caballos, no sobre
+    # la suma de puntajes. Si se hiciera sobre la suma, cuatro caballos con
+    # puntajes 90, 85, 80 y 75 darian casi 25% cada uno y no se notaria
+    # quien es favorito.
+    if top:
+        puntajes = [x["score"] for x in ranked]
+        piso = min(puntajes)
+        # Cuanto se despega cada uno del peor de la carrera, mas una base
+        # para que el ultimo no quede en un numero irrisorio.
+        base_minima = 12
+        ventajas = [max(1.0, x["score"] - piso) + base_minima for x in top]
+        suma = sum(ventajas) or 1
+        for x, v in zip(top, ventajas):
+            x["probabilidad_relativa"] = round(v / suma * 100, 1)
+
+        _cuadrar_porcentajes(top)
+
+    return ranked, top
+
+
+# Para saber por que el afinamiento sirve o no, sin adivinar.
+APRENDIZAJE = {"carreras_sin_campana": 0, "fichas_disponibles": 0,
+               "fichas_completas": 0,
+               "ultima_vez_con": 0, "ultima_vez_fichas": (0, 0)}
+
+
+def _carreras_para_aprender(limite=None, desde=0, mitad=None):
+    """
+    Trae carreras ya corridas del historico, para medir el algoritmo.
+
+    Se puede pedir DE A TANDAS: antes se cargaban las 11.000 juntas y
+    eso ocupaba 527 MB de los 512 que tiene el servidor. Render mataba
+    la app. De a 250, cada tanda ocupa unos 12 MB.
+
+    desde: desde que carrera empezar (para ir tanda por tanda)
+    mitad: "a" o "b", para partirlas y verificar que un cambio no sea
+           casualidad. Se parte por el numero de fila, asi cada mitad
+           tiene carreras de todas las epocas.
+    """
+    if limite is None:
+        limite = int(os.getenv("CARRERAS_PARA_APRENDER", "20000"))
+
+    filtro_mitad = ""
+    if mitad == "a":
+        filtro_mitad = "AND (rowid % 2) = 0"
+    elif mitad == "b":
+        filtro_mitad = "AND (rowid % 2) = 1"
+
+    try:
+        con = db()
+        filas = con.execute(f"""
+            SELECT url, fecha, hipodromo, pista, estado, distancia, participantes
+            FROM historico
+            WHERE participantes IS NOT NULL {filtro_mitad}
+            ORDER BY fecha DESC LIMIT ? OFFSET ?
+        """, (limite, desde)).fetchall()
+        con.close()
+    except Exception:
+        return []
+
+    if not filas:
+        return []
+
+    # Solo las campañas de los caballos QUE ESTAN EN ESTA TANDA. Antes se
+    # cargaban las 3.000 fichas enteras cada vez, y eso solo ya ocupaba
+    # cientos de megas.
+    perfiles = set()
+    for f in filas:
+        try:
+            for p in json.loads(f["participantes"]):
+                if p.get("perfil"):
+                    perfiles.add(p["perfil"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    fichas, datos_caballo = {}, {}
+    try:
+        con = db()
+        lista = list(perfiles)
+        for i in range(0, len(lista), 400):
+            trozo = lista[i:i + 400]
+            huecos = ",".join("?" * len(trozo))
+            for f in con.execute(
+                    f"SELECT perfil, carreras, datos FROM fichas "
+                    f"WHERE perfil IN ({huecos})", trozo).fetchall():
+                try:
+                    fichas[f["perfil"]] = json.loads(f["carreras"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                # Edad, sexo, padre y madre de ese caballo.
+                if f["datos"]:
+                    try:
+                        datos_caballo[f["perfil"]] = json.loads(f["datos"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        con.close()
+    except Exception:
+        pass
+
+    carreras = []
+    sin_campana = 0
+    for f in filas:
+        try:
+            ps = json.loads(f["participantes"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(ps) < 3 or not any(p.get("puesto") for p in ps):
+            continue
+
+        # A cada caballo se le pega su campaña, recortada a lo ANTERIOR a
+        # esta carrera. Sin esto todos puntuan igual y medir no sirve.
+        completos, con_datos = [], 0
+        for p in ps:
+            h = dict(p)
+            # Sus datos propios: edad, sexo, padre, madre.
+            propios = datos_caballo.get(p.get("perfil", ""))
+            if propios:
+                for k, v in propios.items():
+                    if v and not h.get(k):
+                        h[k] = v
+
+            camp = fichas.get(p.get("perfil", ""))
+            if camp:
+                h["carreras"] = camp
+                h = _campana_hasta(h, f["fecha"] or "")
+                if h.get("carreras"):
+                    con_datos += 1
+            completos.append(h)
+
+        # Si casi ninguno tiene campaña, esa carrera no sirve para medir.
+        if con_datos < max(2, len(ps) * 0.4):
+            sin_campana += 1
+            continue
+
+        carreras.append({
+            "participantes": completos,
+            "estado": f["estado"] or "",
+            "pista": f["pista"] or "",
+            "fecha": f["fecha"] or "",
+            "distancia": f["distancia"] or "",
+            "hipodromo": f["hipodromo"] or "",
+        })
+
+    APRENDIZAJE["carreras_sin_campana"] = sin_campana
+    APRENDIZAJE["fichas_disponibles"] = len(fichas)
+    # Cuantas fichas tienen ya los datos completos: si esto cambia, hay
+    # que volver a afinar aunque la cantidad de fichas sea la misma.
+    APRENDIZAJE["fichas_completas"] = len(datos_caballo)
+    return carreras
+
+
+CARRERAS_POR_TANDA = int(os.getenv("CARRERAS_POR_TANDA", "250"))
+
+
+def _acierto_por_tandas(pesos, mitad, tanda=None):
+    """
+    Mide cuanto acierta, leyendo las carreras DE A TANDAS.
+
+    Antes se cargaban las 11.000 carreras juntas y eso ocupaba 527 MB,
+    de los 512 que tiene el servidor. Render mataba la app.
+    De a 250, cada tanda ocupa unos 12 MB.
+
+    mitad: "a" la primera mitad, "b" la segunda. Sirve para probar un
+    cambio en una y verificarlo en la otra, para que no sea casualidad.
+    """
+    tanda = tanda or CARRERAS_POR_TANDA
+    total_g, total_t, vueltas = 0.0, 0.0, 0
+    desde = 0
+    while True:
+        carreras = _carreras_para_aprender(limite=tanda, desde=desde,
+                                           mitad=mitad)
+        if not carreras:
+            break
+        g, t = _cuanto_acierta(carreras, pesos)
+        if g or t:
+            total_g += g
+            total_t += t
+            vueltas += 1
+        desde += tanda
+        del carreras   # se suelta la memoria antes de la proxima tanda
+    if not vueltas:
+        return 0.0, 0.0
+    return round(total_g / vueltas, 2), round(total_t / vueltas, 2)
+
+
+def _cuanto_acierta(carreras, pesos):
+    """
+    Vuelve a pronosticar esas carreras con esos pesos y devuelve cuanto
+    acerto. Es la unica forma honesta de saber si un peso sirve: probarlo.
+    """
+    if not carreras:
+        return 0.0, 0.0
+    ganadores, top4, n = 0, 0, 0
+    for c in carreras:
+        corredores = [p for p in c["participantes"] if p.get("nombre")]
+        if len(corredores) < 3:
+            continue
+        try:
+            _, top = rankear(
+                corredores,
+                {"participantes": corredores,
+                 "pista_dia": c["estado"], "pista": c["pista"],
+                 "distancia": c.get("distancia", ""),
+                 "hipodromo": c.get("hipodromo", "")},
+                pesos,
+            )
+        except Exception:
+            continue
+        llegados = sorted([p for p in corredores if p.get("puesto")],
+                          key=lambda p: p["puesto"])[:4]
+        if not llegados or not top:
+            continue
+        reales = [p["nombre"] for p in llegados]
+        predichos = [p["nombre"] for p in top]
+        if predichos[0] == reales[0]:
+            ganadores += 1
+        top4 += len(set(predichos) & set(reales))
+        n += 1
+    if not n:
+        return 0.0, 0.0
+    return ganadores / n * 100, top4 / (n * 4) * 100
+
+
+def ajustar_algoritmo():
+    """
+    Afina los pesos PROBANDO cada uno contra carreras reales.
+
+    Lo importante: un cambio no se acepta porque haya funcionado una vez.
+    Las carreras se parten en DOS MITADES. Un cambio se prueba en la
+    primera; si mejora, se VERIFICA en la segunda. Solo se acepta si
+    mejora en las dos. Si mejora en una sola, fue casualidad.
+
+    Antes se movian todos los pesos juntos para el mismo lado, asi que
+    nunca se descubria cual servia. Terminaban todos en el piso.
+    """
+    # Cuantas hay, sin cargarlas: solo se cuentan.
+    try:
+        con = db()
+        cuantas = con.execute(
+            "SELECT COUNT(*) c FROM historico WHERE participantes IS NOT NULL"
+        ).fetchone()["c"]
+        con.close()
+    except Exception:
+        cuantas = 0
+
+    # Una tanda chica, solo para saber si hay con que trabajar.
+    todas = _carreras_para_aprender(limite=CARRERAS_POR_TANDA)
+
+    # Si no hay carreras nuevas desde la ultima vez, no tiene sentido
+    # hacer todo el calculo otra vez: daria exactamente lo mismo.
+    # Si no hay nada nuevo, no tiene sentido hacer todo el calculo de
+    # nuevo: daria lo mismo.
+    # OJO: hay que mirar las FICHAS tambien, no solo las carreras. Cada
+    # ficha nueva trae el tiempo, la edad, el padre de ese caballo, y eso
+    # cambia el resultado aunque las carreras sean las mismas.
+    fichas_ahora = (APRENDIZAJE.get("fichas_disponibles", 0),
+                    APRENDIZAJE.get("fichas_completas", 0))
+    if (cuantas
+            and cuantas == APRENDIZAJE.get("ultima_vez_con", 0)
+            and fichas_ahora == APRENDIZAJE.get("ultima_vez_fichas", 0)):
+        return {"ok": False, "sin_novedades": True,
+                "motivo": (f"No hay nada nuevo desde la última vez: "
+                           f"las mismas {cuantas} carreras y "
+                           f"{fichas_ahora[0]} fichas de caballos. "
+                           "Afinar de nuevo daría el mismo resultado.")}
+
+    if len(todas) < 60:
+        sin = APRENDIZAJE.get("carreras_sin_campana", 0)
+        fichas = APRENDIZAJE.get("fichas_disponibles", 0)
+        if sin:
+            return {"ok": False, "motivo": (
+                f"Hay carreras guardadas, pero {sin} no tienen la campaña de "
+                f"sus caballos, así que no se puede medir con ellas. "
+                f"Fichas guardadas: {fichas}. "
+                "Se van completando a medida que el histórico avanza.")}
+        return {"ok": False,
+                "motivo": f"solo hay {len(todas)} carreras útiles, hacen falta 60"}
+
+    # Ya no se cargan las carreras en memoria: se leen de a tandas cada
+    # vez que hace falta medir. Las dos mitades se separan por el numero
+    # de fila (par e impar), asi cada una tiene carreras de toda epoca.
+    del todas
+    mitad_a = cuantas // 2
+    mitad_b = cuantas - mitad_a
+
+    pesos = cargar_pesos()
+    AJUSTE["paso"] = "midiendo como esta ahora"
+    base_ga, base_ta = _acierto_por_tandas(pesos, "a")
+    base_gb, base_tb = _acierto_por_tandas(pesos, "b")
+
+    # Lo que se busca es ACERTAR EL GANADOR. El acierto entre los cuatro
+    # solo desempata, porque con el ganador solo puede haber empates.
+    def puntaje(g, t):
+        return g * 10 + t
+
+    mejor_a = puntaje(base_ga, base_ta)
+    mejor_b = puntaje(base_gb, base_tb)
+    cambios, descartados = [], []
+
+    # Para ver como va desde el panel, y para no perder el avance si
+    # Render corta la tarea a la mitad.
+    orden = sorted(pesos.keys())
+    AJUSTE["total"] = len(orden)
+    AJUSTE["hechas"] = 0
+
+    for n_var, clave in enumerate(orden, 1):
+        AJUSTE["hechas"] = n_var
+        AJUSTE["paso"] = f"probando {clave.replace('_',' ')}"
+        inicial = PESOS_INICIALES[clave]
+        actual = pesos[clave]
+
+        # Hasta donde puede moverse cada peso.
+        #
+        # OJO con las que arrancan en CERO: antes el limite era el 30% y
+        # el 250% del valor de fabrica, o sea CERO y CERO. Subian a 0.5 y
+        # el limite las recortaba de vuelta a 0. Nunca podian salir de
+        # cero, por mas que la variable sirviera. Once variables quedaron
+        # muertas asi.
+        #
+        # Las que arrancan en cero se mueven entre 0 y 12: el afinamiento
+        # decide si valen algo o se quedan en cero.
+        if inicial == 0:
+            piso, techo = 0.0, float(os.getenv("TECHO_NUEVAS", "12"))
+        else:
+            piso, techo = abs(inicial) * 0.3, abs(inicial) * 2.5
+            if inicial < 0:
+                piso, techo = -techo, -piso
+
+        # Se prueban tres valores: mas alto, mas bajo, y en cero.
+        candidatos = []
+        paso = max(abs(inicial) * 0.35, 0.5)
+        # Las que arrancan en cero necesitan un paso mas grande: con 0.5
+        # casi no se nota el efecto y el afinamiento lo descarta.
+        if inicial == 0:
+            paso = float(os.getenv("PASO_NUEVAS", "2.5"))
+        for nuevo in (actual + paso, actual - paso, 0.0):
+            if techo >= piso:
+                nuevo = max(piso, min(techo, nuevo))
+            else:
+                nuevo = min(piso, max(techo, nuevo))
+            if abs(nuevo - actual) > 0.05:
+                candidatos.append(round(nuevo, 2))
+
+        for nuevo in candidatos:
+            prueba = dict(pesos)
+            prueba[clave] = nuevo
+
+            # 1) ¿Mejora en la primera mitad?
+            ga, ta = _acierto_por_tandas(prueba, "a")
+            if puntaje(ga, ta) <= mejor_a + 1.0:
+                continue   # ni siquiera mejora aca, se descarta
+
+            # 2) ¿Se REPITE en la segunda mitad? Si no, fue casualidad.
+            gb, tb = _acierto_por_tandas(prueba, "b")
+            if puntaje(gb, tb) <= mejor_b:
+                descartados.append({
+                    "peso": clave, "probado": nuevo,
+                    "motivo": "mejoró en un grupo pero no en el otro",
+                })
+                continue
+
+            # Mejora en los dos: es real.
+            mejor_a = puntaje(ga, ta)
+            mejor_b = puntaje(gb, tb)
+            pesos[clave] = nuevo
+            cambios.append({
+                "peso": clave, "de": round(actual, 2), "a": nuevo,
+                "ganador": round((ga + gb) / 2, 2),
+                "top4": round((ta + tb) / 2, 2),
+            })
+            # Se guarda EN EL MOMENTO, no al final: si Render corta la
+            # tarea, lo aprendido hasta acá no se pierde.
+            try:
+                guardar_pesos(pesos)
+                AJUSTE["ultimo_cambio"] = (
+                    f"{clave.replace('_',' ')}: {round(actual,2)} → {nuevo}")
+            except Exception:
+                pass
+            break   # se pasa al siguiente peso
+
+    if cambios:
+        guardar_pesos(pesos)
+
+    APRENDIZAJE["ultima_vez_con"] = cuantas
+    APRENDIZAJE["ultima_vez_fichas"] = (
+        APRENDIZAJE.get("fichas_disponibles", 0),
+        APRENDIZAJE.get("fichas_completas", 0))
+
+    # El acierto final, medido IGUAL que el inicial: por las dos mitades.
+    # Antes usaba la lista "todas", que se borra mas arriba para ahorrar
+    # memoria: al llegar aca daba error y el informe final se perdia.
+    # Ademas asi el antes y el despues se comparan con las mismas carreras.
+    fin_ga, fin_ta = _acierto_por_tandas(pesos, "a")
+    fin_gb, fin_tb = _acierto_por_tandas(pesos, "b")
+    fin_g, fin_t = (fin_ga + fin_gb) / 2, (fin_ta + fin_tb) / 2
+    ini_g, ini_t = (base_ga + base_gb) / 2, (base_ta + base_tb) / 2
+
+    return {
+        "ok": True,
+        "carreras_usadas": cuantas,
+        "carreras_sin_campana": APRENDIZAJE.get("carreras_sin_campana", 0),
+        "fichas_guardadas": APRENDIZAJE.get("fichas_disponibles", 0),
+        # Cuantas de esas fichas tienen ya los datos nuevos: edad, sexo,
+        # padre, madre. Sin eso, 7 de las variables no se pueden medir.
+        "fichas_completas": APRENDIZAJE.get("fichas_completas", 0),
+        "grupo_prueba": mitad_a,
+        "grupo_verificacion": mitad_b,
+        # Lo que importa: acertar el ganador.
+        "ganador_antes": round(ini_g, 2),
+        "ganador_ahora": round(fin_g, 2),
+        "top4_antes": round(ini_t, 2),
+        "top4_ahora": round(fin_t, 2),
+        "cambios": cambios,
+        "descartados_por_casualidad": descartados,
+    }
+
+# ============================================================
+# PANEL DE ADMIN — solo accesible con la clave ADMIN_KEY.
+# El usuario comun no ve nada de esto.
+# ============================================================
+
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+def es_admin():
+    """
+    Es admin de dos formas:
+      1) Su USUARIO esta marcado como admin. Es la forma normal: entra con
+         su contraseña y listo, sin poner nada en la direccion.
+      2) Con la clave en la direccion. Queda como respaldo, sobre todo
+         para el panel, al que se entra sin estar logueado.
+    """
+    # Por el usuario
+    try:
+        u = usuario_actual()
+        if u and u.get("es_admin"):
+            return True
+    except Exception:
+        pass
+
+    # Por la clave, como respaldo
+    if not ADMIN_KEY:
+        return False
+    enviada = request.args.get("clave", "") or request.headers.get("X-Admin-Key", "")
+    return enviada == ADMIN_KEY
+
+@app.get("/admin")
+def admin_panel():
+    if not es_admin():
+        return "Acceso restringido.", 403
+    return render_template("admin.html")
+
+@app.get("/api/admin/rendimiento")
+def admin_rendimiento():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    total = con.execute("SELECT COUNT(*) c FROM pronosticos").fetchone()["c"]
+    resueltos = con.execute(
+        "SELECT COUNT(*) c FROM pronosticos WHERE resultado IS NOT NULL"
+    ).fetchone()["c"]
+    stats = con.execute("""
+        SELECT
+          SUM(acierto_ganador) ganadores,
+          SUM(aciertos_top4) aciertos,
+          COUNT(*) n
+        FROM pronosticos WHERE resultado IS NOT NULL
+    """).fetchone()
+    ultimos = con.execute("""
+        SELECT fecha, hipodromo, numero, ranking, resultado,
+               acierto_ganador, aciertos_top4, comparado_en
+        FROM pronosticos WHERE resultado IS NOT NULL
+        ORDER BY id DESC LIMIT 20
+    """).fetchall()
+    pesos_actuales = con.execute(
+        "SELECT clave, valor, actualizado_en FROM algoritmo ORDER BY clave"
+    ).fetchall()
+    con.close()
+
+    n = stats["n"] or 0
+    return jsonify(
+        ok=True,
+        total_pronosticos=total,
+        carreras_comparadas=resueltos,
+        acierto_ganador_pct=round((stats["ganadores"] or 0) / n * 100, 1) if n else None,
+        acierto_top4_pct=round((stats["aciertos"] or 0) / (n * 4) * 100, 1) if n else None,
+        pesos=[dict(p) for p in pesos_actuales] or [
+            {"clave": k, "valor": v, "actualizado_en": "inicial"}
+            for k, v in PESOS_INICIALES.items()
+        ],
+        ultimas=[{
+            "fecha": u["fecha"],
+            "hipodromo": u["hipodromo"],
+            "numero": u["numero"],
+            "predicho": json.loads(u["ranking"]),
+            "real": json.loads(u["resultado"]) if u["resultado"] else [],
+            "acerto_ganador": bool(u["acierto_ganador"]),
+            "aciertos_top4": u["aciertos_top4"],
+        } for u in ultimos],
+    )
+
+
+@app.get("/api/admin/diagnostico")
+def admin_diagnostico():
+    """
+    Herramienta de control: muestra exactamente que responde el Stud Book
+    ante una busqueda. Sirve para cualquier caso futuro en que un caballo
+    no aparezca, sin tener que adivinar el motivo.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    termino = request.args.get("q", "").strip()
+    if not termino:
+        return jsonify(ok=False, error="Falta el nombre a probar."), 400
+
+    cabeceras = dict(HEADERS)
+    cabeceras["Accept"] = "application/json, text/javascript, */*; q=0.01"
+    cabeceras["X-Requested-With"] = "XMLHttpRequest"
+
+    informe = {"termino": termino, "intentos": []}
+
+    # Se prueban distintas variantes para ver cual devuelve resultados.
+    variantes = [
+        ("como lo manda el sitio (%20)", quote(termino)),
+        ("con signo mas (+)", quote_plus(termino)),
+        ("sin espacios", termino.replace(" ", "")),
+        ("solo la primera palabra", quote(termino.split()[0])),
+    ]
+    # Y distintos valores de 'tipo', por si filtra por categoria de ejemplar.
+    for etiqueta, q in variantes:
+        for tipo in ("1", "2", "0", "", "3"):
+            for muerto in ("1", "0"):
+                url = (f"{BASE}/ejemplares/autocomplete"
+                       f"?tipo={tipo}&muerto={muerto}&term={q}")
+                intento = {"variante": etiqueta, "tipo": tipo,
+                           "muerto": muerto, "url": url}
+                try:
+                    r = requests.get(url, headers=cabeceras, timeout=(4, 10))
+                    intento["status"] = r.status_code
+                    try:
+                        datos = r.json()
+                        lista = datos if isinstance(datos, list) else (
+                            datos.get("results") or datos.get("data") or []
+                        )
+                        intento["cantidad"] = len(lista)
+                        intento["nombres"] = [
+                            clean(str(x.get("text", "")))
+                            for x in lista[:15] if isinstance(x, dict)
+                        ]
+                        # Marcar si el buscado aparece en esta variante.
+                        buscado = normalize_text(termino).replace(" ", "")
+                        intento["ENCONTRADO"] = any(
+                            normalize_text(n).replace(" ", "") == buscado
+                            for n in intento["nombres"]
+                        )
+                    except Exception:
+                        intento["cantidad"] = 0
+                        intento["respuesta_cruda"] = r.text[:300]
+                except Exception as e:
+                    intento["error"] = str(e)
+                informe["intentos"].append(intento)
+
+    # Resumen: cuales encontraron exactamente el caballo buscado.
+    aciertos = [i for i in informe["intentos"] if i.get("ENCONTRADO")]
+    exitosos = [i for i in informe["intentos"] if i.get("cantidad")]
+    informe["resumen"] = {
+        "LO_ENCONTRARON": [
+            {"variante": i["variante"], "tipo": i["tipo"], "muerto": i["muerto"]}
+            for i in aciertos
+        ],
+        "variantes_con_algun_resultado": len(exitosos),
+        "variantes_probadas": len(informe["intentos"]),
+    }
+    try:
+        informe["lo_que_usa_la_app"] = [
+            e["nombre"] for e in buscar_ejemplares(termino)
+        ]
+    except Exception as e:
+        # Sitio ocupado o sin respuesta: el diagnostico sigue igual.
+        informe["lo_que_usa_la_app"] = f"no se pudo: {type(e).__name__}"
+
+    return jsonify(ok=True, **informe)
+
+
+@app.get("/api/admin/diag-calendario")
+def admin_diag_calendario():
+    """
+    Comprueba si se pueden traer meses anteriores. Ahora mira el formulario
+    real de la pagina y prueba cuatro vias distintas, con sesion abierta.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    anio = int(request.args.get("anio", "2026"))
+    mes = int(request.args.get("mes", "7"))
+    prefijo = f"{anio}-{mes:02d}-"
+    informe = {"pedido": f"{anio}-{mes:02d}"}
+
+    try:
+        s = _sesion_studbook()
+        r0 = s.get(BASE + "/reuniones", timeout=(5, 15))
+        soup0 = BeautifulSoup(r0.text, "html.parser")
+        informe["cookies"] = list(s.cookies.keys())
+    except Exception as e:
+        return jsonify(ok=False, error=f"No se pudo abrir la pagina: {e}"), 502
+
+    # 1) Como es el formulario, de verdad
+    formulario = _datos_del_formulario(soup0)
+    informe["FORMULARIO"] = formulario or "no se encontro un formulario con mes/año"
+
+    # Todos los formularios, por si el filtro fue muy estricto
+    todos = []
+    for f in soup0.find_all("form"):
+        todos.append({
+            "accion": f.get("action", ""),
+            "metodo": f.get("method", "get"),
+            "campos": [i.get("name") for i in f.find_all(["input","select"]) if i.get("name")],
+        })
+    informe["todos_los_formularios"] = todos[:6]
+
+    # Todos los <select> de la pagina, con sus opciones
+    selects = []
+    for sel in soup0.find_all("select"):
+        opciones = [o.get("value","") for o in sel.find_all("option")][:14]
+        selects.append({"nombre": sel.get("name",""), "id": sel.get("id",""),
+                        "opciones": opciones})
+    informe["selectores"] = selects[:6]
+
+    informe["codigo_recaptcha"] = bool(_codigo_recaptcha(soup0))
+
+    # 2) Probar las vias
+    try:
+        reuniones, via, detalle = _traer_mes(anio, mes)
+    except Exception as e:
+        reuniones, via, detalle = [], f"error: {e}", []
+
+    informe["RESUMEN"] = {
+        "se_puede_traer_meses_viejos": bool(reuniones),
+        "VIA_QUE_FUNCIONA": via,
+        "reuniones_del_mes": len(reuniones),
+        "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:5]],
+    }
+    informe["DETALLE_DE_CADA_INTENTO"] = detalle
+    return jsonify(ok=True, **informe)
+
+
+SIGLAS = {
+    "palermo": "PAL", "san isidro": "SI", "la plata": "LP",
+    "la punta": "LPU", "rosario": "ROS", "tandil": "TAN",
+    "dolores": "DOL", "azul": "AZL", "tucuman": "TUC",
+    "cordoba": "CBA", "mendoza": "MZA", "santa fe": "SFE",
+}
+
+COLORES_HIP = {
+    "PAL": "#8c2a2a", "SI": "#153832", "LP": "#2b4a8c",
+    "LPU": "#5c2b8c", "ROS": "#2b8c6b", "TAN": "#8c6b2a",
+    "DOL": "#2a6b8c", "AZL": "#6b2a8c", "TUC": "#8c4a2a",
+}
+
+def sigla_de(hipodromo):
+    n = normalize_text(hipodromo)
+    for nombre, sigla in SIGLAS.items():
+        if nombre in n:
+            return sigla
+    # Si no esta en la lista, armar una sigla con las iniciales.
+    palabras = [p for p in n.split() if len(p) > 2]
+    return "".join(p[0] for p in palabras[:3]).upper() or "OTR"
+
+
+@app.get("/api/calendario-meses")
+def calendario_meses():
+    """
+    Calendario agrupado por mes, con los hipodromos de cada fecha.
+    Parametros: desde y hasta (AAAA-MM-DD). Por defecto, desde 2024.
+    """
+    hoy = hoy_argentina()
+    desde = request.args.get("desde", "2024-01-01")
+    hasta = request.args.get("hasta", hoy)
+
+    reuniones = calendario_entre(desde, hasta)
+    if not reuniones:
+        # Respaldo: lo que haya guardado en la base.
+        guardadas = saved_calendar()
+        reuniones = [r for r in guardadas if desde <= r["fecha"] <= hasta]
+        if not reuniones:
+            return jsonify(
+                ok=False,
+                error="No se pudo traer el calendario en este momento.",
+                fechas=[],
+            ), 503
+
+    # Agrupar por fecha.
+    por_fecha = {}
+    for r in reuniones:
+        f = r["fecha"]
+        if f not in por_fecha:
+            por_fecha[f] = {"fecha": f, "hipodromos": []}
+        sigla = sigla_de(r["hipodromo"])
+        if not any(h["sigla"] == sigla for h in por_fecha[f]["hipodromos"]):
+            por_fecha[f]["hipodromos"].append({
+                "nombre": r["hipodromo"],
+                "sigla": sigla,
+                "color": COLORES_HIP.get(sigla, "#5a6b66"),
+                "url": r.get("url", ""),
+            })
+
+    fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"], reverse=True)
+
+    # Lista de hipodromos para el filtro.
+    hips = {}
+    for f in fechas:
+        for h in f["hipodromos"]:
+            hips[h["sigla"]] = {"nombre": h["nombre"], "sigla": h["sigla"],
+                                "color": h["color"]}
+
+    return jsonify(
+        ok=True,
+        fechas=fechas,
+        hipodromos=sorted(hips.values(), key=lambda h: h["nombre"]),
+        desde=desde,
+        hasta=hasta,
+    )
+
+
+@app.get("/api/admin/diag-tabulada")
+def admin_diag_tabulada():
+    """
+    Comprueba si de la pagina de una carrera se pueden sacar TODOS los datos
+    que hacen falta para la tabulada: competidores, puestos y cuerpos.
+    Se corre ANTES de programar la pantalla, para no trabajar a ciegas.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    url = request.args.get("url", "").strip()
+    numero = request.args.get("numero", "1")
+
+    if not url:
+        return jsonify(ok=False,
+                       error="Falta la direccion de la carrera (parametro url)."), 400
+
+    informe = {"url": url, "numero": numero}
+
+    try:
+        soup = fetch(url)
+    except Exception as e:
+        return jsonify(ok=False, error=f"No se pudo abrir la pagina: {e}"), 502
+
+    # 1) Que encabezados tiene la tabla
+    encabezados_vistos = []
+    for table in soup.find_all("table"):
+        ths = [clean(th.get_text(" ")) for th in table.find_all("th")]
+        if ths:
+            encabezados_vistos.append(ths)
+    informe["encabezados_de_las_tablas"] = encabezados_vistos[:4]
+
+    # 2) Que saca el lector actual
+    try:
+        data = parse_race(soup, int(numero)) if str(numero).isdigit() else None
+    except Exception as e:
+        data = None
+        informe["error_parse"] = str(e)
+
+    if not data:
+        informe["parse_race"] = "No encontro la carrera numero " + str(numero)
+        informe["RESUMEN"] = {"SIRVE_PARA_TABULADA": False,
+                              "motivo": "no se pudo leer la carrera"}
+        return jsonify(ok=True, **informe)
+
+    participantes = data.get("participantes", [])
+    informe["cantidad_participantes"] = len(participantes)
+    informe["muestra"] = [
+        {
+            "nombre": p.get("nombre"),
+            "numero": p.get("numero"),
+            "puesto": p.get("puesto"),
+            "peso": p.get("peso"),
+            "jockey": p.get("jockey"),
+            "retirado": p.get("retirado"),
+        }
+        for p in participantes[:6]
+    ]
+
+    # 3) Los cuerpos: leerlos directo de la tabla para ver si estan
+    cuerpos_encontrados = []
+    for table in soup.find_all("table"):
+        cabeceras = _find_header_row(table)
+        if not cabeceras:
+            continue
+        idx = _map_headers(cabeceras)
+        if "cuerpos" not in idx or "nombre" not in idx:
+            continue
+        for tr in table.find_all("tr"):
+            celdas = tr.find_all("td")
+            if len(celdas) <= max(idx["cuerpos"], idx["nombre"]):
+                continue
+            nombre = _cell_text(celdas[idx["nombre"]])
+            cpos = _cell_text(celdas[idx["cuerpos"]])
+            if nombre:
+                cuerpos_encontrados.append({"nombre": nombre, "cpos": cpos})
+    informe["cuerpos_leidos"] = cuerpos_encontrados[:8]
+
+    con_puesto = sum(1 for p in participantes if p.get("puesto"))
+    con_cuerpos = sum(1 for c in cuerpos_encontrados if c["cpos"])
+
+    informe["RESUMEN"] = {
+        "SIRVE_PARA_TABULADA": bool(participantes) and con_puesto > 0,
+        "participantes": len(participantes),
+        "con_puesto": con_puesto,
+        "con_cuerpos": con_cuerpos,
+        "falta": (
+            [] if (participantes and con_puesto and con_cuerpos)
+            else [x for x, ok in [
+                ("participantes", bool(participantes)),
+                ("puestos", con_puesto > 0),
+                ("cuerpos", con_cuerpos > 0),
+            ] if not ok]
+        ),
+    }
+    return jsonify(ok=True, **informe)
+
+
+def _carrera_guardada_para_tabulada(url, numero):
+    """
+    Arma la carrera con lo que la app YA TIENE, sin ir al sitio:
+      1) la tabla del historico (16.188 carreras al 3/10/2026), que guarda
+         puesto, cuerpos, pago, jockey... de cada uno
+      2) la carrera guardada por la tarea de cada 15 minutos
+    """
+    try:
+        con = db()
+        f = con.execute(
+            "SELECT numero, distancia, pista, estado, participantes "
+            "FROM historico WHERE url=?", (url,)).fetchone()
+        con.close()
+        if f and f["participantes"]:
+            return {
+                "carrera": f["numero"],
+                "distancia": f["distancia"] or "",
+                "superficie": f["pista"] or "",
+                "estado": f["estado"] or "",
+                "participantes": json.loads(f["participantes"]),
+            }
+    except Exception:
+        pass
+    if numero.isdigit():
+        guardada = lo_guardado(f"carrera:{url}:{numero}")
+        if guardada and guardada.get("participantes"):
+            return guardada
+    return None
+
+
+@app.get("/api/tabulada")
+def api_tabulada():
+    """
+    Tabulada de una carrera: todos los que corrieron, en orden de llegada,
+    con los cuerpos al de adelante y al ganador.
+    """
+    url = request.args.get("url", "").strip()
+    numero = request.args.get("numero", "").strip()
+
+    if not (url.startswith(BASE) or url.startswith("https://studbook.org.ar")):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+
+    clave = f"tabulada:{url}:{numero}"
+    # NADIE VA AL SITIO. Una carrera corrida no cambia nunca: la tabulada
+    # guardada vale para siempre. Antes vencia a los 30 dias, iba al Stud
+    # Book y, si el sitio fallaba, mostraba ERROR teniendola guardada
+    # (medido el 4/10/2026: 5 s de espera y error).
+    cacheado, _ = cache_get(clave, TTL_DETALLE_CARRERA)
+    if cacheado is not None:
+        return jsonify(ok=True, **cacheado)
+
+    data = _carrera_guardada_para_tabulada(url, numero)
+    if not data or not data.get("participantes"):
+        # La pantalla muestra este texto y sigue; no es un error.
+        return jsonify(ok=False, sin_datos=True,
+                       error="Todavía no hay datos de esta carrera."), 404
+
+    participantes = [p for p in data["participantes"] if not p.get("retirado")]
+    # Ordenar por puesto de llegada; los que no tienen puesto van al final.
+    con_puesto = sorted(
+        [p for p in participantes if p.get("puesto")],
+        key=lambda p: p["puesto"]
+    )
+    sin_puesto = [p for p in participantes if not p.get("puesto")]
+
+    filas = []
+    for p in con_puesto + sin_puesto:
+        filas.append({
+            "puesto": p.get("puesto"),
+            "numero": p.get("numero"),
+            "nombre": p.get("nombre"),
+            "cuerpos": p.get("cuerpos", ""),
+            "acumulado": p.get("acumulado", ""),
+            "pago": p.get("pago", ""),
+            "peso": p.get("peso", ""),
+            "jockey": p.get("jockey", ""),
+            "entrenador": p.get("entrenador", ""),
+            "caballeriza": p.get("caballeriza", ""),
+            "perfil": p.get("perfil", ""),
+        })
+
+    detalle = detalle_de_carrera(url, ir_al_sitio=False)
+
+    resultado = {
+        "carrera": data.get("carrera"),
+        "premio": data.get("premio", ""),
+        "distancia": data.get("distancia", ""),
+        "pista": detalle.get("pista_txt") or data.get("superficie", ""),
+        "estado": detalle.get("estado_txt") or data.get("estado", ""),
+        "categoria": detalle.get("categoria_txt") or data.get("categoria", ""),
+        "condicion": detalle.get("condicion_txt") or data.get("condicion", ""),
+        "competidores": len(filas),
+        "filas": filas,
+    }
+    cache_set(clave, resultado)
+    return jsonify(ok=True, **resultado)
+
+
+@app.post("/api/admin/reiniciar")
+def admin_reiniciar():
+    """
+    Borra los pronosticos guardados y vuelve el algoritmo a sus valores
+    iniciales. Sirve cuando los datos quedaron mal por un error de calculo.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM pronosticos").fetchone()["c"]
+    con.execute("DELETE FROM pronosticos")
+    con.execute("DELETE FROM algoritmo")
+    con.commit()
+    con.close()
+    guardar_pesos(PESOS_INICIALES)
+
+    return jsonify(ok=True,
+                   mensaje=(f"Se borraron {n} pronósticos. "
+                            "El algoritmo volvió a sus valores iniciales."),
+                   borrados=n)
+
+
+# ============================================================
+# CONDICIONES DE LA REUNION
+# Las carga el admin y valen para todas las carreras de ese dia.
+# El usuario las puede cambiar para si mismo: eso altera SU pronostico,
+# pero nunca el oficial ni las estadisticas de aciertos.
+# Para agregar un campo nuevo alcanza con sumarlo a esta lista.
+# ============================================================
+
+OPCIONES_CONDICIONES = [
+    {"clave": "pista", "titulo": "Pista",
+     "opciones": ["Arena", "Arena (Codo)", "Césped"]},
+    {"clave": "estado", "titulo": "Estado",
+     "opciones": ["Normal", "Liviana", "Húmeda", "Pesada", "Barrosa"]},
+    {"clave": "viento", "titulo": "Viento",
+     "opciones": ["Sin viento", "A favor", "En contra", "Cruzado"]},
+    {"clave": "clima", "titulo": "Clima",
+     "opciones": ["Despejado", "Nublado", "Llovizna", "Lluvia"]},
+]
+
+
+def condiciones_de(fecha, hipodromo):
+    """Devuelve las condiciones que cargo el admin para esa reunion."""
+    try:
+        con = db()
+        fila = con.execute(
+            "SELECT * FROM condiciones WHERE fecha=? AND hipodromo=?",
+            (fecha, normalize_text(hipodromo))
+        ).fetchone()
+        con.close()
+    except Exception:
+        return {}
+    return dict(fila) if fila else {}
+
+
+@app.get("/api/condiciones")
+def api_condiciones():
+    """Las condiciones oficiales de una reunion, y las opciones disponibles."""
+    fecha = request.args.get("fecha", "").strip()
+    hipodromo = request.args.get("hipodromo", "").strip()
+    guardadas = condiciones_de(fecha, hipodromo) if fecha and hipodromo else {}
+    return jsonify(
+        ok=True,
+        oficiales={c["clave"]: guardadas.get(c["clave"], "")
+                   for c in OPCIONES_CONDICIONES},
+        observaciones=guardadas.get("observaciones", ""),
+        cargado_en=guardadas.get("cargado_en", ""),
+        campos=OPCIONES_CONDICIONES,
+    )
+
+
+@app.post("/api/admin/condiciones")
+def admin_condiciones():
+    """El admin carga las condiciones de una reunion."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    fecha = clean(d.get("fecha", ""))
+    hipodromo = clean(d.get("hipodromo", ""))
+    if not fecha or not hipodromo:
+        return jsonify(ok=False, error="Faltan la fecha y el hipódromo."), 400
+
+    # Solo se aceptan valores de la lista, para que no entre cualquier cosa.
+    valores = {}
+    for campo in OPCIONES_CONDICIONES:
+        v = clean(d.get(campo["clave"], ""))
+        valores[campo["clave"]] = v if v in campo["opciones"] else ""
+
+    con = db()
+    con.execute("""
+        INSERT INTO condiciones(fecha,hipodromo,pista,estado,viento,clima,
+                                observaciones,cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(fecha,hipodromo) DO UPDATE SET
+          pista=excluded.pista, estado=excluded.estado,
+          viento=excluded.viento, clima=excluded.clima,
+          observaciones=excluded.observaciones, cargado_en=excluded.cargado_en
+    """, (
+        fecha, normalize_text(hipodromo),
+        valores["pista"], valores["estado"], valores["viento"], valores["clima"],
+        clean(d.get("observaciones", ""))[:400],
+        datetime.now().isoformat(timespec="seconds"),
+    ))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, mensaje="Condiciones guardadas para toda la reunión.",
+                   oficiales=valores)
+
+
+# ============================================================
+# USUARIOS
+# Usuario y contraseña, sin correo obligatorio.
+# La contraseña NUNCA se guarda tal cual: se guarda cifrada.
+# Recuperar la clave hoy es manual (el admin la resetea). El sistema
+# queda preparado para sumar SMS, WhatsApp o correo sin rehacer nada.
+# ============================================================
+
+DIAS_SESION = 90     # cuanto dura la sesion sin volver a entrar
+
+
+def _cifrar_clave(clave, sal=None):
+    """Cifra la contraseña. Nunca se guarda como la escribió el usuario."""
+    sal = sal or secrets.token_hex(16)
+    mezcla = hashlib.pbkdf2_hmac("sha256", clave.encode(), sal.encode(), 120_000)
+    return f"{sal}${mezcla.hex()}"
+
+
+def _clave_correcta(clave, guardada):
+    try:
+        sal, _ = guardada.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    return secrets.compare_digest(_cifrar_clave(clave, sal), guardada)
+
+
+def usuario_actual():
+    """Devuelve el usuario de la sesión, o None si no ingresó."""
+    token = (request.headers.get("X-Sesion", "")
+             or request.cookies.get("lea_sesion", "")).strip()
+    if not token:
+        return None
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT u.id, u.usuario, u.usuario_visible, u.telefono, u.bloqueado,
+                   u.es_admin, s.creada_en
+            FROM sesiones s JOIN usuarios u ON u.id = s.usuario_id
+            WHERE s.token = ?
+        """, (token,)).fetchone()
+        if not fila:
+            con.close()
+            return None
+        # Sesión vencida
+        edad = (datetime.now() - datetime.fromisoformat(fila["creada_en"])).days
+        if edad > DIAS_SESION or fila["bloqueado"]:
+            con.execute("DELETE FROM sesiones WHERE token=?", (token,))
+            con.commit()
+            con.close()
+            return None
+        con.execute("UPDATE sesiones SET ultima_vez=? WHERE token=?",
+                    (datetime.now().isoformat(timespec="seconds"), token))
+        con.commit()
+        con.close()
+        return dict(fila)
+    except Exception:
+        return None
+
+
+def _limpiar_telefono(bruto):
+    """
+    Deja el numero limpio, para que el MISMO celular escrito de
+    distintas formas sea siempre el mismo.
+
+    En Argentina un celular se escribe de muchas maneras:
+        3584181338        como lo pedimos
+        03584181338       con el 0 adelante
+        358415181338      con el 15
+        +54 9 3584 181338 con el pais
+        3584-181338       con guion
+
+    Todos son el MISMO telefono. Sin esto, una persona podia hacerse
+    varias cuentas escribiendo su numero distinto cada vez, y usar la
+    prueba gratis otras tantas.
+
+    Queda: caracteristica + numero, sin 54, sin 9, sin 0 y sin 15.
+    """
+    n = re.sub(r"\D", "", bruto or "")
+    if not n:
+        return ""
+
+    # El pais: +54 o 0054
+    if n.startswith("0054"):
+        n = n[4:]
+    elif n.startswith("54") and len(n) > 10:
+        n = n[2:]
+
+    # El 9 que va despues del pais para celulares
+    if n.startswith("9") and len(n) > 10:
+        n = n[1:]
+
+    # El 0 de larga distancia
+    if n.startswith("0"):
+        n = n[1:]
+
+    # El 15, que va DESPUES de la caracteristica. Las caracteristicas
+    # argentinas tienen 2, 3 o 4 cifras, asi que se prueba en ese orden.
+    if len(n) > 10:
+        for largo in (2, 3, 4):
+            if n[largo:largo + 2] == "15":
+                n = n[:largo] + n[largo + 2:]
+                break
+
+    return n
+
+
+def _validar_telefono(bruto):
+    """
+    Un celular argentino tiene 10 digitos sin el 0 ni el 15
+    (por ejemplo 3585123456). Se aceptan de 8 a 13 para no dejar
+    afuera a nadie del interior ni a los que ponen el 54 adelante.
+    """
+    solo = _limpiar_telefono(bruto)
+    if not solo:
+        return "Poné tu número de celular."
+    if len(solo) < 8:
+        return "Ese número parece muy corto. Escribilo con la característica."
+    if len(solo) > 13:
+        return "Ese número parece muy largo. Revisalo."
+    if len(set(solo)) <= 1:
+        return "Ese número no parece real."
+    return None
+
+
+def _validar_registro(usuario, clave, telefono=""):
+    """Devuelve un mensaje de error, o None si está todo bien."""
+    if len(usuario) < 3:
+        return "El usuario tiene que tener al menos 3 letras."
+    if len(usuario) > 24:
+        return "El usuario no puede tener más de 24 letras."
+    if not re.fullmatch(r"[A-Za-z0-9_.\- ]+", usuario):
+        return "El usuario solo puede tener letras, números, guiones y puntos."
+    if len(clave) < 6:
+        return "La contraseña tiene que tener al menos 6 caracteres."
+    error_tel = _validar_telefono(telefono)
+    if error_tel:
+        return error_tel
+    return None
+
+
+@app.post("/api/registro")
+def api_registro():
+    if not ajuste("registro_abierto"):
+        return jsonify(
+            ok=False, registro_cerrado=True,
+            error=("Por ahora no estamos aceptando cuentas nuevas. "
+                   "Volvé a probar más tarde."),
+        ), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    clave = d.get("clave", "")
+    telefono = clean(d.get("telefono", ""))[:30]
+
+    error = _validar_registro(usuario, clave, telefono)
+    if error:
+        return jsonify(ok=False, error=error), 400
+    telefono = _limpiar_telefono(telefono)
+
+    # Sin aceptar los terminos no se puede crear la cuenta.
+    if not d.get("acepto"):
+        return jsonify(ok=False, falta_aceptar=True,
+                       error=("Tenés que aceptar los términos y la política "
+                              "de privacidad para crear la cuenta.")), 400
+
+    clave_usuario = normalize_text(usuario)
+    con = db()
+    ya = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                     (clave_usuario,)).fetchone()
+    if ya:
+        con.close()
+        return jsonify(ok=False,
+                       error="Ese nombre de usuario ya está tomado."), 409
+
+    # Un telefono, una sola cuenta. Sin esto una misma persona podria
+    # hacerse diez cuentas y usar diez veces la prueba gratis.
+    # No se dice DE QUIEN es la cuenta: cualquiera podria probar
+    # numeros al azar para averiguar quien tiene cuenta en la app.
+    otro = con.execute("SELECT 1 FROM usuarios WHERE telefono=?",
+                       (telefono,)).fetchone()
+    if otro:
+        con.close()
+        return jsonify(
+            ok=False, telefono_repetido=True,
+            error=("Ese celular ya tiene una cuenta. Entrá con ella, o "
+                   "usá otro número. Si no te acordás el usuario, "
+                   "escribinos."),
+        ), 409
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    cur = con.execute("""
+        INSERT INTO usuarios(usuario, usuario_visible, clave_hash, telefono,
+                             creado_en, ultimo_ingreso, acepto_en, acepto_version)
+        VALUES(?,?,?,?,?,?,?,?)
+    """, (clave_usuario, usuario, _cifrar_clave(clave), telefono, ahora, ahora,
+          ahora, FECHA_LEGALES))
+    uid = cur.lastrowid
+    token = secrets.token_urlsafe(32)
+    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
+                (token, uid, ahora, ahora))
+    con.commit()
+    con.close()
+
+    resp = jsonify(ok=True, usuario=usuario, token=token,
+                   mensaje=f"Bienvenido, {usuario}.")
+    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
+                    samesite="Lax", secure=True, httponly=True)
+    return resp
+
+
+# ============================================================
+# SEGURIDAD AL ENTRAR
+# Sin esto, alguien puede probar miles de contraseñas por minuto
+# hasta acertar. Con 5 intentos fallidos se traba 10 minutos.
+# Al entrar bien, la cuenta vuelve a cero.
+# ============================================================
+
+INTENTOS_ANTES_DE_TRABAR = int(os.getenv("INTENTOS_MAX", "5"))
+MINUTOS_TRABADO = int(os.getenv("MINUTOS_TRABADO", "10"))
+
+
+def _esta_trabado(quien):
+    """Si esta trabado, devuelve cuantos minutos faltan. Si no, None."""
+    try:
+        con = db()
+        f = con.execute("SELECT bloqueado_hasta FROM intentos WHERE quien=?",
+                        (quien,)).fetchone()
+        con.close()
+        if not f or not f["bloqueado_hasta"]:
+            return None
+        hasta = datetime.fromisoformat(f["bloqueado_hasta"])
+        faltan = (hasta - datetime.now()).total_seconds() / 60
+        return max(1, int(faltan + 0.5)) if faltan > 0 else None
+    except Exception:
+        return None
+
+
+def _anotar_fallo(quien):
+    """Suma un intento fallido. Devuelve cuantos le quedan."""
+    try:
+        ahora = datetime.now()
+        con = db()
+        f = con.execute("SELECT fallos, ultimo FROM intentos WHERE quien=?",
+                        (quien,)).fetchone()
+
+        # Si el ultimo fallo fue hace rato, se empieza a contar de nuevo.
+        fallos = 0
+        if f and f["ultimo"]:
+            try:
+                minutos = (ahora - datetime.fromisoformat(f["ultimo"])).total_seconds() / 60
+                fallos = f["fallos"] if minutos <= MINUTOS_TRABADO * 2 else 0
+            except ValueError:
+                fallos = 0
+        fallos += 1
+
+        trabado = None
+        if fallos >= INTENTOS_ANTES_DE_TRABAR:
+            trabado = (ahora + timedelta(minutes=MINUTOS_TRABADO)).isoformat(
+                timespec="seconds")
+
+        con.execute("""
+            INSERT INTO intentos(quien, fallos, ultimo, bloqueado_hasta)
+            VALUES(?,?,?,?)
+            ON CONFLICT(quien) DO UPDATE SET
+              fallos=excluded.fallos, ultimo=excluded.ultimo,
+              bloqueado_hasta=excluded.bloqueado_hasta
+        """, (quien, fallos, ahora.isoformat(timespec="seconds"), trabado))
+        con.commit()
+        con.close()
+        return max(0, INTENTOS_ANTES_DE_TRABAR - fallos)
+    except Exception:
+        return INTENTOS_ANTES_DE_TRABAR
+
+
+def _borrar_fallos(quien):
+    """Entro bien: se borra la cuenta de intentos."""
+    try:
+        con = db()
+        con.execute("DELETE FROM intentos WHERE quien=?", (quien,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+@app.post("/api/ingresar")
+def api_ingresar():
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    clave = d.get("clave", "")
+    if not usuario or not clave:
+        return jsonify(ok=False, error="Poné el usuario y la contraseña."), 400
+
+    # ¿Esta trabado por haber fallado muchas veces?
+    quien = normalize_text(usuario)
+    faltan = _esta_trabado(quien)
+    if faltan:
+        return jsonify(
+            ok=False, trabado=True, minutos=faltan,
+            error=(f"Muchos intentos fallidos. Esperá {faltan} minuto"
+                   f"{'s' if faltan > 1 else ''} y probá de nuevo."),
+        ), 429
+
+    con = db()
+    fila = con.execute("SELECT * FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        # Se avisa que no existe para poder ofrecerle crearlo con ese nombre.
+        return jsonify(ok=False, no_existe=True, usuario_probado=usuario,
+                       error=f"No existe el usuario «{usuario}»."), 401
+    if not _clave_correcta(clave, fila["clave_hash"]):
+        con.close()
+        quedan = _anotar_fallo(quien)
+        if quedan == 0:
+            return jsonify(
+                ok=False, trabado=True, minutos=MINUTOS_TRABADO,
+                error=(f"Muchos intentos fallidos. Esperá {MINUTOS_TRABADO} "
+                       "minutos y probá de nuevo."),
+            ), 429
+        aviso = ""
+        if quedan <= 2:
+            aviso = (f" Te queda{'n' if quedan > 1 else ''} {quedan} "
+                     f"intento{'s' if quedan > 1 else ''}.")
+        return jsonify(ok=False, clave_mal=True, quedan=quedan,
+                       error="La contraseña no es correcta." + aviso), 401
+    if fila["bloqueado"]:
+        con.close()
+        return jsonify(ok=False, error="Esta cuenta está bloqueada."), 403
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    token = secrets.token_urlsafe(32)
+    con.execute("INSERT INTO sesiones(token,usuario_id,creada_en,ultima_vez) VALUES(?,?,?,?)",
+                (token, fila["id"], ahora, ahora))
+    con.execute("UPDATE usuarios SET ultimo_ingreso=? WHERE id=?", (ahora, fila["id"]))
+    con.commit()
+    con.close()
+    _borrar_fallos(quien)   # entro bien: se limpia la cuenta
+
+    resp = jsonify(ok=True, usuario=fila["usuario_visible"], token=token)
+    resp.set_cookie("lea_sesion", token, max_age=DIAS_SESION*24*3600,
+                    samesite="Lax", secure=True, httponly=True)
+    return resp
+
+
+@app.post("/api/salir")
+def api_salir():
+    token = (request.headers.get("X-Sesion", "")
+             or request.cookies.get("lea_sesion", "")).strip()
+    if token:
+        con = db()
+        con.execute("DELETE FROM sesiones WHERE token=?", (token,))
+        con.commit()
+        con.close()
+    resp = jsonify(ok=True, mensaje="Sesión cerrada.")
+    resp.set_cookie("lea_sesion", "", max_age=0)
+    return resp
+
+
+@app.get("/api/quien-soy")
+def api_quien_soy():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False)
+    return jsonify(ok=True, ingresado=True, usuario=u["usuario_visible"])
+
+
+@app.get("/api/proxima-carrera")
+def api_proxima_carrera():
+    """
+    La proxima carrera segun el horario oficial, para el visitante
+    que todavia no tiene cuenta.
+    """
+    hipodromo = clean(request.args.get("hipodromo", ""))
+    hoy = hoy_argentina()
+    ahora = hora_argentina()
+
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return jsonify(ok=False, error="No se pudo consultar el calendario."), 503
+
+    del_dia = [r for r in calendario if r["fecha"] == hoy]
+    if hipodromo:
+        del_dia = [r for r in del_dia
+                   if normalize_text(r["hipodromo"]) == normalize_text(hipodromo)]
+    if not del_dia:
+        return jsonify(ok=True, hay=False,
+                       mensaje="No hay carreras hoy en ese hipódromo.",
+                       hipodromos=[r["hipodromo"] for r in calendario
+                                   if r["fecha"] == hoy])
+
+    reunion = del_dia[0]
+    try:
+        carreras = extract_races_from_meeting(fetch(reunion["url"]))
+    except Exception:
+        return jsonify(ok=False, error="No se pudo abrir la reunión."), 503
+
+    # La primera cuya hora todavia no paso.
+    pendientes = [c for c in carreras if c.get("hora") and c["hora"] >= ahora]
+    proxima = pendientes[0] if pendientes else (carreras[-1] if carreras else None)
+    if not proxima:
+        return jsonify(ok=True, hay=False,
+                       mensaje="Todavía no hay carreras publicadas.")
+
+    return jsonify(
+        ok=True, hay=True,
+        fecha=hoy, hipodromo=reunion["hipodromo"], url=reunion["url"],
+        carrera=proxima,
+        ya_corrieron=len([c for c in carreras
+                          if c.get("hora") and c["hora"] < ahora]),
+        total=len(carreras),
+        hipodromos=[r["hipodromo"] for r in calendario if r["fecha"] == hoy],
+    )
+
+
+@app.get("/api/admin/usuarios")
+def admin_usuarios():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    filas = con.execute("""
+        SELECT id, usuario_visible, telefono, creado_en, ultimo_ingreso,
+               bloqueado, es_admin, acepto_en, acepto_version
+        FROM usuarios ORDER BY id DESC LIMIT 200
+    """).fetchall()
+    total = con.execute("SELECT COUNT(*) c FROM usuarios").fetchone()["c"]
+    con.close()
+    return jsonify(ok=True, total=total, usuarios=[dict(f) for f in filas])
+
+
+@app.post("/api/admin/resetear-clave")
+def admin_resetear_clave():
+    """
+    El admin le pone una clave nueva a un usuario que la olvidó.
+    Hoy es manual; mañana esto mismo puede dispararse por SMS o WhatsApp.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    nueva = d.get("clave", "")
+    if not usuario or len(nueva) < 6:
+        return jsonify(ok=False,
+                       error="Falta el usuario o la clave es muy corta."), 400
+
+    con = db()
+    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET clave_hash=? WHERE id=?",
+                (_cifrar_clave(nueva), fila["id"]))
+    # Se cierran sus sesiones abiertas, por seguridad.
+    con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
+    con.commit()
+    con.close()
+    return jsonify(ok=True,
+                   mensaje=f"Clave nueva para {usuario}. Avisale cuál es.")
+
+
+@app.post("/api/admin/bloquear")
+def admin_bloquear():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    bloquear = 1 if d.get("bloquear") else 0
+    con = db()
+    fila = con.execute("SELECT id FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET bloqueado=? WHERE id=?", (bloquear, fila["id"]))
+    if bloquear:
+        con.execute("DELETE FROM sesiones WHERE usuario_id=?", (fila["id"],))
+    con.commit()
+    con.close()
+    return jsonify(ok=True,
+                   mensaje=("Usuario bloqueado." if bloquear else "Usuario habilitado."))
+
+
+@app.get("/api/admin/diag-viejos")
+def admin_diag_viejos():
+    """
+    Prueba tres vias NUEVAS para llegar a carreras de meses anteriores.
+    Las que ya fallaron (direccion, formulario, sesion, POST) no se repiten.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    anio = int(request.args.get("anio", "2026"))
+    mes = int(request.args.get("mes", "3"))
+    informe = {"pedido": f"{anio}-{mes:02d}"}
+    s = _sesion_studbook()
+
+    # ---------- VIA A: entrar directo a una reunion vieja ----------
+    # Las direcciones tienen la forma /reuniones/detalle/ID/AAAAMMDD-hipodromo-N
+    # Si se puede abrir una vieja directamente, se pueden recorrer todas.
+    via_a = {"nombre": "A) entrar directo a una reunion vieja", "intentos": []}
+    try:
+        actuales = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception as e:
+        actuales = []
+        via_a["error_calendario"] = str(e)
+
+    if actuales:
+        # Se toma una direccion de ejemplo para ver como esta armada.
+        ejemplo = actuales[0]["url"]
+        via_a["ejemplo_de_direccion"] = ejemplo
+        m = re.search(r"/reuniones/detalle/(\d+)/(\d{8})-(.+)$", ejemplo)
+        if m:
+            id_actual, fecha_actual, resto = m.groups()
+            via_a["id_actual"] = int(id_actual)
+            # Las reuniones viejas tienen un ID mas chico. Se prueban algunos
+            # hacia atras para ver si responden.
+            for resta in (30, 100, 300, 600):
+                idv = int(id_actual) - resta
+                if idv < 1:
+                    continue
+                url = f"{BASE}/reuniones/detalle/{idv}/x"
+                try:
+                    r = s.get(url, timeout=(5, 15))
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    texto = clean(soup.get_text(" "))
+                    mf = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
+                    carreras = extract_races_from_meeting(soup)
+                    via_a["intentos"].append({
+                        "id": idv, "status": r.status_code,
+                        "fecha_que_trajo": mf.group(1) if mf else "",
+                        "carreras": len(carreras),
+                        "SIRVE": r.status_code == 200 and len(carreras) > 0,
+                    })
+                except Exception as e:
+                    via_a["intentos"].append({"id": idv, "error": str(e)[:90]})
+    informe["VIA_A"] = via_a
+
+    # ---------- VIA B: otra seccion del sitio con el historico ----------
+    via_b = {"nombre": "B) otra seccion con el historico", "intentos": []}
+    for ruta in ["/reuniones/historico", "/reuniones/listado", "/reuniones/todas",
+                 "/estadisticas/reuniones", "/consultas/reuniones",
+                 f"/reuniones/{anio}", f"/reuniones/{anio}/{mes:02d}"]:
+        try:
+            r = s.get(BASE + ruta, timeout=(5, 12))
+            enlaces = 0
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                enlaces = len(soup.select('a[href*="/reuniones/detalle/"]'))
+            via_b["intentos"].append({
+                "ruta": ruta, "status": r.status_code,
+                "enlaces_a_reuniones": enlaces,
+                "SIRVE": r.status_code == 200 and enlaces > 0,
+            })
+        except Exception as e:
+            via_b["intentos"].append({"ruta": ruta, "error": str(e)[:90]})
+    informe["VIA_B"] = via_b
+
+    # ---------- VIA C: desde la ficha de un caballo ----------
+    # En la campaña de cualquier ejemplar aparecen carreras de años anteriores,
+    # con su enlace. Si esos enlaces abren, se puede recorrer el historico.
+    via_c = {"nombre": "C) desde la campaña de un caballo", "intentos": []}
+    try:
+        nombre_prueba = clean(request.args.get("caballo", "")) or "candy"
+        via_c["nombre_pedido"] = nombre_prueba
+        muestra = buscar_ejemplares(nombre_prueba)
+        if muestra:
+            perfil = muestra[0]["perfil"]
+            via_c["caballo_probado"] = muestra[0]["nombre"]
+            soup = fetch(perfil)
+            carreras = _tabla_carreras_del_perfil(soup)
+            viejas = [c for c in carreras
+                      if c.get("fecha", "").endswith(("2024", "2025"))
+                      and c.get("enlace")]
+            via_c["carreras_en_su_campana"] = len(carreras)
+            via_c["de_2024_o_2025"] = len(viejas)
+            via_c["con_enlace"] = len([x for x in carreras if x.get("enlace")])
+            via_c["ejemplos"] = [
+                {"fecha": x.get("fecha"), "hipodromo": x.get("hipodromo"),
+                 "tiene_enlace": bool(x.get("enlace"))}
+                for x in carreras[:6]
+            ]
+            for c in viejas[:3]:
+                try:
+                    r = s.get(c["enlace"], timeout=(5, 12))
+                    sp = BeautifulSoup(r.text, "html.parser")
+                    n = len(sp.select('a[href*="/ejemplares/perfil/"]'))
+                    via_c["intentos"].append({
+                        "fecha": c["fecha"], "status": r.status_code,
+                        "ejemplares_en_la_pagina": n,
+                        "SIRVE": r.status_code == 200 and n > 0,
+                    })
+                except Exception as e:
+                    via_c["intentos"].append({"fecha": c["fecha"], "error": str(e)[:90]})
+        else:
+            via_c["nota"] = "No se encontro ningun caballo para probar."
+    except Exception as e:
+        via_c["error"] = str(e)[:150]
+    informe["VIA_C"] = via_c
+
+    # ---------- RESUMEN ----------
+    def sirve(via):
+        return any(i.get("SIRVE") for i in via.get("intentos", []))
+    funcionan = [n for n, v in [("A", via_a), ("B", via_b), ("C", via_c)] if sirve(v)]
+    informe["RESUMEN"] = {
+        "VIAS_QUE_FUNCIONAN": funcionan,
+        "se_puede": bool(funcionan),
+    }
+    return jsonify(ok=True, **informe)
+
+
+# ============================================================
+# NOTIFICACIONES AL CELULAR
+# Llegan aunque la app este cerrada. Hacen falta dos claves que se
+# cargan en Render: VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY.
+# En iPhone solo funcionan si el usuario agrega la app a la pantalla
+# de inicio; en Android funcionan siempre.
+# ============================================================
+
+VAPID_PUBLIC = os.getenv("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE = os.getenv("VAPID_PRIVATE_KEY", "")
+VAPID_CONTACTO = os.getenv("VAPID_CONTACTO", "mailto:admin@win-ia.onrender.com")
+
+
+def hay_notificaciones():
+    return bool(VAPID_PUBLIC and VAPID_PRIVATE)
+
+
+@app.get("/api/push/clave")
+def push_clave():
+    """La clave publica, que el navegador necesita para suscribirse."""
+    return jsonify(ok=True, disponible=hay_notificaciones(),
+                   clave=VAPID_PUBLIC)
+
+
+@app.post("/api/push/suscribir")
+def push_suscribir():
+    """Guarda la direccion del celular para poder avisarle."""
+    d = request.get_json(silent=True) or {}
+    endpoint = clean(d.get("endpoint", ""))
+    claves = d.get("keys") or {}
+    p256dh = clean(claves.get("p256dh", ""))
+    auth = clean(claves.get("auth", ""))
+
+    if not endpoint or not p256dh or not auth:
+        return jsonify(ok=False, error="Faltan datos de la suscripción."), 400
+
+    u = usuario_actual()
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones(endpoint, usuario_id, p256dh, auth, creada_en)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+          usuario_id=COALESCE(excluded.usuario_id, suscripciones.usuario_id),
+          p256dh=excluded.p256dh, auth=excluded.auth, fallos=0
+    """, (endpoint, u["id"] if u else None, p256dh, auth,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Vas a recibir los avisos en este celular.")
+
+
+@app.post("/api/push/borrar")
+def push_borrar():
+    d = request.get_json(silent=True) or {}
+    endpoint = clean(d.get("endpoint", ""))
+    if endpoint:
+        con = db()
+        con.execute("DELETE FROM suscripciones WHERE endpoint=?", (endpoint,))
+        con.commit()
+        con.close()
+    return jsonify(ok=True, mensaje="No vas a recibir más avisos en este celular.")
+
+
+def enviar_aviso(suscripcion, titulo, cuerpo, url="/", etiqueta="lea"):
+    """
+    Manda un aviso a un celular. Devuelve True si salio bien.
+    Si el celular ya no existe, se borra la suscripcion.
+    """
+    if not hay_notificaciones():
+        return False
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return False
+
+    datos = json.dumps({
+        "titulo": titulo, "cuerpo": cuerpo, "url": url, "etiqueta": etiqueta,
+    }, ensure_ascii=False)
+
+    try:
+        webpush(
+            subscription_info={
+                "endpoint": suscripcion["endpoint"],
+                "keys": {"p256dh": suscripcion["p256dh"],
+                         "auth": suscripcion["auth"]},
+            },
+            data=datos,
+            vapid_private_key=VAPID_PRIVATE,
+            vapid_claims={"sub": VAPID_CONTACTO},
+            ttl=3600,
+        )
+        con = db()
+        con.execute("UPDATE suscripciones SET ultimo_aviso=?, fallos=0 WHERE endpoint=?",
+                    (datetime.now().isoformat(timespec="seconds"),
+                     suscripcion["endpoint"]))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:
+        # 404 o 410 significan que ese celular ya no acepta avisos.
+        texto = str(e)
+        con = db()
+        if "404" in texto or "410" in texto:
+            con.execute("DELETE FROM suscripciones WHERE endpoint=?",
+                        (suscripcion["endpoint"],))
+        else:
+            con.execute("UPDATE suscripciones SET fallos=fallos+1 WHERE endpoint=?",
+                        (suscripcion["endpoint"],))
+            con.execute("DELETE FROM suscripciones WHERE fallos > 8")
+        con.commit()
+        con.close()
+        return False
+
+
+def avisar_a_usuario(usuario_id, titulo, cuerpo, url="/", etiqueta="lea"):
+    """Manda el aviso a todos los celulares de ese usuario."""
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones WHERE usuario_id=?",
+                       (usuario_id,)).fetchall()
+    con.close()
+    enviados = 0
+    for s in subs:
+        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
+            enviados += 1
+    return enviados
+
+
+def avisar_a_todos(titulo, cuerpo, url="/", etiqueta="general"):
+    """Aviso general: remates, torneos, novedades."""
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones").fetchall()
+    con.close()
+    enviados = 0
+    for s in subs:
+        if enviar_aviso(dict(s), titulo, cuerpo, url, etiqueta):
+            enviados += 1
+    return enviados
+
+
+# ---------- CABALLOS SEGUIDOS ----------
+
+@app.get("/api/seguidos")
+def api_seguidos():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, seguidos=[])
+    con = db()
+    filas = con.execute("""
+        SELECT caballo_visible, perfil, creado_en FROM seguidos
+        WHERE usuario_id=? ORDER BY creado_en DESC
+    """, (u["id"],)).fetchall()
+    con.close()
+    return jsonify(ok=True, ingresado=True,
+                   seguidos=[dict(f) for f in filas])
+
+
+@app.post("/api/seguir")
+def api_seguir():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá una cuenta gratis para seguir caballos."), 401
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    if not nombre:
+        return jsonify(ok=False, error="Falta el nombre del caballo."), 400
+
+    clave = normalize_text(nombre)
+    con = db()
+    ya = con.execute("SELECT 1 FROM seguidos WHERE usuario_id=? AND caballo=?",
+                     (u["id"], clave)).fetchone()
+    if ya:
+        con.execute("DELETE FROM seguidos WHERE usuario_id=? AND caballo=?",
+                    (u["id"], clave))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, siguiendo=False,
+                       mensaje=f"Dejaste de seguir a {nombre}.")
+
+    con.execute("""
+        INSERT INTO seguidos(usuario_id, caballo, caballo_visible, perfil, creado_en)
+        VALUES(?,?,?,?,?)
+    """, (u["id"], clave, nombre, clean(d.get("perfil", "")),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, siguiendo=True,
+                   mensaje=f"Vas a recibir un aviso cuando {nombre} vuelva a correr.")
+
+
+def _ya_se_aviso(usuario_id, caballo, tipo, fecha, hipodromo):
+    con = db()
+    fila = con.execute("""
+        SELECT 1 FROM avisos_enviados
+        WHERE usuario_id=? AND caballo=? AND tipo=? AND fecha=? AND hipodromo=?
+    """, (usuario_id, caballo, tipo, fecha, hipodromo)).fetchone()
+    con.close()
+    return bool(fila)
+
+
+def _marcar_avisado(usuario_id, caballo, tipo, fecha, hipodromo):
+    con = db()
+    con.execute("""
+        INSERT OR IGNORE INTO avisos_enviados
+        (usuario_id, caballo, tipo, fecha, hipodromo, enviado_en)
+        VALUES(?,?,?,?,?,?)
+    """, (usuario_id, caballo, tipo, fecha, hipodromo,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+
+def _carreras_de_hoy_guardadas():
+    """
+    Las carreras de hoy, sacadas de LO GUARDADO. No le pide nada al
+    sitio: todo se trajo a las 2 de la mañana.
+    """
+    hoy = hoy_argentina()
+    calendario, _ = cache_get("calendario", TTL_CALENDARIO)
+    if not calendario:
+        return []
+
+    salida = []
+    for r in calendario:
+        if r["fecha"] != hoy:
+            continue
+        hip = _limpiar_nombre_hipodromo(r["hipodromo"])
+        guardado, _ = cache_get(
+            f"reuniones:{r['fecha']}:{normalize_text(r['hipodromo'])}",
+            TTL_REUNION)
+        if not guardado:
+            continue
+        for x in guardado:
+            for c in x.get("carreras", []):
+                data, _ = cache_get(f"carrera:{r['url']}:{c['numero']}",
+                                    TTL_CARRERA)
+                if not data:
+                    continue
+                salida.append({
+                    "fecha": r["fecha"], "hipodromo": hip, "url": r["url"],
+                    "numero": c["numero"], "hora": c.get("hora", ""),
+                    "data": data,
+                })
+    return salida
+
+
+def _minutos_para(hora):
+    """Cuantos minutos faltan para esa hora. None si no se entiende."""
+    if not hora:
+        return None
+    try:
+        h, m = [int(x) for x in str(hora).split(":")[:2]]
+    except (ValueError, TypeError):
+        return None
+    ahora = ahora_argentina()
+    largada = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
+    return (largada - ahora).total_seconds() / 60
+
+
+def revisar_caballos_seguidos():
+    """
+    Avisa a quien sigue un caballo. TRES avisos por carrera:
+
+      1) A la mañana  — "tu caballo corre hoy"
+      2) Una hora antes — "corre a las 15:30" o "se retiró"
+      3) Con el resultado — "salió 2º"
+
+    NO LE PIDE NADA AL SITIO: todo sale de lo que se guardo a las 2 de
+    la mañana. Antes pedia el calendario y cada reunion CADA 15 MINUTOS,
+    o sea casi 100 pedidos por dia de gusto.
+
+    Cada aviso se manda una sola vez, y al tocarlo lleva a esa carrera.
+    """
+    if not hay_notificaciones():
+        return {"enviados": 0, "motivo": "faltan las claves"}
+    if not ajuste("avisos_encendidos"):
+        return {"enviados": 0, "motivo": "los avisos estan apagados en el panel"}
+
+    con = db()
+    seguidos = con.execute("""
+        SELECT s.usuario_id, s.caballo, s.caballo_visible
+        FROM seguidos s
+        JOIN suscripciones u ON u.usuario_id = s.usuario_id
+        GROUP BY s.usuario_id, s.caballo
+    """).fetchall()
+    con.close()
+    if not seguidos:
+        return {"enviados": 0, "motivo": "nadie sigue caballos todavia"}
+
+    buscados = {}
+    for s in seguidos:
+        buscados.setdefault(s["caballo"], []).append(s)
+
+    enviados = 0
+    for c in _carreras_de_hoy_guardadas():
+        faltan = _minutos_para(c["hora"])
+        data = c["data"]
+        enlace = (f"/?fecha={c['fecha']}"
+                  f"&hipodromo={quote_plus(c['hipodromo'])}"
+                  f"&carrera={c['numero']}")
+
+        for p in data.get("participantes", []):
+            clave = normalize_text(p.get("nombre", ""))
+            if clave not in buscados:
+                continue
+            retirado = bool(p.get("retirado"))
+            puesto = p.get("puesto")
+
+            for seg in buscados[clave]:
+                uid = seg["usuario_id"]
+                visible = seg["caballo_visible"]
+
+                def mandar(tipo, titulo, detalle, rotulo):
+                    if _ya_se_aviso(uid, clave, tipo, c["fecha"], c["hipodromo"]):
+                        return 0
+                    n = avisar_a_usuario(
+                        uid, titulo, detalle,
+                        ("/aviso?r=" + quote_plus(rotulo)
+                         + "&t=" + quote_plus(titulo)
+                         + "&d=" + quote_plus(detalle)
+                         + "&ir=" + quote_plus(enlace)),
+                        tipo)
+                    if n:
+                        _marcar_avisado(uid, clave, tipo,
+                                        c["fecha"], c["hipodromo"])
+                    return n
+
+                # 1) A la mañana: corre hoy
+                enviados += mandar(
+                    "inscripto",
+                    f"{visible} corre hoy",
+                    (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                     + (f" · {c['hora']}" if c["hora"] else "")),
+                    "Tu caballo sale a la pista")
+
+                # 2) Una hora antes: corre, o se retiro
+                if faltan is not None and 0 < faltan <= 75:
+                    if retirado:
+                        enviados += mandar(
+                            "una_hora",
+                            f"{visible} no corre",
+                            (f"Se retiró de la {c['numero']}ª carrera "
+                             f"de {c['hipodromo']}."),
+                            "Se retiró")
+                    else:
+                        enviados += mandar(
+                            "una_hora",
+                            f"{visible} corre en {int(faltan)} minutos",
+                            (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                             + (f" · {c['hora']}" if c["hora"] else "")),
+                            "Falta poco")
+
+                # 3) Con el resultado
+                if puesto:
+                    lugar = {1: "ganó", 2: "salió 2º", 3: "salió 3º"}.get(
+                        puesto, f"salió {puesto}º")
+                    pago = p.get("pago", "")
+                    enviados += mandar(
+                        "resultado",
+                        f"{visible} {lugar}",
+                        (f"{c['hipodromo']} · {c['numero']}ª carrera"
+                         + (f" · pagó ${pago}" if pago and puesto == 1 else "")),
+                        "Ya se corrió")
+
+    return {"enviados": enviados}
+
+
+def avisar_a_los_que_vencieron():
+    """
+    Le avisa al celular a los que se les termino la prueba o la
+    suscripcion. Una sola vez por vencimiento.
+    """
+    if not hay_notificaciones():
+        return 0
+    hoy = hoy_argentina()
+    ayer = (ahora_argentina() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    con = db()
+    filas = con.execute("""
+        SELECT s.usuario_id, s.estado, s.paga_hasta
+        FROM suscripciones_pago s
+        JOIN suscripciones u ON u.usuario_id = s.usuario_id
+        WHERE s.paga_hasta = ? AND s.estado IN ('prueba','al_dia','vencida')
+        GROUP BY s.usuario_id
+    """, (ayer,)).fetchall()
+    con.close()
+
+    enviados = 0
+    for f in filas:
+        uid = f["usuario_id"]
+        # Que no se avise dos veces por el mismo vencimiento.
+        if _ya_se_aviso(uid, "suscripcion", "vencio", f["paga_hasta"], ""):
+            continue
+
+        if f["estado"] == "prueba":
+            titulo = "Se terminó tu día de prueba"
+            cuerpo = ("Desde ahora ves solo la carrera que está por correrse. "
+                      "Suscribite para tener todo de nuevo.")
+        else:
+            titulo = "Tu suscripción venció"
+            cuerpo = "Renovala para volver a ver todas las carreras."
+
+        n = avisar_a_usuario(uid, titulo, cuerpo, "/suscripcion", "vencio")
+        if n:
+            _marcar_avisado(uid, "suscripcion", "vencio", f["paga_hasta"], "")
+            enviados += n
+
+        # Se anota como vencida, para no volver a mirarla.
+        try:
+            con = db()
+            con.execute("""UPDATE suscripciones_pago SET estado='vencida',
+                           actualizada_en=? WHERE usuario_id=?""",
+                        (datetime.now().isoformat(timespec="seconds"), uid))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    return enviados
+
+
+# ============================================================
+# TRAER LAS CARRERAS POR ADELANTADO
+# El sitio oficial publica las carreras hasta tres dias antes, con
+# todos sus competidores. Si se traen de noche y se guardan, el
+# usuario las encuentra listas y la app no depende de que el sitio
+# responda rapido en el momento.
+# Ademas, una hora antes de cada carrera se vuelve a pedir: ahi
+# aparecen los retiros de ultimo momento.
+# ============================================================
+
+ADELANTO = {
+    "trabajando": False,
+    "ultima_vez": "",
+    "carreras": 0,
+    "reuniones": 0,
+    "refrescadas": 0,
+    "campanas": 0,      # campañas de caballos traidas
+    "pronosticos": 0,   # pronosticos ya armados
+    "ultimo": "",
+}
+
+
+
+
+# ---------------------------------------------------------------------
+# LAS TABULADAS DE LOS QUE CORREN
+#
+# Idea de Leandro (7/10/2026): si una carrera ya tiene pronostico, tiene
+# que tener tambien el respaldo de la tabulada. Hasta ahora esas carreras
+# caian al final de la cola del historico, atras de 86.981 pendientes: a
+# ese ritmo tardaban mas de un año en llegar, y la pantalla mostraba
+# "Buscando la tabulada..." para siempre.
+#
+# Como se arregla: se anotan en la MISMA cola, pero con prioridad. Asi
+# usan la maquinaria que ya existe —el horario de 3 a 7, el interruptor
+# del panel, las tandas cortas que sobreviven a los reinicios de Render—
+# y nunca sale al sitio una segunda tarea en paralelo.
+#
+# Medido en la base real el 7/10/2026, para 3 dias de carreras:
+#   hacen falta 2.777 tabuladas, estaban guardadas 791 (28%).
+# ---------------------------------------------------------------------
+ANIOS_TABULADAS = int(os.getenv("ANIOS_TABULADAS", "2"))
+DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "3"))
+
+TABULADAS = {"anotadas": 0, "ultima_siembra": ""}
+
+
+def _fecha_de_la_campana(texto):
+    """La campaña trae la fecha como 26/07/2025. Devuelve None si no se puede."""
+    try:
+        d, m, a = texto.split("/")
+        return datetime(int(a), int(m), int(d))
+    except Exception:
+        return None
+
+
+def _anotar_tabuladas_que_faltan():
+    """
+    Anota en la cola, CON PRIORIDAD, las tabuladas que les faltan a las
+    carreras que vienen. Todo de lo guardado: esta funcion no toca el
+    sitio, solo mira y anota. Quien sale a buscarlas es el historico, en
+    su horario.
+
+    El orden importa: se recorre de la reunion mas proxima a la mas
+    lejana, asi lo que se corre antes queda primero en la cola.
+    """
+    limite = (ahora_argentina()
+              - timedelta(days=365 * ANIOS_TABULADAS)).replace(tzinfo=None)
+    hoy = hoy_argentina()
+    hasta = (ahora_argentina()
+             + timedelta(days=DIAS_TABULADAS)).strftime("%Y-%m-%d")
+
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted(
+        [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
+        key=lambda r: r["fecha"])
+
+    anotadas, vistas = 0, set()
+    con = db()
+    try:
+        for reunion in proximas:
+            clave = (f"reuniones:{reunion['fecha']}:"
+                     f"{normalize_text(reunion['hipodromo'])}")
+            guardada = lo_guardado(clave) or []
+            if not guardada:
+                continue
+            bloque = guardada[0]
+            for c in bloque.get("carreras", []):
+                data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+                if not data:
+                    continue
+                for p in data.get("participantes", []):
+                    perfil = p.get("perfil", "")
+                    if not perfil or p.get("retirado") or perfil in vistas:
+                        continue
+                    vistas.add(perfil)
+                    fila = con.execute(
+                        "SELECT carreras FROM fichas WHERE perfil=?",
+                        (perfil,)).fetchone()
+                    if not fila or fila["carreras"] is None:
+                        # Sin ficha no se sabe que corrio. Se anota al
+                        # caballo con prioridad: al traerle la ficha
+                        # aparecen sus carreras y entran en la proxima
+                        # siembra.
+                        anotadas += _anotar_con_prioridad(
+                            con, perfil, "caballo", "")
+                        continue
+                    try:
+                        campana = json.loads(fila["carreras"])
+                    except Exception:
+                        continue
+                    for v in campana:
+                        url = v.get("enlace")
+                        if not url or url in vistas:
+                            continue
+                        vistas.add(url)
+                        f = _fecha_de_la_campana(v.get("fecha", ""))
+                        if not f or f < limite:
+                            continue
+                        if _ya_guardada(url):
+                            continue
+                        anotadas += _anotar_con_prioridad(
+                            con, url, "carrera",
+                            f.strftime("%Y-%m-%d"))
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+    TABULADAS["anotadas"] = anotadas
+    TABULADAS["ultima_siembra"] = ahora_argentina().strftime("%Y-%m-%d %H:%M")
+    return anotadas
+
+
+def _anotar_con_prioridad(con, url, tipo, fecha):
+    """
+    Lo pone en la cola adelante de todo. Si ya estaba anotado sin
+    prioridad, se la sube: no alcanza con INSERT OR IGNORE, que lo
+    dejaria esperando al fondo igual que antes.
+    """
+    try:
+        con.execute("""
+            INSERT INTO por_explorar(url, tipo, fecha, agregado_en, prioridad)
+            VALUES(?,?,?,?,1)
+            ON CONFLICT(url) DO UPDATE SET prioridad=1
+        """, (url, tipo, fecha or "",
+              datetime.now().isoformat(timespec="seconds")))
+        return 1
+    except Exception:
+        return 0
+
+
+def _cuantas_prioritarias():
+    """Cuantas quedan por buscar de las urgentes."""
+    try:
+        con = db()
+        n = con.execute("SELECT COUNT(*) c FROM por_explorar "
+                        "WHERE prioridad=1 AND hecho=0 AND intentos<3"
+                        ).fetchone()["c"]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _dejar_todo_listo(data, reunion, carrera):
+    """
+    Deja una carrera lista para que el usuario no espere nada:
+      1) trae la campaña de cada caballo y la guarda
+      2) arma el pronostico y lo guarda
+
+    Antes esto se hacia recien cuando alguien abria la carrera, y eran
+    14 pedidos al sitio con el usuario esperando. Ahora se hace de
+    madrugada y el usuario solo lee lo guardado.
+    """
+    try:
+        corredores = [p for p in data.get("participantes", [])
+                      if not p.get("retirado")]
+        if len(corredores) < 2:
+            return
+
+        # 1) La campaña de cada uno. La ficha queda guardada, asi que
+        #    un caballo que corre varias veces se pide una sola vez.
+        completos = []
+        pausa = float(os.getenv("PAUSA_ADELANTO", "1.0"))
+        for p in corredores:
+            perfil = p.get("perfil", "")
+            antes = cache_get(f"ficha:{perfil}", TTL_FICHA_CABALLO)[1] if perfil else True
+            completos.append(enrich_horse(dict(p), ir_al_sitio=True))
+            if perfil and not antes:
+                ADELANTO["campanas"] = ADELANTO.get("campanas", 0) + 1
+                time.sleep(pausa)
+
+        # 2) El pronostico, armado y guardado.
+        fecha = meeting_date_from_url(reunion["url"])
+        hip = _limpiar_nombre_hipodromo(reunion["hipodromo"])
+
+        oficiales = condiciones_de(fecha, hip)
+        contexto = {
+            "participantes": completos,
+            "distancia": data.get("distancia", ""),
+            "hora": carrera.get("hora", ""),
+            "hipodromo": hip,
+            "categoria": data.get("categoria", ""),
+            "condicion": data.get("condicion", ""),
+        }
+        for campo in OPCIONES_CONDICIONES:
+            contexto[campo["clave"]] = oficiales.get(campo["clave"], "")
+
+        pesos = cargar_pesos()
+        _, top = rankear(completos, contexto, pesos)
+
+        cache_set(f"listo:{reunion['url']}:{carrera['numero']}", {
+            "participantes": completos,
+            "ranking": top,
+            "armado_en": datetime.now().isoformat(timespec="seconds"),
+        })
+        ADELANTO["pronosticos"] = ADELANTO.get("pronosticos", 0) + 1
+    except Exception:
+        pass
+
+
+def traer_las_que_vienen(forzar=False):
+    """
+    Recorre las reuniones publicadas y guarda todas sus carreras.
+    Se hace de madrugada, cuando no molesta a nadie.
+    """
+    if ADELANTO["trabajando"]:
+        return {"ok": False, "motivo": "ya se está trayendo"}
+
+    ADELANTO["trabajando"] = True
+    ADELANTO["carreras"] = 0
+    ADELANTO["reuniones"] = 0
+    hoy = hoy_argentina()
+
+    try:
+        try:
+            # Se pide FRESCO y se guarda: es el unico momento del dia en
+            # que se va a buscar. El resto del dia la app usa lo guardado.
+            calendario = calendario_completo()
+            cache_set("calendario", calendario)
+        except Exception as e:
+            ADELANTO["ultimo"] = f"no se pudo abrir el calendario: {str(e)[:60]}"
+            return {"ok": False, "motivo": ADELANTO["ultimo"]}
+
+        # Solo de hoy en adelante: lo viejo ya no cambia.
+        # Del mes que viene, solo las de la proxima semana: las demas
+        # todavia no tienen carreras y serian pedidos al sitio de balde.
+        en_7_dias = (ahora_argentina() + timedelta(days=7)).strftime("%Y-%m-%d")
+        proximas = [r for r in calendario if r["fecha"] >= hoy
+                    and (r["fecha"][:7] == hoy[:7] or r["fecha"] <= en_7_dias)]
+        proximas.sort(key=lambda r: r["fecha"])
+
+        for reunion in proximas:
+            try:
+                clave_reunion = f"reuniones:{reunion['fecha']}:{normalize_text(reunion['hipodromo'])}"
+                soup = fetch(reunion["url"])
+                carreras = extract_races_from_meeting(soup)
+                if not carreras:
+                    continue
+
+                # La lista de carreras de esa reunion.
+                cache_set(clave_reunion, [{
+                    "hipodromo": _limpiar_nombre_hipodromo(reunion["hipodromo"]),
+                    "url": reunion["url"],
+                    "carreras": carreras,
+                }])
+                # Las horas de largada, aparte y por url. Con esto el
+                # calendario sabe si la jornada termino sin ir al sitio.
+                cache_set(f"horarios:{reunion['url']}",
+                          [c.get("hora", "") for c in carreras])
+
+                # Y cada carrera con TODO: competidores, campañas y el
+                # pronostico ya armado. Asi el usuario abre y no espera
+                # nada: antes la campaña se buscaba recien cuando alguien
+                # abria la carrera, y eso eran 14 pedidos al sitio.
+                for c in carreras:
+                    clave = f"carrera:{reunion['url']}:{c['numero']}"
+                    guardada, _ = cache_get(clave, TTL_CARRERA)
+                    _, fresca = cache_get(
+                        clave, _cuanto_vale_guardada(guardada, reunion["fecha"]))
+                    if guardada is not None and fresca and not forzar:
+                        continue
+                    try:
+                        data = parse_race(soup, c["numero"])
+                        if data:
+                            cache_set(clave, data)
+                            ADELANTO["carreras"] += 1
+                            _dejar_todo_listo(data, reunion, c)
+                    except Exception:
+                        continue
+                    time.sleep(float(os.getenv("PAUSA_ADELANTO", "1.0")))
+
+                ADELANTO["reuniones"] += 1
+                ADELANTO["ultimo"] = (f"{reunion['fecha']} "
+                                      f"{_limpiar_nombre_hipodromo(reunion['hipodromo'])}")
+            except Exception:
+                continue
+
+        ADELANTO["ultima_vez"] = ahora_argentina().strftime("%Y-%m-%d %H:%M")
+        return {"ok": True, "reuniones": ADELANTO["reuniones"],
+                "carreras": ADELANTO["carreras"]}
+    finally:
+        ADELANTO["trabajando"] = False
+
+
+# La ventana para traer las carreras que vienen. De 22 a 23, para que
+# queden guardadas antes de que el historico arranque de madrugada.
+ADELANTO_DESDE = int(os.getenv("ADELANTO_DESDE", "22"))
+ADELANTO_HASTA = int(os.getenv("ADELANTO_HASTA", "23"))
+
+MINUTOS_PARA_EL_RESULTADO = int(os.getenv("MINUTOS_RESULTADO", "40"))
+
+# Cuando se busco por ultima vez el resultado de cada reunion, para no
+# pedirlo mas seguido de lo acordado.
+_ULTIMA_BUSQUEDA_RESULTADO = {}
+
+
+def completar_resultados():
+    """
+    Busca el resultado de las carreras de HOY que ya largaron y todavia
+    no lo tienen. Si no esta, vuelve a buscarlo cada 40 minutos hasta
+    encontrarlo.
+
+    Hace falta porque ahora NADIE VA AL SITIO: antes el resultado lo
+    traia, sin querer, la visita de un usuario. Si ya nadie va, el
+    resultado entraria recien con el repaso de cada 6 horas.
+
+    NUNCA TRABA NADA: corre de fondo, en su propio hilo. Mientras tanto
+    la carrera se sigue mostrando con su pronostico, como siempre.
+
+    Es barata: la pagina de la reunion trae TODAS sus carreras juntas,
+    asi que se pide UNA vez por reunion y se completan todas las que
+    falten. Y si no falta ninguna, no se pide nada.
+    """
+    completadas = 0
+    faltan = {}
+    for c in _carreras_de_hoy_guardadas():
+        minutos = _minutos_para(c.get("hora"))
+        if minutos is None:
+            continue
+        # Todavia no largo, o largo hace menos de 40 minutos: se espera.
+        if minutos > -MINUTOS_PARA_EL_RESULTADO:
+            continue
+        data = c.get("data") or {}
+        if any(p.get("puesto") for p in data.get("participantes", [])):
+            continue        # ya tiene resultado
+        faltan.setdefault(c["url"], []).append(c["numero"])
+
+    if not faltan:
+        return 0            # nada que completar: no se molesta al sitio
+
+    ahora = time.time()
+    for url, numeros in faltan.items():
+        # Cada 40 minutos por reunion, no en cada vuelta de 15.
+        ultima = _ULTIMA_BUSQUEDA_RESULTADO.get(url, 0)
+        if ahora - ultima < MINUTOS_PARA_EL_RESULTADO * 60:
+            continue
+        _ULTIMA_BUSQUEDA_RESULTADO[url] = ahora
+        try:
+            soup = fetch(url)
+        except Exception:
+            continue        # el sitio no contesta: se prueba en 40 minutos
+        for n in numeros:
+            try:
+                data = parse_race(soup, n)
+            except Exception:
+                continue
+            if not data:
+                continue
+            if not any(p.get("puesto") for p in data.get("participantes", [])):
+                continue    # el sitio todavia no lo publico
+            cache_set(f"carrera:{url}:{n}", data)
+            completadas += 1
+
+    return completadas
+
+
+def refrescar_las_que_estan_por_correrse():
+    """
+    Vuelve a pedir las carreras que salen en la proxima hora y media.
+    Ahi es cuando aparecen los retiros de ultimo momento.
+    Devuelve los retiros nuevos que encontro.
+    """
+    retiros = []
+
+    # Que carreras salen en la proxima hora y media. Se mira LO
+    # GUARDADO: antes se pedia el calendario y CADA reunion al sitio,
+    # cada 15 minutos, aunque no hubiera ninguna carrera cerca.
+    pendientes = []
+    for x in _carreras_de_hoy_guardadas():
+        faltan = _minutos_para(x["hora"])
+        if faltan is not None and 0 < faltan <= 90:
+            pendientes.append(x)
+
+    if not pendientes:
+        return retiros   # nada cerca: no se molesta al sitio
+
+    # Recien ahora se va al sitio, y solo por esas reuniones.
+    soups = {}
+    for x in pendientes:
+        if x["url"] not in soups:
+            try:
+                soups[x["url"]] = fetch(x["url"])
+            except Exception:
+                soups[x["url"]] = None
+
+    for x in pendientes:
+        soup = soups.get(x["url"])
+        if soup is None:
+            continue
+        reunion = {"url": x["url"], "hipodromo": x["hipodromo"],
+                   "fecha": x["fecha"]}
+        c = {"numero": x["numero"], "hora": x["hora"]}
+
+        if True:
+            clave = f"carrera:{reunion['url']}:{c['numero']}"
+            antes, _ = cache_get(clave, TTL_CARRERA)
+
+            try:
+                data = parse_race(soup, c["numero"])
+            except Exception:
+                continue
+            if not data:
+                continue
+
+            cache_set(clave, data)
+            ADELANTO["refrescadas"] += 1
+
+            # Si cambio algo, se rehace el pronostico con lo nuevo.
+            try:
+                antes_n = len([p for p in (antes or {}).get("participantes", [])
+                               if not p.get("retirado")])
+                ahora_n = len([p for p in data.get("participantes", [])
+                               if not p.get("retirado")])
+                if antes is None or antes_n != ahora_n:
+                    _dejar_todo_listo(data, reunion, c)
+            except Exception:
+                pass
+
+            # ¿Se retiro alguno que antes corria?
+            if antes:
+                corrian = {normalize_text(p.get("nombre", ""))
+                           for p in antes.get("participantes", [])
+                           if not p.get("retirado")}
+                ahora_corren = {normalize_text(p.get("nombre", ""))
+                                for p in data.get("participantes", [])
+                                if not p.get("retirado")}
+                for p in data.get("participantes", []):
+                    n = normalize_text(p.get("nombre", ""))
+                    if n in corrian and n not in ahora_corren:
+                        retiros.append({
+                            "caballo": n,
+                            "visible": p.get("nombre", ""),
+                            "fecha": reunion["fecha"],
+                            "hipodromo": reunion["hipodromo"],
+                            "numero": c["numero"],
+                        })
+    return retiros
+
+
+def avisar_los_retiros(retiros):
+    """Le avisa al que sigue a un caballo que se retiro."""
+    if not retiros or not hay_notificaciones():
+        return 0
+    enviados = 0
+    for r in retiros:
+        try:
+            con = db()
+            quienes = con.execute("""
+                SELECT s.usuario_id FROM seguidos s
+                JOIN suscripciones u ON u.usuario_id = s.usuario_id
+                WHERE s.caballo = ?
+                GROUP BY s.usuario_id
+            """, (r["caballo"],)).fetchall()
+            con.close()
+        except Exception:
+            continue
+
+        for q in quienes:
+            uid = q["usuario_id"]
+            if _ya_se_aviso(uid, r["caballo"], "retiro", r["fecha"], r["hipodromo"]):
+                continue
+            titulo = f"{r['visible']} no corre"
+            cuerpo = (f"Se retiró de la {r['numero']}ª carrera "
+                      f"de {r['hipodromo']}.")
+            n = avisar_a_usuario(
+                uid, titulo, cuerpo,
+                ("/aviso?r=" + quote_plus("Retiro")
+                 + "&t=" + quote_plus(titulo)
+                 + "&d=" + quote_plus(cuerpo)),
+                "retiro")
+            if n:
+                _marcar_avisado(uid, r["caballo"], "retiro",
+                                r["fecha"], r["hipodromo"])
+                enviados += n
+    return enviados
+
+
+def revision_de_avisos():
+    """
+    Tarea de fondo: revisa cada 15 minutos si hay que avisarle a alguien.
+    Cada 15 minutos porque el aviso de 'una hora antes' necesita precision.
+    """
+    time.sleep(90)
+    while True:
+        # PRIMERO los resultados: asi el aviso de "ganó / salió 2º" sale
+        # en la misma vuelta, con el resultado ya guardado.
+        # Es la unica tarea que trae resultados, porque la visita del
+        # usuario ya no va al sitio.
+        try:
+            completar_resultados()
+        except Exception:
+            pass
+
+        try:
+            revisar_caballos_seguidos()
+        except Exception:
+            pass
+        try:
+            avisar_a_los_que_vencieron()
+        except Exception:
+            pass
+
+        # Refrescar las que salen en la proxima hora y media, y avisar
+        # si se retiro un caballo que alguien sigue.
+        try:
+            avisar_los_retiros(refrescar_las_que_estan_por_correrse())
+        except Exception:
+            pass
+
+        # El vivo de cada hipodromo, 25 minutos antes de su primera
+        # carrera. Cada uno se busca UNA sola vez por dia.
+        try:
+            buscar_las_transmisiones()
+        except Exception:
+            pass
+
+        # De noche, traer todas las que vienen y dejarlas guardadas.
+        #
+        # Por que a las 22 y no a las 2 (cambio del 7/10/2026, idea de
+        # Leandro): el Stud Book publica las carreras cada varios dias, a
+        # cualquier hora. Buscandolas de noche quedan guardadas ANTES de
+        # que arranque el historico, asi esa misma madrugada el histórico
+        # ya puede traer las tabuladas de esos caballos. Antes se traian
+        # a las 2 y el historico arrancaba a las 3: una hora de margen.
+        #
+        # Es una ventana y no una hora exacta porque Render reinicia el
+        # proceso cada tanto: si justo cae en la unica hora buena, ese
+        # dia no se traia nada.
+        try:
+            h = ahora_argentina().hour
+            hoy = hoy_argentina()
+            if (ADELANTO_DESDE <= h <= ADELANTO_HASTA
+                    and ADELANTO.get("ultima_vez", "")[:10] != hoy):
+                traer_las_que_vienen()
+        except Exception:
+            pass
+
+        time.sleep(15 * 60)
+
+
+@app.post("/api/admin/avisar-a-todos")
+def admin_avisar_a_todos():
+    """Aviso general: remates, torneos, novedades."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    titulo = clean(d.get("titulo", ""))
+    cuerpo = clean(d.get("cuerpo", ""))
+    if not titulo:
+        return jsonify(ok=False, error="Falta el título del aviso."), 400
+    destino = clean(d.get("url", "")) or (
+        "/aviso?r=" + quote_plus("Novedades")
+        + "&t=" + quote_plus(titulo)
+        + "&d=" + quote_plus(cuerpo)
+    )
+    n = avisar_a_todos(titulo, cuerpo, destino)
+    return jsonify(ok=True, enviados=n,
+                   mensaje=f"Aviso enviado a {n} celular(es).")
+
+
+@app.post("/api/admin/probar-aviso")
+def admin_probar_aviso():
+    """Manda un aviso de prueba a los celulares del admin."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    subs = con.execute("SELECT * FROM suscripciones ORDER BY creada_en DESC LIMIT 3").fetchall()
+    con.close()
+    if not subs:
+        return jsonify(ok=False,
+                       error="Todavía no hay ningún celular suscripto."), 404
+    n = sum(1 for s in subs
+            if enviar_aviso(dict(s), "Prueba de LEA WIN IA",
+                            "Si ves esto, los avisos funcionan.", "/", "prueba"))
+    return jsonify(ok=True, enviados=n,
+                   mensaje=f"Prueba enviada a {n} de {len(subs)} celular(es).")
+
+
+@app.get("/api/admin/estado-avisos")
+def admin_estado_avisos():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    subs = con.execute("SELECT COUNT(*) c FROM suscripciones").fetchone()["c"]
+    seg = con.execute("SELECT COUNT(*) c FROM seguidos").fetchone()["c"]
+    env = con.execute("SELECT COUNT(*) c FROM avisos_enviados").fetchone()["c"]
+    ultimos = con.execute("""
+        SELECT caballo, tipo, fecha, hipodromo, enviado_en
+        FROM avisos_enviados ORDER BY id DESC LIMIT 20
+    """).fetchall()
+    con.close()
+    return jsonify(
+        ok=True,
+        claves_cargadas=hay_notificaciones(),
+        celulares_suscriptos=subs,
+        caballos_seguidos=seg,
+        avisos_enviados=env,
+        ultimos=[dict(u) for u in ultimos],
+    )
+
+
+@app.get("/sw.js")
+def service_worker():
+    """
+    El archivo que recibe los avisos. Tiene que servirse desde la raiz,
+    si no el navegador no le permite trabajar en toda la app.
+    """
+    from flask import send_from_directory
+    resp = send_from_directory("static", "sw.js", mimetype="application/javascript")
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/manifest.json")
+def manifiesto():
+    """
+    Permite instalar la app en la pantalla de inicio del celular.
+    En iPhone esto es OBLIGATORIO para que lleguen los avisos.
+    """
+    return jsonify({
+        "name": "LEA WIN IA",
+        "short_name": "LEA WIN",
+        "description": "Pronóstico de carreras del Stud Book Argentino",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#153832",
+        "theme_color": "#153832",
+        "orientation": "portrait",
+        "icons": [
+            {"src": "/static/icono-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icono-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    })
+
+
+# ============================================================
+# RECUPERAR LA CONTRASEÑA
+# Se manda un aviso al celular con un enlace. El usuario elige su
+# clave nueva. El enlace vale 30 minutos y una sola vez.
+# Si no tiene el celular suscripto, el admin se la resetea a mano.
+# ============================================================
+
+MINUTOS_ENLACE_CLAVE = 30
+
+
+@app.post("/api/olvide-clave")
+def api_olvide_clave():
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    if not usuario:
+        return jsonify(ok=False, error="Escribí tu nombre de usuario."), 400
+
+    con = db()
+    fila = con.execute("SELECT id, usuario_visible, telefono FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, no_existe=True,
+                       error=f"No existe el usuario «{usuario}»."), 404
+
+    # ¿Tiene algún celular con los avisos activados?
+    subs = con.execute("SELECT COUNT(*) c FROM suscripciones WHERE usuario_id=?",
+                       (fila["id"],)).fetchone()["c"]
+    if not subs:
+        con.close()
+        return jsonify(
+            ok=False, sin_celular=True,
+            telefono=fila["telefono"] or "",
+            error=("No tenés ningún celular con los avisos activados, "
+                   "así que no podemos mandarte el enlace. "
+                   "Escribinos y te la cambiamos a mano."),
+        ), 409
+
+    # Enlace de un solo uso
+    codigo = secrets.token_urlsafe(24)
+    con.execute("INSERT INTO pedidos_clave(codigo, usuario_id, creado_en) VALUES(?,?,?)",
+                (codigo, fila["id"], datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+    enviados = avisar_a_usuario(
+        fila["id"],
+        "Restablecer contraseña",
+        "Tocá para elegir una contraseña nueva. El enlace vale 30 minutos.",
+        f"/clave/{codigo}",
+        "clave",
+    )
+    if not enviados:
+        return jsonify(ok=False,
+                       error="No se pudo mandar el aviso. Probá más tarde."), 502
+
+    return jsonify(ok=True,
+                   mensaje=("Te mandamos un aviso al celular. "
+                            "Tocalo para elegir una contraseña nueva."))
+
+
+def _pedido_valido(codigo):
+    con = db()
+    fila = con.execute("SELECT * FROM pedidos_clave WHERE codigo=?",
+                       (codigo,)).fetchone()
+    con.close()
+    if not fila or fila["usado"]:
+        return None
+    minutos = (datetime.now() -
+               datetime.fromisoformat(fila["creado_en"])).total_seconds() / 60
+    if minutos > MINUTOS_ENLACE_CLAVE:
+        return None
+    return dict(fila)
+
+
+@app.get("/clave/<codigo>")
+def pantalla_clave(codigo):
+    """La pantalla donde el usuario elige su contraseña nueva."""
+    pedido = _pedido_valido(codigo)
+    nombre = ""
+    if pedido:
+        con = db()
+        u = con.execute("SELECT usuario_visible FROM usuarios WHERE id=?",
+                        (pedido["usuario_id"],)).fetchone()
+        con.close()
+        nombre = u["usuario_visible"] if u else ""
+    return render_template("clave.html", codigo=codigo,
+                           valido=bool(pedido), usuario=nombre)
+
+
+@app.post("/api/clave-nueva")
+def api_clave_nueva():
+    d = request.get_json(silent=True) or {}
+    codigo = clean(d.get("codigo", ""))
+    nueva = d.get("clave", "")
+
+    pedido = _pedido_valido(codigo)
+    if not pedido:
+        return jsonify(ok=False,
+                       error="Este enlace ya venció o se usó. Pedí uno nuevo."), 410
+    if len(nueva) < 6:
+        return jsonify(ok=False,
+                       error="La contraseña tiene que tener al menos 6 caracteres."), 400
+
+    con = db()
+    con.execute("UPDATE usuarios SET clave_hash=? WHERE id=?",
+                (_cifrar_clave(nueva), pedido["usuario_id"]))
+    con.execute("UPDATE pedidos_clave SET usado=1 WHERE codigo=?", (codigo,))
+    # Se cierran las sesiones abiertas, por seguridad.
+    con.execute("DELETE FROM sesiones WHERE usuario_id=?", (pedido["usuario_id"],))
+    # Se anulan los otros pedidos pendientes de ese usuario.
+    con.execute("UPDATE pedidos_clave SET usado=1 WHERE usuario_id=? AND usado=0",
+                (pedido["usuario_id"],))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Listo. Ya podés entrar con tu contraseña nueva.")
+
+
+# ============================================================
+# ANUNCIOS
+# Lo que el admin quiere mostrarle a todos: promociones, torneos,
+# novedades. Se muestra arriba de cualquier aviso que toque el
+# usuario, entre las fechas que se le pongan.
+# ============================================================
+
+def anuncio_vigente():
+    """El anuncio que corresponde a hoy, o None si no hay ninguno."""
+    hoy = hoy_argentina()
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT * FROM anuncios
+            WHERE desde <= ? AND hasta >= ?
+            ORDER BY id DESC LIMIT 1
+        """, (hoy, hoy)).fetchone()
+        con.close()
+        return dict(fila) if fila else None
+    except Exception:
+        return None
+
+
+@app.get("/aviso")
+def pantalla_aviso():
+    """
+    La pantalla que se abre al tocar cualquier notificacion.
+    Arriba va el anuncio del dia, abajo el dato concreto del aviso.
+    """
+    return render_template(
+        "aviso.html",
+        anuncio=anuncio_vigente(),
+        titulo=clean(request.args.get("t", "")),
+        detalle=clean(request.args.get("d", "")),
+        rotulo=clean(request.args.get("r", "")),
+        ir=clean(request.args.get("ir", "/")),
+    )
+
+
+@app.get("/api/anuncio")
+def api_anuncio():
+    a = anuncio_vigente()
+    return jsonify(ok=True, hay=bool(a), anuncio=a or {})
+
+
+@app.get("/api/admin/anuncios")
+def admin_anuncios():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    filas = con.execute("SELECT * FROM anuncios ORDER BY id DESC LIMIT 30").fetchall()
+    con.close()
+    hoy = hoy_argentina()
+    lista = []
+    for f in filas:
+        d = dict(f)
+        d["vigente"] = d["desde"] <= hoy <= d["hasta"]
+        lista.append(d)
+    return jsonify(ok=True, anuncios=lista, hoy=hoy)
+
+
+@app.post("/api/admin/anuncio")
+def admin_guardar_anuncio():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    titulo = clean(d.get("titulo", ""))
+    desde = clean(d.get("desde", ""))
+    hasta = clean(d.get("hasta", ""))
+
+    if not titulo:
+        return jsonify(ok=False, error="Falta el título del anuncio."), 400
+    for f, nombre in [(desde, "desde"), (hasta, "hasta")]:
+        try:
+            datetime.strptime(f, "%Y-%m-%d")
+        except ValueError:
+            return jsonify(ok=False, error=f"La fecha «{nombre}» no es válida."), 400
+    if hasta < desde:
+        return jsonify(ok=False,
+                       error="La fecha de fin no puede ser anterior a la de inicio."), 400
+
+    con = db()
+    con.execute("""
+        INSERT INTO anuncios(rotulo, titulo, texto, boton_texto, boton_url,
+                             desde, hasta, creado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+    """, (clean(d.get("rotulo", ""))[:40], titulo[:120],
+          clean(d.get("texto", ""))[:900],
+          clean(d.get("boton_texto", ""))[:40],
+          clean(d.get("boton_url", ""))[:300],
+          desde, hasta, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Anuncio guardado, del {desde} al {hasta}.")
+
+
+@app.post("/api/admin/borrar-anuncio")
+def admin_borrar_anuncio():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    try:
+        idd = int(d.get("id"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Falta el anuncio a borrar."), 400
+    con = db()
+    con.execute("DELETE FROM anuncios WHERE id=?", (idd,))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Anuncio borrado.")
+
+
+@app.get("/aviso-previa")
+def pantalla_aviso_previa():
+    """
+    Vista previa del anuncio, para que el admin lo vea antes de guardarlo.
+    Usa la MISMA pantalla que el usuario, con lo que se esta escribiendo.
+    """
+    if not es_admin() and request.args.get("clave") is None:
+        # La previa se abre dentro del panel, que ya esta protegido.
+        pass
+    anuncio = {
+        "rotulo": clean(request.args.get("rotulo", "")),
+        "titulo": clean(request.args.get("titulo", "")),
+        "texto": clean(request.args.get("texto", "")),
+        "boton_texto": clean(request.args.get("boton_texto", "")),
+        "boton_url": clean(request.args.get("boton_url", "")),
+    }
+    return render_template(
+        "aviso.html",
+        anuncio=anuncio if anuncio["titulo"] else None,
+        titulo=clean(request.args.get("t", "")),
+        detalle=clean(request.args.get("d", "")),
+        rotulo=clean(request.args.get("r", "")),
+        ir="/",
+    )
+
+
+@app.get("/api/mis-datos")
+def api_mis_datos():
+    """Lo que el usuario tiene cargado, para poder revisarlo."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False)
+    con = db()
+    fila = con.execute("SELECT usuario_visible, telefono, creado_en FROM usuarios WHERE id=?",
+                       (u["id"],)).fetchone()
+    con.close()
+    return jsonify(ok=True, ingresado=True, **dict(fila))
+
+
+@app.post("/api/cambiar-telefono")
+def api_cambiar_telefono():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Tenés que entrar a tu cuenta."), 401
+
+    d = request.get_json(silent=True) or {}
+    tel = clean(d.get("telefono", ""))[:30]
+    error = _validar_telefono(tel)
+    if error:
+        return jsonify(ok=False, error=error), 400
+
+    con = db()
+    con.execute("UPDATE usuarios SET telefono=? WHERE id=?",
+                (_limpiar_telefono(tel), u["id"]))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje="Número guardado.")
+
+
+# ============================================================
+# AJUSTES
+# Interruptores que el admin prende y apaga desde el panel,
+# sin tener que tocar el codigo ni volver a publicar.
+# ============================================================
+
+AJUSTES_POSIBLES = [
+    {"clave": "registro_abierto", "titulo": "Dejar crear cuentas nuevas",
+     "ayuda": "Si lo apagás, nadie puede registrarse. Los que ya tienen cuenta entran igual.",
+     "por_defecto": "1"},
+    {"clave": "avisos_encendidos", "titulo": "Mandar avisos automáticos",
+     "ayuda": "Los de caballo inscripto y una hora antes de la carrera.",
+     "por_defecto": "1"},
+    {"clave": "recoleccion_historico", "titulo": "Juntar el histórico de madrugada",
+     "ayuda": ("De 3 a 7 de la mañana busca carreras viejas, despacio, "
+               "para no molestar al Stud Book. Apagalo si algo anda mal."),
+     "por_defecto": "1"},
+]
+
+
+def ajuste(clave):
+    """Devuelve True o False. Si nunca se tocó, usa el valor por defecto."""
+    por_defecto = "1"
+    for a in AJUSTES_POSIBLES:
+        if a["clave"] == clave:
+            por_defecto = a["por_defecto"]
+            break
+    try:
+        con = db()
+        fila = con.execute("SELECT valor FROM ajustes WHERE clave=?",
+                           (clave,)).fetchone()
+        con.close()
+        return (fila["valor"] if fila else por_defecto) == "1"
+    except Exception:
+        return por_defecto == "1"
+
+
+@app.get("/api/admin/ajustes")
+def admin_ver_ajustes():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    return jsonify(ok=True, ajustes=[
+        {**a, "encendido": ajuste(a["clave"])} for a in AJUSTES_POSIBLES
+    ])
+
+
+@app.post("/api/admin/ajuste")
+def admin_cambiar_ajuste():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [a["clave"] for a in AJUSTES_POSIBLES]:
+        return jsonify(ok=False, error="Ese ajuste no existe."), 400
+    valor = "1" if d.get("encendido") else "0"
+    con = db()
+    con.execute("""
+        INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)
+        ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                         cambiado_en=excluded.cambiado_en
+    """, (clave, valor, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, encendido=(valor == "1"),
+                   mensaje="Ajuste guardado.")
+
+
+@app.get("/api/estado-registro")
+def api_estado_registro():
+    """La pantalla pregunta esto para saber si mostrar el botón de crear."""
+    return jsonify(ok=True, abierto=ajuste("registro_abierto"))
+
+
+# ============================================================
+# DATOS PROPIOS DEL CABALLO
+# Lo que el usuario ve en el paddock. Cambia SU pronostico, queda
+# en su historial, y no toca el oficial ni el aprendizaje.
+# Cada dato lleva su valoracion: a favor, en contra o neutra.
+# ============================================================
+
+CAMPOS_CABALLO = [
+    {"clave": "vendaje", "titulo": "Vendaje", "tipo": "opciones",
+     "opciones": [
+        {"v": "Sin vendaje", "j": "neutro"},
+        {"v": "En las manos", "j": "neutro"},
+        {"v": "En las patas", "j": "neutro"},
+        {"v": "En las cuatro", "j": "mal"},
+     ]},
+    {"clave": "herraje", "titulo": "Herraje", "tipo": "letras",
+     "ayuda": "Las cuatro letras tal como las publican.",
+     "largo": 4},
+    {"clave": "kilos", "titulo": "Kilos del caballo", "tipo": "numero",
+     "ayuda": "El peso corporal, si lo sabés.",
+     "min": 300, "max": 650},
+    {"clave": "animo", "titulo": "Cómo lo ves", "tipo": "opciones",
+     "opciones": [
+        {"v": "Tranquilo", "j": "bien"},
+        {"v": "Nervioso", "j": "mal"},
+        {"v": "Se planta", "j": "mal"},
+        {"v": "Tira", "j": "mal"},
+     ]},
+    {"clave": "estado", "titulo": "Estado", "tipo": "opciones",
+     "opciones": [
+        {"v": "Brilloso", "j": "bien"},
+        {"v": "Opaco", "j": "mal"},
+        {"v": "Sudado", "j": "mal"},
+        {"v": "Flaco", "j": "mal"},
+     ]},
+    {"clave": "monta", "titulo": "Cambio de monta", "tipo": "opciones",
+     "opciones": [
+        {"v": "Sigue igual", "j": "neutro"},
+        {"v": "Mejoró", "j": "bien"},
+        {"v": "Desmejoró", "j": "mal"},
+     ]},
+    {"clave": "observaciones", "titulo": "Observaciones", "tipo": "texto",
+     "ayuda": "Lo que no entre en las opciones.", "largo": 200},
+]
+
+# Cuanto mueve cada valoracion del usuario. Pesa bastante: si el que esta
+# en la cancha ve al favorito nervioso y sudado, eso tiene que notarse.
+# Empiezan parejo entre si; con el tiempo se vera cuales sirven de verdad.
+PESO_A_FAVOR = 14.0
+PESO_EN_CONTRA = -14.0
+
+
+def _limpiar_datos_caballo(bruto):
+    """Solo deja pasar lo que corresponde a cada campo."""
+    limpio = {}
+    for campo in CAMPOS_CABALLO:
+        entrada = (bruto or {}).get(campo["clave"])
+        if not isinstance(entrada, dict):
+            continue
+        valor = clean(str(entrada.get("valor", "")))
+        if not valor:
+            continue
+        juicio = entrada.get("juicio", "neutro")
+        if juicio not in ("bien", "mal", "neutro"):
+            juicio = "neutro"
+
+        if campo["tipo"] == "opciones":
+            if valor not in [o["v"] for o in campo["opciones"]]:
+                continue
+        elif campo["tipo"] == "letras":
+            valor = re.sub(r"[^A-Za-z]", "", valor).upper()[:campo["largo"]]
+            if not valor:
+                continue
+        elif campo["tipo"] == "numero":
+            n = _to_float(valor)
+            if n is None or not (campo["min"] <= n <= campo["max"]):
+                continue
+            valor = str(int(n))
+        elif campo["tipo"] == "texto":
+            valor = valor[:campo["largo"]]
+
+        limpio[campo["clave"]] = {"valor": valor, "juicio": juicio}
+    return limpio
+
+
+def puntos_del_usuario(datos):
+    """
+    Cuanto suma o resta lo que cargo el usuario. Cada dato cuenta segun
+    la valoracion que EL le puso, no una que inventemos nosotros.
+    """
+    if not datos:
+        return 0.0, []
+    puntos, motivos = 0.0, []
+    for campo in CAMPOS_CABALLO:
+        d = datos.get(campo["clave"])
+        if not d:
+            continue
+        if d["juicio"] == "bien":
+            puntos += PESO_A_FAVOR
+            motivos.append(f"vos lo ves a favor: {campo['titulo'].lower()} {d['valor'].lower()}")
+        elif d["juicio"] == "mal":
+            puntos += PESO_EN_CONTRA
+            motivos.append(f"vos lo ves en contra: {campo['titulo'].lower()} {d['valor'].lower()}")
+    return puntos, motivos
+
+
+@app.get("/api/campos-caballo")
+def api_campos_caballo():
+    """Las opciones que puede cargar el usuario."""
+    return jsonify(ok=True, campos=CAMPOS_CABALLO)
+
+
+@app.get("/api/datos-caballo")
+def api_datos_caballo():
+    """
+    Lo que el usuario cargo de un caballo: para esta carrera y el
+    historial de las anteriores.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, datos={}, historial=[])
+
+    caballo = normalize_text(request.args.get("caballo", ""))
+    fecha = clean(request.args.get("fecha", ""))
+    hip = normalize_text(request.args.get("hipodromo", ""))
+    if not caballo:
+        return jsonify(ok=False, error="Falta el caballo."), 400
+
+    con = db()
+    actual = con.execute("""
+        SELECT datos FROM datos_caballo
+        WHERE usuario_id=? AND caballo=? AND fecha=? AND hipodromo=?
+    """, (u["id"], caballo, fecha, hip)).fetchone()
+
+    historial = con.execute("""
+        SELECT fecha, hipodromo, numero_carrera, datos, puesto
+        FROM datos_caballo
+        WHERE usuario_id=? AND caballo=? AND NOT (fecha=? AND hipodromo=?)
+        ORDER BY fecha DESC LIMIT 12
+    """, (u["id"], caballo, fecha, hip)).fetchall()
+    con.close()
+
+    def leer(t):
+        try:
+            return json.loads(t)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    return jsonify(
+        ok=True, ingresado=True,
+        datos=leer(actual["datos"]) if actual else {},
+        historial=[{
+            "fecha": h["fecha"],
+            "hipodromo": h["hipodromo"],
+            "numero": h["numero_carrera"],
+            "puesto": h["puesto"],
+            "datos": leer(h["datos"]),
+        } for h in historial],
+    )
+
+
+@app.post("/api/datos-caballo")
+def api_guardar_datos_caballo():
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá una cuenta gratis para cargar tus datos."), 401
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    fecha = clean(d.get("fecha", ""))
+    hip = clean(d.get("hipodromo", ""))
+    if not nombre or not fecha:
+        return jsonify(ok=False, error="Faltan el caballo y la fecha."), 400
+
+    datos = _limpiar_datos_caballo(d.get("datos"))
+    con = db()
+    if not datos:
+        # Si borro todo, se saca el registro.
+        con.execute("""
+            DELETE FROM datos_caballo
+            WHERE usuario_id=? AND caballo=? AND fecha=? AND hipodromo=?
+        """, (u["id"], normalize_text(nombre), fecha, normalize_text(hip)))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, datos={}, mensaje="Se borró lo que habías cargado.")
+
+    numero = d.get("numero_carrera")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        numero = None
+
+    con.execute("""
+        INSERT INTO datos_caballo(usuario_id, caballo, caballo_visible, fecha,
+                                  hipodromo, numero_carrera, datos, cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id, caballo, fecha, hipodromo) DO UPDATE SET
+          datos=excluded.datos, numero_carrera=excluded.numero_carrera,
+          cargado_en=excluded.cargado_en
+    """, (u["id"], normalize_text(nombre), nombre, fecha, normalize_text(hip),
+          numero, json.dumps(datos, ensure_ascii=False),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, datos=datos, mensaje="Guardado.")
+
+
+# ============================================================
+# DATOS OFICIALES POR CABALLO
+# El peso corporal y el herraje los carga el ADMIN el dia de la carrera,
+# porque el Stud Book solo los publica DESPUES de que se corrio.
+# Entran al pronostico OFICIAL, el que se compara con el resultado.
+# El usuario los puede cambiar para si mismo, como las condiciones.
+# ============================================================
+
+def datos_oficiales_de(fecha, hipodromo):
+    """Lo que cargo el admin para esa reunion: {caballo: {peso, herraje}}"""
+    if not fecha:
+        return {}
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT caballo, peso_corporal, herraje FROM datos_oficiales
+            WHERE fecha=? AND hipodromo=?
+        """, (fecha, normalize_text(hipodromo))).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    return {f["caballo"]: {"peso_corporal": f["peso_corporal"],
+                           "herraje": f["herraje"]} for f in filas}
+
+
+@app.get("/api/datos-oficiales")
+def api_datos_oficiales():
+    """Lo que cargo el admin, para mostrarlo en la lista de competidores."""
+    fecha = clean(request.args.get("fecha", ""))
+    hip = clean(request.args.get("hipodromo", ""))
+    return jsonify(ok=True, datos=datos_oficiales_de(fecha, hip),
+                   es_admin=es_admin())
+
+
+@app.post("/api/admin/datos-oficiales")
+def admin_datos_oficiales():
+    """El admin carga el peso corporal y el herraje de un caballo."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    nombre = clean(d.get("caballo", ""))
+    fecha = clean(d.get("fecha", ""))
+    hip = clean(d.get("hipodromo", ""))
+    if not nombre or not fecha:
+        return jsonify(ok=False, error="Faltan el caballo y la fecha."), 400
+
+    # Peso: los kilos del animal, entre 300 y 650.
+    peso = None
+    bruto = clean(str(d.get("peso_corporal", "")))
+    if bruto:
+        n = _to_float(bruto)
+        if n is None or not (300 <= n <= 650):
+            return jsonify(ok=False,
+                           error="El peso tiene que estar entre 300 y 650 kilos."), 400
+        peso = int(n)
+
+    # Herraje: cuatro letras, tal como las publican.
+    herraje = re.sub(r"[^A-Za-z]", "", clean(str(d.get("herraje", "")))).upper()[:4]
+
+    numero = d.get("numero_carrera")
+    try:
+        numero = int(numero)
+    except (TypeError, ValueError):
+        numero = None
+
+    con = db()
+    if peso is None and not herraje:
+        con.execute("""
+            DELETE FROM datos_oficiales
+            WHERE caballo=? AND fecha=? AND hipodromo=?
+        """, (normalize_text(nombre), fecha, normalize_text(hip)))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, mensaje="Se borró lo cargado.", datos={})
+
+    con.execute("""
+        INSERT INTO datos_oficiales(caballo, caballo_visible, fecha, hipodromo,
+                                    numero_carrera, peso_corporal, herraje, cargado_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(caballo, fecha, hipodromo) DO UPDATE SET
+          peso_corporal=excluded.peso_corporal, herraje=excluded.herraje,
+          numero_carrera=excluded.numero_carrera, cargado_en=excluded.cargado_en
+    """, (normalize_text(nombre), nombre, fecha, normalize_text(hip),
+          numero, peso, herraje,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Guardado para {nombre}.",
+                   datos={"peso_corporal": peso, "herraje": herraje})
+
+
+@app.route("/api/admin/vaciar-cache", methods=["GET", "POST"])
+def admin_vaciar_cache():
+    """
+    Borra lo guardado del Stud Book. Sirve cuando se corrige algo de la
+    lectura y no se quiere esperar a que el cache venza solo.
+    NO borra usuarios, pronosticos ni nada cargado a mano.
+    Se puede abrir directo desde la barra de direccion.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM cache").fetchone()["c"]
+    con.execute("DELETE FROM cache")
+    con.commit()
+    con.close()
+    return jsonify(ok=True, borrados=n,
+                   mensaje=f"Se vaciaron {n} datos guardados. "
+                           "La próxima consulta los trae de nuevo del sitio.")
+
+
+@app.post("/api/admin/marcar-admin")
+def admin_marcar_admin():
+    """
+    Marca (o desmarca) a un usuario como admin. Asi puede cargar los datos
+    oficiales entrando normal, sin poner la clave en la direccion.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    marcar = 1 if d.get("admin") else 0
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    fila = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                       (normalize_text(usuario),)).fetchone()
+    if not fila:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    con.execute("UPDATE usuarios SET es_admin=? WHERE id=?", (marcar, fila["id"]))
+    con.commit()
+    con.close()
+    return jsonify(ok=True, es_admin=bool(marcar),
+                   mensaje=(f"{fila['usuario_visible']} ahora es admin."
+                            if marcar else
+                            f"{fila['usuario_visible']} ya no es admin."))
+
+
+@app.get("/api/soy-admin")
+def api_soy_admin():
+    """La pantalla pregunta esto para saber si mostrar el botón ⚙."""
+    return jsonify(ok=True, es_admin=es_admin())
+
+
+# ============================================================
+# RECOLECTOR DEL HISTORICO
+# El Stud Book no deja listar meses anteriores, pero SI deja abrir una
+# carrera vieja si se conoce su direccion. Esas direcciones estan en la
+# campaña de cada caballo.
+# Entonces: de un caballo se sacan sus carreras, de cada carrera se sacan
+# los demas caballos, y asi se va tejiendo el historico.
+# Corre de madrugada, despacio, para no molestar al sitio.
+# ============================================================
+
+# De medianoche a las 7 (cambio del 7/10/2026, pedido de Leandro).
+# Antes eran las 3: con 4 horas no entraban las tabuladas de los que
+# corren (medido: 3 h 43 la primera vez) mas el historico viejo. Y
+# arrancando a las 00 no se pisa con la busqueda de las carreras que
+# vienen, que quedo de 22 a 23.
+HORA_INICIO_RECOLECCION = int(os.getenv("RECOLECCION_DESDE", "0"))   # medianoche
+HORA_FIN_RECOLECCION = int(os.getenv("RECOLECCION_HASTA", "7"))      # 7 de la mañana
+PAUSA_HISTORICO = float(os.getenv("PAUSA_HISTORICO", "3.0"))         # segundos
+
+# Cuando se arranca a mano, sin esperar al horario de la madrugada.
+A_MANO = {"prendido": False, "desde": None}
+
+HISTORICO = {
+    "corriendo": False,
+    "carreras_guardadas": 0,
+    "caballos_vistos": 0,
+    "pendientes": 0,
+    "ultimo": "",
+    "frenado_por_el_sitio": False,
+}
+
+
+def _es_horario_de_recoleccion():
+    # Si se prendio a mano, trabaja aunque no sea la hora.
+    if A_MANO["prendido"]:
+        return True
+
+    h = ahora_argentina().hour
+    if HORA_INICIO_RECOLECCION < HORA_FIN_RECOLECCION:
+        return HORA_INICIO_RECOLECCION <= h < HORA_FIN_RECOLECCION
+    # Por si alguna vez cruza la medianoche (ej: 23 a 5)
+    return h >= HORA_INICIO_RECOLECCION or h < HORA_FIN_RECOLECCION
+
+
+def _pausa_prudente():
+    """
+    Espera un rato al azar entre pedido y pedido. Al azar, para no
+    parecer una maquina golpeando siempre al mismo ritmo.
+    """
+    import random
+    time.sleep(PAUSA_HISTORICO + random.uniform(0, 2.0))
+
+
+def _sumar_a_la_cola(url, tipo, fecha=""):
+    """
+    Anota una direccion para visitarla mas adelante. La fecha sirve para
+    recorrer de lo mas nuevo a lo mas viejo, en orden.
+    """
+    if not url:
+        return
+    # Si no vino la fecha, se intenta sacar de la propia direccion.
+    if not fecha:
+        fecha = meeting_date_from_url(url)
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR IGNORE INTO por_explorar(url, tipo, fecha, agregado_en)
+            VALUES(?,?,?,?)
+        """, (url, tipo, fecha or "", datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _marcar_hecho(url):
+    try:
+        con = db()
+        con.execute("UPDATE por_explorar SET hecho=1 WHERE url=?", (url,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _siguiente_de_la_cola():
+    """
+    Lo proximo a visitar.
+
+    Primero los CABALLOS, despues las carreras. Es al reves de como
+    estaba, y por un motivo: habia 10.957 carreras guardadas pero solo
+    904 fichas de caballos. Y en la ficha esta el tiempo, la edad, el
+    padre, la categoria... o sea todo lo que el algoritmo necesita para
+    medir si esas variables sirven. Sin ficha, esas variables no se
+    pueden usar.
+
+    Dentro de cada tipo, de lo mas nuevo a lo mas viejo.
+    """
+    try:
+        con = db()
+        fila = con.execute("""
+            SELECT url, tipo FROM por_explorar
+            WHERE hecho=0 AND intentos < 3
+            ORDER BY prioridad DESC,
+                     -- Entre las urgentes manda el orden en que se
+                     -- anotaron, que va de la reunion mas proxima a la
+                     -- mas lejana. Si mandara la fecha, saldria primero
+                     -- la carrera vieja mas reciente, que no es lo que
+                     -- pidio Leandro: lo que se corre antes va antes.
+                     CASE prioridad WHEN 1 THEN rowid END ASC,
+                     (tipo='caballo') DESC,
+                     (fecha IS NULL OR fecha='') ASC,
+                     fecha DESC,
+                     rowid ASC
+            LIMIT 1
+        """).fetchone()
+        con.close()
+        return dict(fila) if fila else None
+    except Exception:
+        return None
+
+
+def _ya_guardada(url):
+    """
+    Dice si esa carrera ya esta guardada Y COMPLETA. Si quedo sin el
+    perfil de sus caballos, se considera incompleta y hay que rehacerla:
+    sin el perfil no se puede llegar a la campaña, y sin campaña no se
+    puede afinar.
+    """
+    try:
+        con = db()
+        f = con.execute("SELECT participantes FROM historico WHERE url=?",
+                        (url,)).fetchone()
+        con.close()
+        if not f:
+            return False
+        ps = json.loads(f["participantes"])
+        return bool(ps) and any(p.get("perfil") for p in ps)
+    except Exception:
+        return False
+
+
+def _campana_hasta(caballo, fecha_corte):
+    """
+    Deja en la ficha SOLO las carreras anteriores a la fecha que se va a
+    pronosticar. Es imprescindible: la ficha que trae el sitio hoy incluye
+    la carrera que queremos pronosticar y todas las posteriores. Si no se
+    recorta, el pronostico ya sabe como termino y el acierto seria falso.
+    """
+    if not fecha_corte:
+        return caballo
+
+    def antes(c):
+        f = c.get("fecha", "")     # viene como DD/MM/AAAA
+        try:
+            d, m, a = f.split("/")
+            return f"{a}-{m}-{d}" < fecha_corte
+        except (ValueError, AttributeError):
+            return False
+
+    h = dict(caballo)
+    previas = [c for c in (h.get("carreras") or []) if antes(c)]
+    h["carreras"] = previas
+
+    # Los contadores se recalculan solo con lo anterior.
+    puestos = [c["puesto"] for c in previas if c.get("puesto")]
+    h["corridas"] = len(previas)
+    h["victorias"] = sum(1 for p in puestos if p == 1)
+    h["podios"] = sum(1 for p in puestos if p <= 3)
+    h["actuaciones"] = [
+        f"{c['fecha']} {c.get('hipodromo','')} {c['puesto']}º"
+        for c in previas if c.get("puesto")
+    ][:20]
+
+    # La forma reciente: los puestos de las ultimas, de la mas nueva a la
+    # mas vieja. Es lo que el programa publica como "8 ultimas".
+    h["forma"] = "".join(
+        str(min(9, c["puesto"])) + "S"
+        for c in previas[:8] if c.get("puesto")
+    )
+
+    # Dias sin correr, contados hasta la fecha de esta carrera.
+    if previas:
+        try:
+            d, m, a = previas[0]["fecha"].split("/")
+            ultima = datetime(int(a), int(m), int(d))
+            esta = datetime.strptime(fecha_corte, "%Y-%m-%d")
+            h["dias_sin_correr"] = (esta - ultima).days
+        except (ValueError, AttributeError):
+            h["dias_sin_correr"] = None
+    else:
+        h["dias_sin_correr"] = None
+
+    # La frase resumen del sitio habla de toda la campaña, incluida la
+    # posterior. Se descarta para no filtrar informacion del futuro.
+    h["campana"] = ""
+    h["efectividad"] = ""
+    return h
+
+
+def guardar_carrera_historica(url):
+    """
+    Abre una carrera vieja, guarda quienes corrieron y anota a cada
+    caballo para visitarlo despues. Devuelve cuantos caballos nuevos sumo.
+    """
+    if _ya_guardada(url):
+        _marcar_hecho(url)
+        return 0
+
+    try:
+        soup = fetch(url)
+    except Exception:
+        return -1   # el sitio no respondio
+
+    # La pagina de una carrera trae una sola; se busca cual es.
+    data = None
+    for n in range(1, 21):
+        data = parse_race(soup, n)
+        if data and data.get("participantes"):
+            break
+    if not data or not data.get("participantes"):
+        _marcar_hecho(url)
+        return 0
+
+    # La fecha esta en la direccion o en el texto.
+    fecha = meeting_date_from_url(url)
+    if not fecha:
+        m = re.search(r"(\d{2})/(\d{2})/(\d{4})", clean(soup.get_text(" ")))
+        if m:
+            fecha = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+
+    # El hipodromo. La direccion de una carrera vieja viene como
+    # /reuniones/carrera/ID/x/N, sin el nombre. Asi que se busca de tres
+    # formas, en orden.
+    hip = ""
+
+    # 1) Si la direccion SI lo trae (algunas lo hacen).
+    m = re.search(r"/reuniones/\w+/\d+/\d{8}-([a-z\-]+?)-\d+", url)
+    if m:
+        hip = m.group(1).replace("-", " ").title()
+
+    # 2) En un enlace de la propia pagina que vuelva a la reunion.
+    if not hip:
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"/reuniones/detalle/\d+/\d{8}-([a-z\-]+?)-\d+", a["href"])
+            if m:
+                hip = m.group(1).replace("-", " ").title()
+                break
+
+    # 3) En el texto: el sitio nombra al hipodromo arriba de la carrera.
+    if not hip:
+        texto = clean(soup.get_text(" "))
+        for nombre in ["San Isidro", "Palermo", "La Plata", "Rosario",
+                       "Tandil", "Dolores", "Azul", "Tucumán", "La Punta",
+                       "Córdoba", "Mendoza", "Santa Fe", "Neuquén",
+                       "San Rafael", "Río Cuarto"]:
+            if nombre.lower() in texto.lower():
+                hip = nombre
+                break
+
+    # 4) Ultimo recurso: la sigla que aparece en la ficha (ARG, SIS, LPA).
+    if not hip:
+        m = re.search(r"\b(ARG|SIS|LPA|ROS|TAN|DOL|AZL|TUC|SLU|CBA|MZA|SFE)\b",
+                      clean(soup.get_text(" ")))
+        if m:
+            hip = nombre_hipodromo(m.group(1))
+
+    # TODO lo que se leyo de cada caballo. Antes se guardaba solo una
+    # parte y se perdian datos que el algoritmo necesita para medir:
+    # la edad, la forma, los dias sin correr, la efectividad.
+    participantes = [{
+        "nombre": p.get("nombre"),
+        "numero": p.get("numero"),
+        "puesto": p.get("puesto"),
+        "peso": p.get("peso"),
+        "peso_corporal": p.get("peso_corporal"),
+        "jockey": p.get("jockey"),
+        "entrenador": p.get("entrenador"),
+        "caballeriza": p.get("caballeriza"),
+        "cuerpos": p.get("cuerpos"),
+        "acumulado": p.get("acumulado"),
+        "pago": p.get("pago"),
+        # La direccion de su ficha: con esto se busca su campaña guardada
+        # a la hora de afinar. Sin esto no hay con que medir.
+        "perfil": p.get("perfil", ""),
+        "rend_jockey": p.get("rend_jockey"),
+        "rend_entrenador": p.get("rend_entrenador"),
+        "rend_caballeriza": p.get("rend_caballeriza"),
+        # Lo que antes se perdia:
+        "edad": p.get("edad"),
+        "sexo_tabla": p.get("sexo_tabla"),
+        "forma": p.get("forma"),
+        "dias_sin_correr": p.get("dias_sin_correr"),
+        "campana_nums": p.get("campana_nums"),
+        "efectividad": p.get("efectividad"),
+        "ganado": p.get("ganado"),
+        "detalle": p.get("detalle"),
+        "retirado": p.get("retirado", False),
+    } for p in data["participantes"] if not p.get("retirado")]
+
+    detalle = {}
+    try:
+        detalle = detalle_de_carrera(url)
+    except Exception:
+        pass
+
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO historico(url, fecha, hipodromo, numero,
+                distancia, pista, estado, participantes, guardado_en)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (url, fecha, hip, data.get("carrera"),
+              data.get("distancia", ""),
+              detalle.get("pista_txt") or data.get("superficie", ""),
+              detalle.get("estado_txt") or data.get("estado", ""),
+              json.dumps(participantes, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+    # Cada caballo de esta carrera abre camino a otras carreras.
+    nuevos = 0
+    for p in data["participantes"]:
+        if p.get("perfil"):
+            _sumar_a_la_cola(p["perfil"], "caballo")
+            nuevos += 1
+
+    # --- APRENDER DE ESTA CARRERA ---
+    # Es lo mas valioso: la carrera ya se corrio, asi que se puede
+    # pronosticar a ciegas y comparar contra lo que de verdad paso.
+    # Cada carrera vieja suma al aprendizaje del algoritmo.
+    #
+    # OJO: hace falta la campaña de cada caballo. Sin ella todos puntuan
+    # igual y el pronostico no significaria nada. Se traen de a uno, con
+    # pausa, para no golpear al sitio. La ficha queda en cache 6 horas,
+    # asi que un caballo que corrio varias veces se pide una sola vez.
+    try:
+        corredores = [p for p in data["participantes"] if not p.get("retirado")]
+        if len(corredores) >= 2 and any(p.get("puesto") for p in corredores):
+            con_campana = []
+            for p in corredores:
+                antes = cache_get(f"ficha:{p.get('perfil','')}", TTL_FICHA_CABALLO)[1]
+                completo = enrich_horse(dict(p), ir_al_sitio=True)
+                # SOLO lo anterior a esta carrera: si no, el pronostico
+                # ya sabria como termino y el acierto seria falso.
+                con_campana.append(_campana_hasta(completo, fecha))
+                if not antes and p.get("perfil"):
+                    _pausa_prudente()   # solo si de verdad hubo que pedirla
+
+            pesos = cargar_pesos()
+            _, top = rankear(
+                con_campana,
+                {"participantes": con_campana,
+                 "pista_dia": detalle.get("estado_txt") or data.get("estado", ""),
+                 "hora": detalle.get("hora", ""),
+                 "distancia": data.get("distancia", ""),
+                 "hipodromo": hip,
+                 "categoria": detalle.get("categoria_txt") or data.get("categoria", ""),
+                 "condicion": detalle.get("condicion_txt") or data.get("condicion", "")},
+                pesos,
+            )
+            registrar_pronostico(
+                url=url, numero=data.get("carrera"),
+                fecha=fecha, hipodromo=hip,
+                top=top, participantes=con_campana,
+                pesos=pesos, ya_corrida=True,
+            )
+    except Exception:
+        pass   # que un fallo al aprender nunca corte la recoleccion
+
+    _marcar_hecho(url)
+    return nuevos
+
+
+def explorar_caballo(url_perfil):
+    """
+    Abre la ficha de un caballo y anota TODAS sus carreras para visitarlas.
+    Devuelve cuantas carreras nuevas encontro.
+    """
+    try:
+        soup = fetch(url_perfil)
+    except Exception:
+        return -1
+
+    carreras = _tabla_carreras_del_perfil(soup)
+
+    # Se guarda la campaña UNA sola vez por caballo. Un caballo que corrio
+    # 20 veces aparece en 20 carreras: guardarla en cada una seria repetir
+    # lo mismo veinte veces y llenar el disco al pedo.
+    # Esto es lo que le faltaba al afinamiento para poder medir.
+    try:
+        nombre = ""
+        for et in ("h1", "h2"):
+            h = soup.find(et)
+            if h and clean(h.get_text(" ")):
+                nombre = clean(h.get_text(" "))
+                break
+        # TODO lo que trae cada carrera de su campaña. Antes se guardaban
+        # solo 8 de los 20 datos, y se perdian el tiempo, la categoria,
+        # la condicion y el pago: justo lo que el algoritmo necesita para
+        # medir esas variables. Por eso quedaban en cero.
+        livianas = [{
+            "fecha": x.get("fecha", ""),
+            "puesto": x.get("puesto"),
+            "distancia": x.get("distancia", ""),
+            "estado": x.get("estado", ""),
+            "pista": x.get("pista", ""),
+            "numero": x.get("numero", ""),
+            "kilos": x.get("kilos", ""),
+            "hipodromo": x.get("hipodromo", ""),
+            # Lo que antes se perdia:
+            "tiempo": x.get("tiempo", ""),
+            "categoria": x.get("categoria", ""),
+            "condicion": x.get("condicion", ""),
+            "pago": x.get("pago", ""),
+            "importe": x.get("importe", ""),
+            "premio": x.get("premio", ""),
+            "jockey": x.get("jockey", ""),
+            "caballeriza": x.get("caballeriza", ""),
+            "video": x.get("video", ""),
+            "enlace": x.get("enlace", ""),
+            "reunion": x.get("reunion", ""),
+            "hipodromo_codigo": x.get("hipodromo_codigo", ""),
+        } for x in carreras]
+        # Los datos del caballo: edad, sexo, padre, madre. Antes no se
+        # guardaban, y por eso esas variables no se podian medir.
+        texto = clean(soup.get_text(" "))
+        propios = _resumen_del_perfil(soup, texto)
+
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO fichas(perfil, nombre, carreras, datos,
+                                          actualizada_en)
+            VALUES(?,?,?,?,?)
+        """, (url_perfil, nombre, json.dumps(livianas, ensure_ascii=False),
+              json.dumps(propios, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+    nuevas = 0
+    for c in carreras:
+        if c.get("enlace"):
+            # La fecha viene como DD/MM/AAAA; se guarda como AAAA-MM-DD
+            # para poder ordenar de lo mas nuevo a lo mas viejo.
+            f = ""
+            try:
+                d, m, a = c.get("fecha", "").split("/")
+                f = f"{a}-{m}-{d}"
+            except (ValueError, AttributeError):
+                pass
+            _sumar_a_la_cola(c["enlace"], "carrera", f)
+            nuevas += 1
+
+    _marcar_hecho(url_perfil)
+    return nuevas
+
+
+def _contar_pendientes():
+    try:
+        con = db()
+        n = con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=0"
+        ).fetchone()["c"]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _fichas_incompletas(tope=3000):
+    """
+    Las fichas guardadas antes de este cambio no tienen el tiempo, la
+    categoria, el pago ni los datos del caballo (edad, sexo, padre).
+    Sin eso, el algoritmo no puede medir esas variables.
+    Esto las vuelve a poner en la cola para completarlas.
+    No pide nada al sitio: solo mira la base.
+    """
+    # MEMORIA: antes traia las 9.398 fichas ENTERAS (con toda su campaña)
+    # en cada tanda del historico, y Python no devolvia esa memoria.
+    # Medido el 4/10/2026 con una base del tamaño real: +64 MB por tanda.
+    # Ahora la base contesta SOLO los perfiles que faltan.
+    try:
+        con = db()
+        rehacer = [f["perfil"] for f in con.execute("""
+            SELECT perfil FROM fichas
+            WHERE perfil NOT IN (SELECT url FROM por_explorar
+                                 WHERE tipo='caballo' AND hecho=0)
+              AND (datos IS NULL OR datos = ''
+                   OR NOT json_valid(COALESCE(carreras, '[]'))
+                   OR (json_array_length(COALESCE(carreras, '[]')) > 0
+                       AND json_type(carreras, '$[0].tiempo') IS NULL))
+            ORDER BY rowid LIMIT ?""", (tope,)).fetchall()]
+        con.close()
+    except Exception:
+        # Si la base de Render no entendiera JSON, la forma vieja.
+        rehacer = _fichas_incompletas_a_la_vieja(tope)
+        if rehacer is None:
+            return 0
+
+    if not rehacer:
+        return 0
+    try:
+        con = db()
+        for perfil in rehacer:
+            # La fecha 9999 las manda al principio de la cola: son las
+            # que desbloquean las variables del algoritmo, asi que van
+            # antes que los caballos nuevos.
+            con.execute("""
+                INSERT INTO por_explorar(url, tipo, fecha, hecho, intentos,
+                                         agregado_en)
+                VALUES(?,'caballo','9999-12-31',0,0,?)
+                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0,
+                                               fecha='9999-12-31'
+            """, (perfil, datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        return 0
+    return len(rehacer)
+
+
+
+def _fichas_incompletas_a_la_vieja(tope=3000):
+    """
+    Las fichas guardadas antes de este cambio no tienen el tiempo, la
+    categoria, el pago ni los datos del caballo (edad, sexo, padre).
+    Sin eso, el algoritmo no puede medir esas variables.
+    Esto las vuelve a poner en la cola para completarlas.
+    No pide nada al sitio: solo mira la base.
+    """
+    try:
+        con = db()
+        filas = con.execute("SELECT perfil, carreras, datos FROM fichas").fetchall()
+        en_cola = {f["url"] for f in
+                   con.execute("SELECT url FROM por_explorar "
+                               "WHERE tipo='caballo' AND hecho=0").fetchall()}
+        con.close()
+    except Exception:
+        return None
+
+    rehacer = []
+    for f in filas:
+        if f["perfil"] in en_cola:
+            continue
+        # Sin los datos del caballo, o sin el tiempo en sus carreras.
+        falta = not f["datos"]
+        if not falta:
+            try:
+                cs = json.loads(f["carreras"] or "[]")
+                falta = bool(cs) and "tiempo" not in (cs[0] or {})
+            except (json.JSONDecodeError, TypeError, IndexError):
+                falta = True
+        if falta:
+            rehacer.append(f["perfil"])
+            if len(rehacer) >= tope:
+                break
+
+    return rehacer
+
+def _fichas_que_faltan(tope=3000):
+    """
+    Busca los caballos que aparecen en carreras YA GUARDADAS pero que
+    todavia no tienen su ficha, y los pone en la cola.
+
+    Es lo que desbloquea las variables nuevas: el tiempo, la edad, el
+    padre, la categoria y las demas salen de la ficha, no de la carrera.
+    Sin ficha, el algoritmo no las puede medir y quedan en cero.
+
+    No pide nada al sitio: solo mira lo que ya esta en la base.
+    """
+    # MEMORIA: antes traia las 16.188 carreras, todas las fichas y toda
+    # la cola a la memoria en cada tanda del historico (medido 4/10/2026:
+    # +78 MB que no se devolvian). Ahora la base contesta solo los que
+    # faltan: medido +5 MB y 0,5 s con una base del tamaño real.
+    # Mismo orden que antes: el de las carreras y, adentro, el de largada.
+    # Se lee de a una fila (sin fetchall) y se corta al llegar al tope.
+    try:
+        con = db()
+        faltan, vistos = [], set()
+        for f in con.execute("""
+                SELECT json_extract(j.value, '$.perfil') perfil
+                FROM historico h, json_each(h.participantes) j
+                WHERE h.participantes IS NOT NULL
+                  AND json_valid(h.participantes)
+                  AND COALESCE(json_extract(j.value, '$.perfil'), '') != ''
+                  AND json_extract(j.value, '$.perfil') NOT IN
+                      (SELECT perfil FROM fichas)
+                  AND json_extract(j.value, '$.perfil') NOT IN
+                      (SELECT url FROM por_explorar WHERE tipo='caballo')"""):
+            if f["perfil"] not in vistos:
+                vistos.add(f["perfil"])
+                faltan.append(f["perfil"])
+                if len(faltan) >= tope:
+                    break
+        con.close()
+    except Exception:
+        faltan = _fichas_que_faltan_a_la_vieja(tope)
+        if faltan is None:
+            return 0
+
+    for perfil in faltan:
+        _sumar_a_la_cola(perfil, "caballo")
+
+    return len(faltan)
+
+
+
+def _fichas_que_faltan_a_la_vieja(tope=3000):
+    """
+    Busca los caballos que aparecen en carreras YA GUARDADAS pero que
+    todavia no tienen su ficha, y los pone en la cola.
+
+    Es lo que desbloquea las variables nuevas: el tiempo, la edad, el
+    padre, la categoria y las demas salen de la ficha, no de la carrera.
+    Sin ficha, el algoritmo no las puede medir y quedan en cero.
+
+    No pide nada al sitio: solo mira lo que ya esta en la base.
+    """
+    try:
+        con = db()
+        # Los que ya tienen ficha.
+        tengo = {f["perfil"] for f in
+                 con.execute("SELECT perfil FROM fichas").fetchall()}
+        # Los que ya estan anotados para visitar.
+        en_cola = {f["url"] for f in
+                   con.execute("SELECT url FROM por_explorar "
+                               "WHERE tipo='caballo'").fetchall()}
+        # Los que aparecen en las carreras guardadas.
+        filas = con.execute(
+            "SELECT participantes FROM historico "
+            "WHERE participantes IS NOT NULL"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return None
+
+    faltan = []
+    vistos = set()
+    for f in filas:
+        try:
+            for p in json.loads(f["participantes"]):
+                perfil = p.get("perfil", "")
+                if (perfil and perfil not in tengo and perfil not in en_cola
+                        and perfil not in vistos):
+                    vistos.add(perfil)
+                    faltan.append(perfil)
+                    if len(faltan) >= tope:
+                        break
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(faltan) >= tope:
+            break
+
+    return faltan
+
+def _completar_lo_que_falta():
+    """
+    Las carreras guardadas antes de tener la tabla de fichas quedaron
+    incompletas: no guardaron ni el perfil de cada caballo ni su campaña.
+    Asi no sirven para afinar.
+
+    Esto las vuelve a poner en la cola para visitarlas de nuevo. Al
+    reabrirlas se guardan completas y ademas se anotan sus caballos, que
+    es de donde sale la campaña.
+
+    NO SE BORRA NADA: lo que hay se conserva y se completa encima.
+    """
+    # MEMORIA: antes traia las 16.188 carreras enteras. Ahora la base
+    # contesta solo las que no tienen el perfil de ningun caballo.
+    try:
+        con = db()
+        a_rehacer = [f["url"] for f in con.execute("""
+            SELECT url FROM historico h
+            WHERE json_valid(h.participantes)
+              AND json_array_length(h.participantes) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM json_each(h.participantes) j
+                  WHERE COALESCE(json_extract(j.value, '$.perfil'), '') != '')
+            ORDER BY rowid""").fetchall()]
+        con.close()
+    except Exception:
+        a_rehacer = _completar_a_la_vieja()
+        if a_rehacer is None:
+            return 0
+
+    if not a_rehacer:
+        return 0
+
+    # Se sacan de "hecho" para que se vuelvan a visitar.
+    try:
+        con = db()
+        for url in a_rehacer:
+            con.execute("""
+                INSERT INTO por_explorar(url, tipo, fecha, hecho, intentos, agregado_en)
+                VALUES(?,'carrera',?,0,0,?)
+                ON CONFLICT(url) DO UPDATE SET hecho=0, intentos=0
+            """, (url, meeting_date_from_url(url) or "",
+                  datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+    except Exception:
+        return 0
+
+    return len(a_rehacer)
+
+
+
+def _completar_a_la_vieja():
+    """La forma anterior, por si la base no entiende JSON."""
+    try:
+        con = db()
+        filas = con.execute(
+            "SELECT url, participantes FROM historico"
+        ).fetchall()
+        con.close()
+    except Exception:
+        return None
+
+    a_rehacer = []
+    for f in filas:
+        try:
+            ps = json.loads(f["participantes"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        # Si ninguno tiene perfil, esa carrera se guardo incompleta.
+        if ps and not any(p.get("perfil") for p in ps):
+            a_rehacer.append(f["url"])
+    return a_rehacer
+
+def _sembrar_si_hace_falta():
+    """
+    Si la cola esta vacia, se arranca con los caballos que corren hoy.
+    Cada uno tiene su campaña, y de ahi sale todo lo demas.
+    """
+    if _contar_pendientes() > 0:
+        return
+    try:
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+    except Exception:
+        return
+    for reunion in calendario[:4]:
+        try:
+            soup = fetch(reunion["url"])
+            for c in extract_races_from_meeting(soup)[:3]:
+                data = parse_race(soup, c["numero"])
+                if not data:
+                    continue
+                for p in data.get("participantes", [])[:6]:
+                    if p.get("perfil"):
+                        _sumar_a_la_cola(p["perfil"], "caballo")
+        except Exception:
+            continue
+
+
+def trabajar_una_tanda(cuantos=None, forzar=False):
+    """
+    Hace un poco de trabajo del historico y vuelve enseguida.
+
+    Por que en tandas y no una tarea permanente: el servidor de Render
+    reinicia su proceso cada tanto y MATA cualquier tarea de fondo.
+    Una tarea que corre para siempre nunca sobrevive ahi. Una tanda
+    corta, en cambio, siempre termina.
+
+    Se llama sola cuando alguien entra al panel, y desde el boton.
+    """
+    if not forzar:
+        if not _es_horario_de_recoleccion() or not ajuste("recoleccion_historico"):
+            return {"hecho": 0, "motivo": "fuera de horario o apagado"}
+
+    if HISTORICO.get("corriendo"):
+        return {"hecho": 0, "motivo": "ya hay una tanda en curso"}
+
+    if cuantos is None:
+        cuantos = int(os.getenv("TANDA_HISTORICO", "12"))
+
+    HISTORICO["corriendo"] = True
+    HISTORICO["frenado_por_el_sitio"] = False
+    hechos, fallos = 0, 0
+
+    try:
+        # Si no hay nada por hacer, se busca por donde empezar.
+        # Antes de nada, sumar las fichas que faltan de lo que ya hay.
+        # Es lo que le da al algoritmo el tiempo, la edad, el padre.
+        try:
+            # Primero completar las que quedaron a medias, despues las
+            # que faltan del todo.
+            viejas = _fichas_incompletas()
+            nuevas = _fichas_que_faltan()
+            if viejas or nuevas:
+                HISTORICO["ultimo"] = (
+                    f"Anotadas {nuevas} fichas nuevas y {viejas} para completar.")
+        except Exception:
+            pass
+
+        # Las tabuladas de los que corren van primero. Se resiembra
+        # sola cuando termino con las de ayer: asi cada dia entran las
+        # de la reunion nueva sin que nadie toque nada.
+        try:
+            if (os.getenv("TRAER_TABULADAS", "1") == "1"
+                    and _cuantas_prioritarias() == 0):
+                n = _anotar_tabuladas_que_faltan()
+                if n:
+                    HISTORICO["ultimo"] = f"Anotadas {n} tabuladas de los que corren."
+        except Exception:
+            pass
+
+        if _contar_pendientes() == 0:
+            try:
+                rehacer = _completar_lo_que_falta()
+                if rehacer:
+                    HISTORICO["ultimo"] = f"Completando {rehacer} carreras."
+                else:
+                    _sembrar_si_hace_falta()
+                    HISTORICO["ultimo"] = "Buscando por dónde empezar…"
+            except Exception:
+                pass
+
+        for _ in range(cuantos):
+            siguiente = _siguiente_de_la_cola()
+            if not siguiente:
+                HISTORICO["ultimo"] = "No queda nada por explorar."
+                break
+
+            url, tipo = siguiente["url"], siguiente["tipo"]
+            try:
+                con = db()
+                con.execute("UPDATE por_explorar SET intentos=intentos+1 WHERE url=?",
+                            (url,))
+                con.commit()
+                con.close()
+            except Exception:
+                pass
+
+            if tipo == "carrera":
+                r = guardar_carrera_historica(url)
+                if r >= 0:
+                    HISTORICO["carreras_guardadas"] += 1
+                    HISTORICO["ultimo"] = f"carrera guardada · {url[-38:]}"
+            else:
+                r = explorar_caballo(url)
+                if r >= 0:
+                    HISTORICO["caballos_vistos"] += 1
+                    HISTORICO["ultimo"] = f"caballo explorado · {url[-38:]}"
+
+            if r < 0:
+                fallos += 1
+                if fallos >= 3:
+                    HISTORICO["frenado_por_el_sitio"] = True
+                    HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
+                    break
+            else:
+                fallos = 0
+                hechos += 1
+
+            HISTORICO["pendientes"] = _contar_pendientes()
+            _pausa_prudente()
+    finally:
+        HISTORICO["corriendo"] = False
+
+    return {"hecho": hechos, "pendientes": _contar_pendientes()}
+
+
+def recolectar_historico():
+    """
+    Sigue existiendo por si el servidor permite tareas de fondo.
+    En Render no sobrevive, por eso ademas se trabaja en tandas.
+    """
+    time.sleep(120)
+
+    while True:
+        try:
+            if _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
+                trabajar_una_tanda(cuantos=40)
+
+            # El afinamiento va DESPUES del historico, de 7 a 9, nunca
+            # al mismo tiempo. Los dos juntos llegaban al limite de
+            # memoria y Render reiniciaba la app.
+            h = ahora_argentina().hour
+            hoy = hoy_argentina()
+            if (HORA_AFINAR <= h < HORA_AFINAR_FIN
+                    and not AJUSTE.get("corriendo")
+                    and AJUSTE.get("ultimo_dia") != hoy):
+                AJUSTE["ultimo_dia"] = hoy
+                if True:
+                    try:
+                        AJUSTE["corriendo"] = True
+                        AJUSTE["empezo"] = ahora_argentina().strftime("%H:%M:%S")
+                        r = ajustar_algoritmo()
+                        if r.get("ok"):
+                            HISTORICO["ultimo_ajuste"] = {
+                                "cuando": ahora_argentina().strftime("%Y-%m-%d %H:%M"),
+                                "ganador_antes": r["ganador_antes"],
+                                "ganador_ahora": r["ganador_ahora"],
+                                "carreras": r["carreras_usadas"],
+                                "cambios": len(r["cambios"]),
+                            }
+                    except Exception:
+                        pass
+                    finally:
+                        # Antes nunca se volvia a poner en False: despues
+                        # de la primera mañana quedaba "trabajando" para
+                        # siempre, no volvia a afinar solo hasta el proximo
+                        # deploy, y el boton del panel decia "ya se esta
+                        # afinando" sin estar haciendo nada.
+                        AJUSTE["corriendo"] = False
+                        AJUSTE["paso"] = ""
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+# Estado del ultimo afinamiento, para consultarlo sin esperar.
+# El afinamiento corre DESPUES del historico, para que no se pisen.
+HORA_AFINAR = int(os.getenv("HORA_AFINAR", "7"))
+HORA_AFINAR_FIN = int(os.getenv("HORA_AFINAR_FIN", "9"))
+
+AJUSTE = {"corriendo": False, "resultado": None, "empezo": "",
+          "paso": "", "hechas": 0, "total": 0, "ultimo_cambio": "",
+          "ultimo_dia": ""}
+
+
+def _afinar_en_segundo_plano():
+    """
+    Afina sin hacer esperar a la pantalla.
+
+    OJO: Render MATA las tareas de fondo cada tanto. Por eso el avance
+    se va guardando: si lo corta, al volver a tocar Afinar sigue donde
+    quedo en vez de empezar de nuevo. Antes se quedaba en "Probando"
+    para siempre y nunca terminaba.
+    """
+    AJUSTE["corriendo"] = True
+    AJUSTE["empezo"] = ahora_argentina().strftime("%H:%M:%S")
+    AJUSTE["paso"] = "leyendo las carreras"
+    AJUSTE["hechas"] = 0
+    AJUSTE["total"] = 0
+    try:
+        AJUSTE["resultado"] = ajustar_algoritmo()
+    except Exception as e:
+        AJUSTE["resultado"] = {"ok": False, "motivo": str(e)[:200]}
+    finally:
+        AJUSTE["corriendo"] = False
+        AJUSTE["paso"] = ""
+
+
+@app.route("/api/admin/ajustar", methods=["GET", "POST"])
+def admin_ajustar():
+    """
+    Arranca el afinamiento y contesta enseguida. El trabajo sigue en el
+    servidor; el resultado se consulta con /api/admin/ajuste-estado.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if AJUSTE["corriendo"]:
+        return jsonify(ok=True, corriendo=True,
+                       mensaje="Ya se está afinando. Esperá un momento.")
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    con.close()
+    if n < 60:
+        return jsonify(ok=False,
+                       error=f"Solo hay {n} carreras, hacen falta 60."), 400
+
+    AJUSTE["resultado"] = None
+    threading.Thread(target=_afinar_en_segundo_plano, daemon=True).start()
+    return jsonify(ok=True, corriendo=True,
+                   mensaje=(f"Afinando contra {n} carreras. Puede tardar "
+                            "unos minutos. Podés cerrar esta página: "
+                            "el servidor sigue trabajando."))
+
+
+@app.get("/api/admin/ajuste-estado")
+def admin_ajuste_estado():
+    """Cómo va el afinamiento, o cómo terminó."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    r = AJUSTE["resultado"]
+    if AJUSTE["corriendo"]:
+        hechas = AJUSTE.get("hechas", 0)
+        total = AJUSTE.get("total", 0)
+        return jsonify(
+            ok=True, corriendo=True, empezo=AJUSTE["empezo"],
+            hechas=hechas, total=total,
+            paso=AJUSTE.get("paso", ""),
+            ultimo_cambio=AJUSTE.get("ultimo_cambio", ""),
+            mensaje=((f"Va {hechas} de {total} variables. "
+                      f"Ahora: {AJUSTE.get('paso','')}."
+                      + (f" Último cambio: {AJUSTE['ultimo_cambio']}."
+                         if AJUSTE.get("ultimo_cambio") else ""))
+                     if total else "Leyendo las carreras…"))
+    if not r:
+        return jsonify(ok=True, corriendo=False, sin_datos=True,
+                       mensaje="Todavía no se afinó nada en esta sesión.")
+    if not r.get("ok"):
+        # Que no haya novedades no es un error: es que no hace falta.
+        if r.get("sin_novedades"):
+            return jsonify(ok=True, corriendo=False, sin_novedades=True,
+                           mensaje=r.get("motivo", ""))
+        return jsonify(ok=False, corriendo=False,
+                       error=r.get("motivo", "No se pudo afinar.")), 400
+
+    d = dict(r)
+    d.pop("ok", None)
+    return jsonify(ok=True, corriendo=False, **d,
+                   mensaje=(f"Listo. Probado contra {d['carreras_usadas']} "
+                            f"carreras y {d.get('fichas_completas', 0)} de "
+                            f"{d.get('fichas_guardadas', 0)} fichas completas. "
+                            f"Acierto del GANADOR: "
+                            f"{d['ganador_antes']}% → {d['ganador_ahora']}%. "
+                            f"Entre los cuatro: {d['top4_antes']}% → "
+                            f"{d['top4_ahora']}%. "
+                            f"Se cambiaron {len(d['cambios'])} pesos y se "
+                            f"descartaron {len(d['descartados_por_casualidad'])} "
+                            "que mejoraban en un grupo pero no en el otro."))
+
+
+@app.get("/api/admin/ajustar-directo")
+def admin_ajustar_directo():
+    """El afinamiento esperando la respuesta. Solo para pruebas."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    r = ajustar_algoritmo()
+    if not r.get("ok"):
+        return jsonify(ok=False, error=r.get("motivo", "No se pudo ajustar.")), 400
+    # El resultado ya trae su propio "ok", asi que se saca antes de
+    # armar la respuesta. Si no, Flask lo recibe dos veces y falla.
+    r.pop("ok", None)
+    return jsonify(ok=True, **r,
+                   mensaje=(f"Probado contra {r['carreras_usadas']} carreras. "
+                            f"Acierto del GANADOR: {r['ganador_antes']}% → "
+                            f"{r['ganador_ahora']}%. "
+                            f"Entre los cuatro: {r['top4_antes']}% → "
+                            f"{r['top4_ahora']}%. "
+                            f"Se cambiaron {len(r['cambios'])} pesos. "
+                            f"Se descartaron {len(r['descartados_por_casualidad'])} "
+                            f"que mejoraban en un grupo pero no en el otro."))
+
+
+@app.route("/api/admin/historico-arrancar", methods=["GET", "POST"])
+def admin_historico_arrancar():
+    """Arranca el historico ahora, sin esperar a la madrugada."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    A_MANO["prendido"] = True
+    A_MANO["desde"] = ahora_argentina().strftime("%H:%M")
+
+    # Arranca a trabajar YA, sin esperar nada.
+    threading.Thread(target=trabajar_una_tanda,
+                     kwargs={"forzar": True}, daemon=True).start()
+
+    return jsonify(ok=True, prendido=True,
+                   mensaje=("Arrancando. Va a juntar carreras hasta que lo "
+                            "pares. Podés cerrar esta página."))
+
+
+@app.route("/api/admin/historico-parar", methods=["GET", "POST"])
+def admin_historico_parar():
+    """Para el historico. Vuelve a su horario de 3 a 7."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    A_MANO["prendido"] = False
+    A_MANO["desde"] = None
+    return jsonify(ok=True, prendido=False,
+                   mensaje="Parado. Vuelve a arrancar solo a las 3 de la mañana.")
+
+
+@app.route("/api/admin/historico-limpiar", methods=["GET", "POST"])
+def admin_historico_limpiar():
+    """
+    Borra lo juntado y arranca de cero. Se usa cuando lo guardado quedo
+    incompleto y no sirve para afinar.
+    NO toca usuarios, condiciones ni nada cargado a mano.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    con.execute("DELETE FROM historico")
+    con.execute("DELETE FROM fichas")
+    con.execute("DELETE FROM por_explorar")
+    # Los pronosticos que salieron de ahi se hicieron sin la campaña,
+    # asi que no valen para medir.
+    con.execute("DELETE FROM pronosticos WHERE url LIKE '%/reuniones/carrera/%'")
+    con.commit()
+    con.close()
+
+    HISTORICO.update({
+        "carreras_guardadas": 0, "caballos_vistos": 0,
+        "pendientes": 0, "ultimo": "Se empezó de cero.",
+        "frenado_por_el_sitio": False,
+    })
+    return jsonify(ok=True, borradas=n,
+                   mensaje=(f"Se borraron {n} carreras. Tus usuarios y lo "
+                            "cargado a mano no se tocaron. Tocá «Arrancar» "
+                            "para empezar de nuevo."))
+
+
+@app.get("/api/admin/diag-historico")
+def admin_diag_historico():
+    """
+    Muestra paso a paso que pasa cuando el historico intenta arrancar.
+    Sirve para ver donde se traba, sin adivinar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    informe = {
+        "prendido_a_mano": A_MANO["prendido"],
+        "desde": A_MANO["desde"],
+        "en_horario": _es_horario_de_recoleccion(),
+        "hora_argentina": hora_argentina(),
+        "interruptor_del_panel": ajuste("recoleccion_historico"),
+        "estado": dict(HISTORICO),
+    }
+
+    con = db()
+    informe["en_la_base"] = {
+        "carreras": con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"],
+        "fichas": con.execute("SELECT COUNT(*) c FROM fichas").fetchone()["c"],
+        "cola_pendiente": con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=0").fetchone()["c"],
+        "cola_hecha": con.execute(
+            "SELECT COUNT(*) c FROM por_explorar WHERE hecho=1").fetchone()["c"],
+    }
+    con.close()
+
+    # Probar de verdad cada paso, sin guardar nada.
+    pasos = []
+
+    # 1) ¿Se puede abrir el calendario?
+    try:
+        soup = fetch(BASE + "/reuniones")
+        reuniones = calendar_from_meetings(soup)
+        pasos.append({
+            "paso": "1. abrir el calendario",
+            "ok": True,
+            "reuniones": len(reuniones),
+            "ejemplos": [f"{r['fecha']} {r['hipodromo']}" for r in reuniones[:3]],
+        })
+    except Exception as e:
+        reuniones = []
+        pasos.append({"paso": "1. abrir el calendario", "ok": False,
+                      "error": str(e)[:150]})
+
+    # 2) ¿Se puede abrir una reunion y sacar sus carreras?
+    if reuniones:
+        try:
+            soup = fetch(reuniones[0]["url"])
+            carreras = extract_races_from_meeting(soup)
+            pasos.append({
+                "paso": "2. abrir una reunion",
+                "ok": bool(carreras),
+                "carreras": len(carreras),
+            })
+        except Exception as e:
+            carreras = []
+            pasos.append({"paso": "2. abrir una reunion", "ok": False,
+                          "error": str(e)[:150]})
+
+        # 3) ¿Se pueden leer los participantes y sus fichas?
+        if carreras:
+            try:
+                data = parse_race(soup, carreras[0]["numero"])
+                ps = (data or {}).get("participantes", [])
+                con_perfil = [p for p in ps if p.get("perfil")]
+                pasos.append({
+                    "paso": "3. leer los participantes",
+                    "ok": bool(con_perfil),
+                    "participantes": len(ps),
+                    "con_ficha": len(con_perfil),
+                    "ejemplo": con_perfil[0]["perfil"] if con_perfil else "",
+                })
+            except Exception as e:
+                pasos.append({"paso": "3. leer los participantes", "ok": False,
+                              "error": str(e)[:150]})
+
+    informe["pasos"] = pasos
+    informe["DIAGNOSTICO"] = (
+        "Todo bien: debería estar juntando."
+        if all(p.get("ok") for p in pasos) and pasos
+        else "Falla en alguno de los pasos de arriba."
+    )
+    return jsonify(ok=True, **informe)
+
+
+@app.route("/api/admin/traer-carreras", methods=["GET", "POST"])
+def admin_traer_carreras():
+    """
+    Trae ahora todas las carreras publicadas y las deja guardadas.
+    Lo mismo que hace sola de madrugada.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if ADELANTO["trabajando"]:
+        return jsonify(ok=True, trabajando=True,
+                       mensaje="Ya se están trayendo. Esperá un momento.")
+
+    forzar = request.args.get("forzar") == "1"
+    threading.Thread(target=traer_las_que_vienen,
+                     kwargs={"forzar": forzar}, daemon=True).start()
+    return jsonify(ok=True, trabajando=True,
+                   mensaje=("Trayendo las carreras que vienen. "
+                            "Podés cerrar esta página."))
+
+
+@app.get("/api/admin/carreras-guardadas")
+def admin_carreras_guardadas():
+    """Cuantas carreras hay guardadas y listas para el usuario."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    hoy = hoy_argentina()
+    try:
+        calendario, _ = con_cache("calendario", TTL_CALENDARIO, False,
+                                  lambda: calendario_completo())
+    except Exception:
+        calendario = []
+
+    proximas = [r for r in (calendario or []) if r["fecha"] >= hoy]
+    por_fecha = {}
+    for r in proximas:
+        f = r["fecha"]
+        clave = f"reuniones:{f}:{normalize_text(r['hipodromo'])}"
+        guardado, _ = cache_get(clave, TTL_REUNION)
+        cuantas, listas, por_revisar = 0, 0, 0
+        if guardado:
+            for x in guardado:
+                for c in x.get("carreras", []):
+                    cuantas += 1
+                    cc = f"carrera:{r['url']}:{c['numero']}"
+                    g, _ = cache_get(cc, TTL_CARRERA)
+                    # LISTA = la tenemos guardada, el usuario la abre al
+                    # instante. Que hayan pasado 40 minutos no la borra:
+                    # solo significa que en la proxima pasada se revisa
+                    # por si hubo un retiro. Antes se contaban como
+                    # "no listas" y el panel mostraba 0 de 114.
+                    if g is not None:
+                        listas += 1
+                        _, fresca = cache_get(cc, _cuanto_vale_guardada(g, f))
+                        if not fresca:
+                            por_revisar += 1
+        por_fecha.setdefault(f, {"fecha": f, "reuniones": [], "carreras": 0,
+                                 "listas": 0, "por_revisar": 0})
+        por_fecha[f]["reuniones"].append(_limpiar_nombre_hipodromo(r["hipodromo"]))
+        por_fecha[f]["carreras"] += cuantas
+        por_fecha[f]["listas"] += listas
+        por_fecha[f]["por_revisar"] += por_revisar
+
+    fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"])
+    return jsonify(ok=True, hoy=hoy, fechas=fechas,
+                   dias_publicados=len(fechas),
+                   estado=ADELANTO,
+                   tabuladas=TABULADAS,
+                   espera_segundos=ESPERA_RESPUESTA)
+
+
+@app.get("/api/admin/historico")
+def admin_historico():
+    """
+    Cuanto se lleva juntado. Ademas ADELANTA TRABAJO: cada vez que se
+    consulta, hace una tanda corta. Asi el historico avanza aunque el
+    servidor mate las tareas de fondo, que es lo que pasa en Render.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    # Una tanda en segundo plano, para no hacer esperar a la pantalla.
+    try:
+        if (_es_horario_de_recoleccion() and ajuste("recoleccion_historico")
+                and not HISTORICO.get("corriendo")):
+            threading.Thread(target=trabajar_una_tanda, daemon=True).start()
+    except Exception:
+        pass
+    con = db()
+    total = con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"]
+    pend = con.execute("SELECT COUNT(*) c FROM por_explorar WHERE hecho=0").fetchone()["c"]
+    hechos = con.execute("SELECT COUNT(*) c FROM por_explorar WHERE hecho=1").fetchone()["c"]
+    por_anio = con.execute("""
+        SELECT substr(fecha,1,4) anio, COUNT(*) c FROM historico
+        WHERE fecha IS NOT NULL AND fecha != ''
+        GROUP BY anio ORDER BY anio DESC
+    """).fetchall()
+    ultimas = con.execute("""
+        SELECT fecha, hipodromo, numero FROM historico
+        ORDER BY guardado_en DESC LIMIT 10
+    """).fetchall()
+    con.close()
+    return jsonify(
+        ok=True,
+        carreras_guardadas=total,
+        por_visitar=pend,
+        ya_visitados=hechos,
+        por_anio=[dict(p) for p in por_anio],
+        ultimas=[dict(u) for u in ultimas],
+        horario=f"{HORA_INICIO_RECOLECCION}:00 a {HORA_FIN_RECOLECCION}:00",
+        en_horario=_es_horario_de_recoleccion(),
+        encendido=ajuste("recoleccion_historico"),
+        estado=HISTORICO,
+    )
+
+
+# ============================================================
+# COPIA DE SEGURIDAD
+# El disco de Render puede fallar o borrarse. Todo lo que junto la app
+# (usuarios, pronosticos, el algoritmo aprendido, el historico) se puede
+# bajar en un solo archivo y guardar en un pendrive.
+# ============================================================
+
+# Lo que NO se respalda: se puede volver a traer del sitio, y ocuparia
+# espacio de mas.
+TABLAS_QUE_NO_VAN = {"cache", "sqlite_sequence", "sesiones", "pedidos_clave"}
+
+
+@app.route("/api/admin/copia", methods=["GET", "POST"])
+def admin_copia():
+    """
+    Arma un archivo con todo lo importante y lo manda para descargar.
+    Se puede abrir directo desde la barra de direccion.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+
+    con = db()
+    tablas = [f["name"] for f in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+
+    copia = {
+        "app": "LEA WIN IA",
+        "version": 1,
+        "hecha_en": datetime.now().isoformat(timespec="seconds"),
+        "fecha_argentina": hoy_argentina(),
+        "tablas": {},
+    }
+
+    for t in tablas:
+        if t in TABLAS_QUE_NO_VAN:
+            continue
+        try:
+            filas = con.execute(f"SELECT * FROM {t}").fetchall()
+            copia["tablas"][t] = [dict(f) for f in filas]
+        except Exception:
+            continue
+    con.close()
+
+    # Un resumen arriba, para saber de un vistazo que trae.
+    copia["resumen"] = {t: len(v) for t, v in copia["tablas"].items() if v}
+
+    texto = json.dumps(copia, ensure_ascii=False, indent=1)
+    nombre = f"lea-win-ia-{hoy_argentina()}.json"
+
+    return Response(
+        texto,
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}"'},
+    )
+
+
+@app.get("/api/admin/copia-resumen")
+def admin_copia_resumen():
+    """Cuanto pesa y que trae la copia, sin bajarla."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    tablas = [f["name"] for f in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    resumen, total = {}, 0
+    for t in tablas:
+        if t in TABLAS_QUE_NO_VAN:
+            continue
+        try:
+            n = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+            if n:
+                resumen[t] = n
+                total += n
+        except Exception:
+            continue
+    con.close()
+
+    # Cuanto ocupa el archivo de la base, para dar una idea del tamaño.
+    try:
+        tam = os.path.getsize(DB)
+    except Exception:
+        tam = 0
+
+    return jsonify(ok=True, resumen=resumen, filas_totales=total,
+                   tamano_mb=round(tam / 1024 / 1024, 2))
+
+
+@app.post("/api/admin/restaurar")
+def admin_restaurar():
+    """
+    Vuelve a poner los datos de una copia. Se usa solo si se perdio todo.
+    NO borra lo que ya hay: agrega lo que falte y respeta lo existente.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    if d.get("app") != "LEA WIN IA" or "tablas" not in d:
+        return jsonify(ok=False,
+                       error="Ese archivo no es una copia de esta app."), 400
+
+    con = db()
+    puestas, saltadas = {}, {}
+    for tabla, filas in d["tablas"].items():
+        if tabla in TABLAS_QUE_NO_VAN or not isinstance(filas, list) or not filas:
+            continue
+        # Solo tablas que de verdad existen, para no ejecutar cualquier cosa.
+        existe = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tabla,)
+        ).fetchone()
+        if not existe:
+            continue
+
+        columnas = [f[1] for f in con.execute(f"PRAGMA table_info({tabla})").fetchall()]
+        n_ok, n_no = 0, 0
+        for fila in filas:
+            if not isinstance(fila, dict):
+                continue
+            cols = [c for c in fila.keys() if c in columnas]
+            if not cols:
+                continue
+            marcas = ",".join("?" for _ in cols)
+            try:
+                con.execute(
+                    f"INSERT OR IGNORE INTO {tabla} ({','.join(cols)}) VALUES ({marcas})",
+                    [fila[c] for c in cols],
+                )
+                n_ok += 1
+            except Exception:
+                n_no += 1
+        puestas[tabla] = n_ok
+        if n_no:
+            saltadas[tabla] = n_no
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, restauradas=puestas, con_problemas=saltadas,
+                   mensaje=("Copia restaurada. Lo que ya estaba se respetó, "
+                            "solo se agregó lo que faltaba."))
+
+
+# ============================================================
+# TERMINOS Y PRIVACIDAD
+# Hacen falta para cobrar y para publicar en cualquier tienda.
+# Los datos del responsable se cargan en Render, asi se cambian
+# sin tocar el codigo.
+# ============================================================
+
+DATOS_LEGALES = {
+    "responsable": os.getenv("LEGAL_RESPONSABLE", "Leandro Lencina"),
+    "ciudad": os.getenv("LEGAL_CIUDAD", "General Cabrera"),
+    "provincia": os.getenv("LEGAL_PROVINCIA", "Córdoba"),
+    "cp": os.getenv("LEGAL_CP", "5809"),
+    "whatsapp": os.getenv("LEGAL_WHATSAPP", "+54 9 3584 181338"),
+    "sitio": os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com"),
+}
+
+@app.get("/terminos")
+def pagina_terminos():
+    return render_template("terminos.html", fecha=FECHA_LEGALES, **DATOS_LEGALES)
+
+
+@app.get("/privacidad")
+def pagina_privacidad():
+    return render_template("privacidad.html", fecha=FECHA_LEGALES, **DATOS_LEGALES)
+
+
+@app.get("/api/buscar-fechas")
+def api_buscar_fechas():
+    """
+    Que fechas hay con carreras, para el calendario del buscador.
+    Junta lo que publica el sitio hoy y lo que junto el historico.
+    """
+    anio = request.args.get("anio", "")
+    mes = request.args.get("mes", "")
+
+    fechas = {}
+
+    # 1) Lo que el sitio publica ahora.
+    try:
+        # NADIE VA AL SITIO: el calendario guardado, sin vencimiento.
+        cal = lo_guardado("calendario") or []
+        for r in cal or []:
+            f = r["fecha"]
+            hip = _limpiar_nombre_hipodromo(r["hipodromo"])
+            fechas.setdefault(f, set()).add(hip)
+    except Exception:
+        pass
+
+    # 2) Lo que junto el historico, que es de donde salen las viejas.
+    try:
+        con = db()
+        for r in con.execute("""
+            SELECT DISTINCT fecha, hipodromo FROM historico
+            WHERE fecha IS NOT NULL AND fecha != ''
+        """).fetchall():
+            if r["hipodromo"]:
+                fechas.setdefault(r["fecha"], set()).add(r["hipodromo"])
+            else:
+                fechas.setdefault(r["fecha"], set())
+        con.close()
+    except Exception:
+        pass
+
+    # Si se pidio un mes, se filtra.
+    if anio and mes:
+        prefijo = f"{anio}-{int(mes):02d}-"
+        fechas = {f: h for f, h in fechas.items() if f.startswith(prefijo)}
+
+    # Que años y meses tienen algo, para armar el calendario.
+    anios = {}
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT DISTINCT substr(fecha,1,4) a, substr(fecha,6,2) m
+            FROM historico WHERE fecha IS NOT NULL AND fecha != ''
+        """).fetchall()
+        con.close()
+        for f in filas:
+            anios.setdefault(f["a"], set()).add(f["m"])
+    except Exception:
+        pass
+
+    # El mes de hoy siempre esta, porque el sitio lo publica.
+    hoy = hoy_argentina()
+    anios.setdefault(hoy[:4], set()).add(hoy[5:7])
+
+    return jsonify(
+        ok=True,
+        fechas=[{"fecha": f, "hipodromos": sorted(h)}
+                for f, h in sorted(fechas.items(), reverse=True)],
+        anios=[{"anio": a, "meses": sorted(m)} for a, m in sorted(anios.items(), reverse=True)],
+        hoy=hoy,
+    )
+
+
+@app.get("/api/carreras-de")
+def api_carreras_de():
+    """
+    Las carreras de una fecha e hipodromo. Primero busca en lo guardado
+    por el historico; si no esta, va al sitio.
+    """
+    fecha = clean(request.args.get("fecha", ""))
+    hip = clean(request.args.get("hipodromo", ""))
+    if not fecha:
+        return jsonify(ok=False, error="Falta la fecha."), 400
+
+    # 1) En lo guardado.
+    guardadas = []
+    try:
+        con = db()
+        q = "SELECT url, numero, distancia, pista, estado FROM historico WHERE fecha=?"
+        args = [fecha]
+        if hip:
+            q += " AND hipodromo=?"
+            args.append(hip)
+        for r in con.execute(q + " ORDER BY numero", args).fetchall():
+            guardadas.append({
+                "numero": r["numero"], "url": r["url"],
+                "distancia": r["distancia"], "pista": r["pista"],
+                "estado": r["estado"], "de": "guardada",
+            })
+        con.close()
+    except Exception:
+        pass
+
+    if guardadas:
+        return jsonify(ok=True, carreras=guardadas, fuente="histórico")
+
+    # 2) Si no esta en el historico, las reuniones que guardo la tarea de
+    #    las 2 de la mañana. NADIE VA AL SITIO (antes aca se hacia fetch).
+    try:
+        # NADIE VA AL SITIO: el calendario guardado, sin vencimiento.
+        cal = lo_guardado("calendario") or []
+        buscado = normalize_text(_limpiar_nombre_hipodromo(hip)) if hip else ""
+        for r in cal or []:
+            if r["fecha"] != fecha:
+                continue
+            if buscado and normalize_text(
+                    _limpiar_nombre_hipodromo(r["hipodromo"])) != buscado:
+                continue
+            cs = []
+            for nombre in {r["hipodromo"], _limpiar_nombre_hipodromo(r["hipodromo"])}:
+                for reu in lo_guardado(
+                        f"reuniones:{fecha}:{normalize_text(nombre)}") or []:
+                    if reu.get("url") == r["url"] and reu.get("carreras"):
+                        cs = reu["carreras"]
+            if cs:
+                return jsonify(ok=True, fuente="guardado", url=r["url"],
+                               hipodromo=_limpiar_nombre_hipodromo(r["hipodromo"]),
+                               carreras=[{**c, "de": "guardada"} for c in cs])
+    except Exception:
+        pass
+
+    return jsonify(ok=False,
+                   error=("No hay carreras guardadas de esa fecha. "
+                          "Las fechas viejas se van completando a medida "
+                          "que el histórico avanza."),
+                   carreras=[]), 404
+
+
+# ============================================================
+# SUSCRIPCION Y COBRO
+# El cobro lo hace Mercado Pago. Nosotros nunca vemos la tarjeta.
+# Las claves se cargan en Render, para no dejarlas en el codigo.
+#
+# Como funciona:
+#   - Cualquiera crea su cuenta gratis
+#   - Sin pagar ve solo la carrera del dia, como el que no tiene cuenta
+#   - Pagando ve todo
+#   - Si deja de pagar, la cuenta queda y vuelve a ver solo la del dia
+# ============================================================
+
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+MP_PUBLIC_KEY = os.getenv("MP_PUBLIC_KEY", "")
+MP_API = "https://api.mercadopago.com"
+
+DIAS_DE_GRACIA = int(os.getenv("DIAS_DE_GRACIA", "3"))
+
+# ---------- LOS PLANES ----------
+# Los precios se cambian desde Render, sin tocar el codigo:
+#   PRECIO_MENSUAL   el plan normal
+#   PRECIO_PREMIUM   el plan a medida
+PRECIO_MENSUAL = float(os.getenv("PRECIO_MENSUAL", "2400"))
+PRECIO_PREMIUM = float(os.getenv("PRECIO_PREMIUM", "24000"))
+
+# El WhatsApp al que se manda al premium. Se cambia desde Render.
+WHATSAPP_PREMIUM = os.getenv("LEGAL_WHATSAPP", "+54 9 3584 181338")
+
+
+def _solo_numeros(t):
+    return re.sub(r"\D", "", t or "")
+
+
+PLANES_DE_FABRICA = [
+    {
+        "clave": "gratis",
+        "nombre": "Gratis",
+        "precio": 0,
+        "resumen": "Para probar cómo trabaja la app",
+        "incluye": [
+            "La carrera que está por correrse",
+            "El pronóstico de esa carrera, con sus motivos",
+        ],
+        "no_incluye": [
+            "El resto de las carreras del día",
+            "Las fechas anteriores y las que vienen",
+        ],
+    },
+    {
+        "clave": "normal",
+        "nombre": "Normal",
+        "precio": PRECIO_MENSUAL,
+        "resumen": "Todo lo que la app sabe hacer",
+        "incluye": [
+            "Todas las carreras, de todas las fechas",
+            "Buscador de caballos con su campaña completa",
+            "Avisos al celular cuando tu caballo corre",
+            "Cargar tus propios datos del paddock",
+            "Videos y tabuladas de cada carrera",
+            "Participar en los torneos de pronóstico",
+        ],
+        "no_incluye": [],
+    },
+    {
+        "clave": "premium",
+        "nombre": "Premium",
+        "precio": PRECIO_PREMIUM,
+        "resumen": "Una app armada para vos",
+        "incluye": [
+            "Todo lo del plan Normal",
+            "Tu propio panel, con tus números",
+            "Pronósticos armados a tu medida",
+            "Datos de caballos para comprar",
+            "Atención directa por WhatsApp",
+        ],
+        "no_incluye": [],
+        "destacado": True,
+    },
+]
+
+def planes_actuales():
+    """
+    Los planes tal como se ven hoy. Se parte de los de fabrica y se
+    aplica encima lo que el admin haya cambiado desde el panel.
+    Asi se pueden tocar precios y textos sin publicar nada.
+    """
+    planes = [dict(p) for p in PLANES_DE_FABRICA]
+    try:
+        con = db()
+        filas = con.execute("SELECT * FROM planes").fetchall()
+        con.close()
+    except Exception:
+        return planes
+
+    cambios = {f["clave"]: dict(f) for f in filas}
+    for p in planes:
+        ch = cambios.get(p["clave"])
+        if not ch:
+            continue
+        if ch.get("nombre"):
+            p["nombre"] = ch["nombre"]
+        if ch.get("resumen"):
+            p["resumen"] = ch["resumen"]
+        if ch.get("precio") is not None:
+            p["precio"] = float(ch["precio"])
+        for campo in ("incluye", "no_incluye"):
+            if ch.get(campo) is not None:
+                p[campo] = [l.strip() for l in str(ch[campo]).split("\n")
+                            if l.strip()]
+    return planes
+
+
+def plan_por_clave(clave):
+    for p in planes_actuales():
+        if p["clave"] == clave:
+            return p
+    return None
+
+
+def precio_de(clave):
+    p = plan_por_clave(clave)
+    return float(p["precio"]) if p else PRECIO_MENSUAL
+
+
+def _lo_que_incluye():
+    """Lo del plan normal, para el aviso de cuando falta suscripcion."""
+    p = plan_por_clave("normal")
+    return p["incluye"] if p else []
+
+
+def hay_cobro():
+    """Si no estan las claves, el cobro esta apagado y todo sigue gratis."""
+    return bool(MP_ACCESS_TOKEN)
+
+
+def _mp(metodo, ruta, datos=None):
+    """Habla con Mercado Pago. Devuelve (salio_bien, respuesta)."""
+    if not MP_ACCESS_TOKEN:
+        return False, {"error": "faltan las claves de Mercado Pago"}
+    cab = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        if metodo == "POST":
+            r = requests.post(MP_API + ruta, headers=cab, json=datos, timeout=(5, 20))
+        else:
+            r = requests.get(MP_API + ruta, headers=cab, timeout=(5, 20))
+        try:
+            cuerpo = r.json()
+        except ValueError:
+            cuerpo = {"texto": r.text[:300]}
+        return r.status_code < 300, cuerpo
+    except Exception as e:
+        return False, {"error": str(e)[:200]}
+
+
+def suscripcion_de(usuario_id):
+    """La suscripcion de un usuario, o None."""
+    if not usuario_id:
+        return None
+    try:
+        con = db()
+        f = con.execute("SELECT * FROM suscripciones_pago WHERE usuario_id=?",
+                        (usuario_id,)).fetchone()
+        con.close()
+        return dict(f) if f else None
+    except Exception:
+        return None
+
+
+def esta_al_dia(usuario_id):
+    """
+    Dice si ese usuario puede ver todo.
+    Si el cobro esta apagado, TODOS pueden: asi la app sigue andando
+    igual que antes hasta que se prenda de verdad.
+    """
+    if not hay_cobro():
+        return True
+    s = suscripcion_de(usuario_id)
+    if not s or not s.get("paga_hasta"):
+        return False
+
+    # Los dias de gracia son para el que PAGA, por si el cobro se demora.
+    # La prueba gratis NO los tiene: dura solo ese dia, hasta las 23:59.
+    gracia = 0 if s.get("estado") == "prueba" else DIAS_DE_GRACIA
+    try:
+        limite = (datetime.strptime(s["paga_hasta"], "%Y-%m-%d")
+                  + timedelta(days=gracia)).strftime("%Y-%m-%d")
+    except ValueError:
+        return False
+    return hoy_argentina() <= limite and s.get("estado") != "cancelada"
+
+
+def puede_ver_todo():
+    """El que mira la pantalla, ¿puede ver todo?"""
+    if es_admin():
+        return True
+    u = usuario_actual()
+    return bool(u) and esta_al_dia(u["id"])
+
+
+@app.get("/api/mi-suscripcion")
+def api_mi_suscripcion():
+    """Como esta mi suscripcion, para mostrarlo en la app."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, ingresado=False, al_dia=False,
+                       cobro_prendido=hay_cobro(),
+                       planes=planes_actuales(), mi_plan="gratis",
+                       precio=precio_de("normal"),
+                       incluye=_lo_que_incluye())
+
+    s = suscripcion_de(u["id"]) or {}
+    al_dia = esta_al_dia(u["id"])
+    # Que plan tiene hoy: si no paga, el gratis.
+    mi_plan = (s.get("plan") or "normal") if al_dia else "gratis"
+
+    return jsonify(
+        ok=True, ingresado=True,
+        al_dia=al_dia,
+        cobro_prendido=hay_cobro(),
+        es_admin=es_admin(),
+        estado=s.get("estado", "sin_suscripcion"),
+        paga_hasta=s.get("paga_hasta", ""),
+        ultimo_pago=s.get("ultimo_pago", ""),
+        mi_plan=mi_plan,
+        planes=planes_actuales(),
+        whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
+        precio=precio_de("normal"),
+        incluye=_lo_que_incluye(),
+    )
+
+
+def _guardar_contacto(usuario_id, correo="", quiere_avisos=True):
+    """
+    Guarda el correo de quien se suscribe, junto a su telefono.
+    Sirve para poder avisarle de novedades o de un problema con el pago.
+    """
+    try:
+        con = db()
+        f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                        (usuario_id,)).fetchone()
+        tel = f["telefono"] if f else ""
+        ahora = datetime.now().isoformat(timespec="seconds")
+        con.execute("""
+            INSERT INTO contactos(usuario_id, correo, telefono, quiere_avisos,
+                                  guardado_en, actualizado_en)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(usuario_id) DO UPDATE SET
+              correo=COALESCE(NULLIF(excluded.correo,''), contactos.correo),
+              telefono=excluded.telefono,
+              actualizado_en=excluded.actualizado_en
+        """, (usuario_id, correo, tel, 1 if quiere_avisos else 0, ahora, ahora))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _cobro_de_una_vez(u, plan, clave_plan, sitio):
+    """
+    Cobro por unica vez, para el que no quiso dar su correo.
+
+    Mercado Pago no permite la suscripcion automatica sin un correo de
+    verdad. Asi que en ese caso se cobra un mes suelto: paga, tiene
+    acceso 30 dias, y despues vuelve a pagar cuando quiera.
+    """
+    datos = {
+        "items": [{
+            "title": f"LEA WIN IA — plan {plan['nombre']} (1 mes)",
+            "quantity": 1,
+            "unit_price": float(plan["precio"]),
+            "currency_id": "ARS",
+        }],
+        "external_reference": f"usuario-{u['id']}-{clave_plan}",
+        "back_urls": {
+            "success": f"{sitio}/suscripcion?pago=listo",
+            "pending": f"{sitio}/suscripcion?pago=pendiente",
+            "failure": f"{sitio}/suscripcion?pago=fallo",
+        },
+        "auto_return": "approved",
+        "notification_url": f"{sitio}/api/pago-aviso",
+        "statement_descriptor": "LEA WIN IA",
+    }
+
+    ok, r = _mp("POST", "/checkout/preferences", datos)
+    if not ok:
+        try:
+            print("=" * 60, flush=True)
+            print("MERCADO PAGO RECHAZO EL PAGO DE UNA VEZ", flush=True)
+            print(f"  se mando : {json.dumps(datos, ensure_ascii=False)}", flush=True)
+            print(f"  contesto : {json.dumps(r, ensure_ascii=False)}", flush=True)
+            print("=" * 60, flush=True)
+        except Exception:
+            pass
+        return jsonify(ok=False, error="No se pudo armar el cobro.",
+                       detalle=str(r)[:400]), 502
+
+    donde = r.get("init_point") or r.get("sandbox_init_point", "")
+    if not donde:
+        return jsonify(ok=False,
+                       error="Mercado Pago no devolvió la dirección de pago."), 502
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='pendiente', id_mercadopago=excluded.id_mercadopago,
+          monto=excluded.monto, plan=excluded.plan,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "pendiente", r.get("id", ""), float(plan["precio"]),
+          clave_plan, ahora, ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, pagar_en=donde, id=r.get("id", ""),
+                   plan=clave_plan, de_una_vez=True,
+                   aviso=("Vas a pagar un mes. Para que se te cobre solo "
+                          "cada mes, dejanos tu correo."))
+
+
+@app.post("/api/suscribirme")
+def api_suscribirme():
+    """
+    Arma el cobro en Mercado Pago y devuelve la direccion donde pagar.
+    El usuario sale de la app, paga, y vuelve.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Entrá a tu cuenta para suscribirte."), 401
+    if not hay_cobro():
+        return jsonify(ok=False,
+                       error="El cobro todavía no está habilitado."), 503
+
+    # Que plan quiere y con que correo. Si no dice nada, el normal.
+    d = request.get_json(silent=True) or {}
+    clave_plan = clean(d.get("plan", "")) or "normal"
+    plan = plan_por_clave(clave_plan)
+    if not plan or plan["precio"] <= 0:
+        return jsonify(ok=False, error="Ese plan no se puede pagar."), 400
+
+    # Si ya tiene el MISMO plan al dia, no tiene sentido pagar de nuevo.
+    s_actual = suscripcion_de(u["id"]) or {}
+    if esta_al_dia(u["id"]) and (s_actual.get("plan") or "normal") == clave_plan:
+        return jsonify(ok=False, ya_al_dia=True,
+                       error=f"Ya tenés el plan {plan['nombre']} al día."), 400
+
+    sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
+
+    # El correo decide COMO se cobra.
+    #
+    # Mercado Pago exige un correo de verdad para armar la suscripcion
+    # automatica: con uno inventado la rechaza ("guest_site_mismatch").
+    # Por eso:
+    #   - con correo  -> suscripcion, se le cobra solo cada mes
+    #   - sin correo  -> pago suelto, tiene que volver a pagar cada mes
+    correo = clean(d.get("correo", ""))[:120]
+    if correo and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", correo):
+        return jsonify(ok=False, error="Ese correo no parece válido."), 400
+
+    # Se guarda para el contacto, lo use o no para el cobro.
+    if correo:
+        _guardar_contacto(u["id"], correo)
+
+    if not correo:
+        return _cobro_de_una_vez(u, plan, clave_plan, sitio)
+
+    datos = {
+        "reason": f"LEA WIN IA — plan {plan['nombre']}",
+        "external_reference": f"usuario-{u['id']}-{clave_plan}",
+        "payer_email": correo,
+        "back_url": f"{sitio}/suscripcion",
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": float(plan["precio"]),
+            "currency_id": "ARS",
+        },
+        "status": "pending",
+    }
+
+    ok, r = _mp("POST", "/preapproval", datos)
+    if not ok:
+        # Queda anotado en los registros de Render para poder ver QUE
+        # rechazo Mercado Pago. Sin esto solo se sabia que fallo.
+        try:
+            print("=" * 60, flush=True)
+            print("MERCADO PAGO RECHAZO EL COBRO", flush=True)
+            print(f"  lo que se mando: {json.dumps(datos, ensure_ascii=False)}",
+                  flush=True)
+            print(f"  lo que contesto: {json.dumps(r, ensure_ascii=False)}",
+                  flush=True)
+            print("=" * 60, flush=True)
+        except Exception:
+            pass
+        return jsonify(ok=False, error="No se pudo armar el cobro.",
+                       detalle=str(r)[:400]), 502
+
+    donde_pagar = r.get("init_point") or r.get("sandbox_init_point", "")
+    if not donde_pagar:
+        return jsonify(ok=False, error="Mercado Pago no devolvió la dirección de pago.",
+                       detalle=str(r)[:300]), 502
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='pendiente', id_mercadopago=excluded.id_mercadopago,
+          monto=excluded.monto, plan=excluded.plan,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "pendiente", r.get("id", ""), float(plan["precio"]),
+          clave_plan, ahora, ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, pagar_en=donde_pagar, id=r.get("id", ""),
+                   plan=clave_plan)
+
+
+@app.get("/api/admin/probar-mercadopago")
+def admin_probar_mercadopago():
+    """
+    Prueba la conexion con Mercado Pago y muestra QUE contesta.
+    Sirve para ver el motivo exacto de un rechazo, sin adivinar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    informe = {
+        "claves_cargadas": bool(MP_ACCESS_TOKEN),
+        "empieza_con": MP_ACCESS_TOKEN[:8] if MP_ACCESS_TOKEN else "",
+        "tipo": ("produccion" if MP_ACCESS_TOKEN.startswith("APP_USR")
+                 else "prueba" if MP_ACCESS_TOKEN.startswith("TEST")
+                 else "desconocido"),
+    }
+
+    # 1) ¿La clave sirve?
+    ok, r = _mp("GET", "/users/me")
+    informe["1_la_clave_sirve"] = ok
+    if ok:
+        informe["cuenta"] = {k: r.get(k) for k in
+                             ("id", "nickname", "site_id", "email")}
+    else:
+        informe["error_de_la_clave"] = r
+
+    # 2) Probar armar un cobro de verdad
+    sitio = os.getenv("LEGAL_SITIO", "https://win-ia.onrender.com")
+    plan = plan_por_clave("normal") or {"nombre": "Normal", "precio": 1000}
+    prueba = {
+        "reason": f"LEA WIN IA — plan {plan['nombre']}",
+        "external_reference": "usuario-0-normal",
+        "payer_email": clean(request.args.get("correo", "")) or "test@test.com",
+        "back_url": f"{sitio}/suscripcion",
+        "auto_recurring": {
+            "frequency": 1, "frequency_type": "months",
+            "transaction_amount": float(plan["precio"]),
+            "currency_id": "ARS",
+        },
+        "status": "pending",
+    }
+    ok2, r2 = _mp("POST", "/preapproval", prueba)
+    informe["2_lo_que_se_manda"] = prueba
+    informe["2_se_pudo_armar"] = ok2
+    informe["2_lo_que_contesta"] = r2
+
+    if ok2 and r2.get("id"):
+        # Se cancela enseguida: era solo una prueba.
+        _mp("POST", f"/preapproval/{r2['id']}", {"status": "cancelled"})
+        informe["donde_pagaria"] = r2.get("init_point", "")
+
+    informe["QUE_PASA"] = (
+        "Todo bien: el cobro se puede armar." if ok2
+        else "Mercado Pago lo rechaza. Mirá 2_lo_que_contesta.")
+    return jsonify(ok=True, **informe)
+
+
+# ============================================================
+# BOTON DE ARREPENTIMIENTO
+# Lo exige la Resolucion 424/2020: el que compra por internet puede
+# arrepentirse dentro de los 10 dias y le devolves la plata.
+# Mercado Pago NO cobra comision por el pago devuelto, asi que
+# devolver no cuesta nada.
+# Una sola vez por usuario: despues el boton no aparece mas.
+# ============================================================
+
+DIAS_PARA_ARREPENTIRSE = int(os.getenv("DIAS_ARREPENTIRSE", "10"))
+
+
+def _puede_arrepentirse(usuario_id):
+    """
+    Devuelve (si_puede, motivo, dias_que_le_quedan).
+    """
+    s = suscripcion_de(usuario_id)
+    if not s:
+        return False, "No tenés ninguna compra.", 0
+    if s.get("se_arrepintio"):
+        return False, "Ya usaste tu derecho a arrepentirte una vez.", 0
+    if not s.get("ultimo_pago"):
+        return False, "Todavía no registramos ningún pago tuyo.", 0
+
+    try:
+        pago = datetime.strptime(str(s["ultimo_pago"])[:10], "%Y-%m-%d")
+        pasaron = (datetime.strptime(hoy_argentina(), "%Y-%m-%d") - pago).days
+    except ValueError:
+        return False, "No se pudo leer la fecha del pago.", 0
+
+    quedan = DIAS_PARA_ARREPENTIRSE - pasaron
+    if quedan <= 0:
+        return False, (f"Pasaron más de {DIAS_PARA_ARREPENTIRSE} días "
+                       "desde tu pago."), 0
+    return True, "", quedan
+
+
+@app.get("/api/puedo-arrepentirme")
+def api_puedo_arrepentirme():
+    """Si el botón le tiene que aparecer, y cuántos días le quedan."""
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=True, puede=False)
+    puede, motivo, quedan = _puede_arrepentirse(u["id"])
+    s = suscripcion_de(u["id"]) or {}
+    return jsonify(ok=True, puede=puede, motivo=motivo, dias=quedan,
+                   monto=s.get("monto"), dias_por_ley=DIAS_PARA_ARREPENTIRSE)
+
+
+@app.post("/api/arrepentirme")
+def api_arrepentirme():
+    """
+    El usuario se arrepiente. Se cancela la suscripcion, se le devuelve
+    la plata y queda anotado para que no lo pueda repetir.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, error="Entrá a tu cuenta."), 401
+
+    puede, motivo, _ = _puede_arrepentirse(u["id"])
+    if not puede:
+        return jsonify(ok=False, error=motivo), 400
+
+    s = suscripcion_de(u["id"]) or {}
+    monto = s.get("monto") or 0
+
+    # 1) Cortar el cobro, para que no se le siga descontando.
+    if s.get("id_mercadopago"):
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}",
+            {"status": "cancelled"})
+
+    # 2) Devolver la plata del ultimo pago.
+    devuelto = False
+    try:
+        con = db()
+        p = con.execute("""SELECT id FROM pagos
+                           WHERE usuario_id=? AND estado='approved'
+                           ORDER BY fecha DESC LIMIT 1""",
+                        (u["id"],)).fetchone()
+        con.close()
+        if p and p["id"]:
+            ok, r = _mp("POST", f"/v1/payments/{p['id']}/refunds", {})
+            devuelto = ok
+            if not ok:
+                print(f"NO SE PUDO DEVOLVER el pago {p['id']}: "
+                      f"{json.dumps(r, ensure_ascii=False)[:200]}", flush=True)
+    except Exception:
+        pass
+
+    # 3) Anotarlo: una sola vez por usuario.
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""UPDATE suscripciones_pago
+                   SET estado='cancelada', paga_hasta=NULL,
+                       se_arrepintio=1, arrepentido_en=?, monto_devuelto=?,
+                       actualizada_en=?
+                   WHERE usuario_id=?""",
+                (ahora, monto if devuelto else 0, ahora, u["id"]))
+    con.commit()
+    con.close()
+
+    # 4) Avisarle al admin.
+    try:
+        con = db()
+        admins = con.execute(
+            "SELECT id FROM usuarios WHERE es_admin=1").fetchall()
+        f = con.execute("SELECT usuario_visible FROM usuarios WHERE id=?",
+                        (u["id"],)).fetchone()
+        con.close()
+        quien = f["usuario_visible"] if f else "un usuario"
+        for a in admins:
+            avisar_a_usuario(
+                a["id"], f"{quien} se arrepintió de la compra",
+                (f"Se le devolvieron ${monto:,.0f}." if devuelto else
+                 f"Hay que devolverle ${monto:,.0f} a mano desde "
+                 "Mercado Pago."),
+                "/admin", "arrepentimiento")
+    except Exception:
+        pass
+
+    return jsonify(
+        ok=True, devuelto=devuelto,
+        mensaje=("Listo. Cancelamos tu suscripción y te devolvimos la "
+                 "plata. Puede tardar unos días en aparecer según cómo "
+                 "hayas pagado."
+                 if devuelto else
+                 "Listo. Cancelamos tu suscripción. La devolución se "
+                 "hace en las próximas horas; si tenés dudas, escribinos."))
+
+
+@app.post("/api/cancelar-suscripcion")
+def api_cancelar_suscripcion():
+    """
+    El usuario cancela cuando quiere, con un boton. Sigue teniendo acceso
+    hasta que termine el periodo que ya pago.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, error="Entrá a tu cuenta."), 401
+
+    s = suscripcion_de(u["id"])
+    if not s:
+        return jsonify(ok=False, error="No tenés ninguna suscripción."), 404
+
+    if s.get("id_mercadopago"):
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}", {"status": "cancelled"})
+
+    con = db()
+    con.execute("""UPDATE suscripciones_pago SET estado='cancelada',
+                   actualizada_en=? WHERE usuario_id=?""",
+                (datetime.now().isoformat(timespec="seconds"), u["id"]))
+    con.commit()
+    con.close()
+
+    hasta = s.get("paga_hasta", "")
+    return jsonify(ok=True, paga_hasta=hasta,
+                   mensaje=("Cancelaste la suscripción. " +
+                            (f"Seguís teniendo acceso hasta el {hasta}."
+                             if hasta else "No se te va a cobrar más.")))
+
+
+@app.route("/api/pago-aviso", methods=["GET", "POST"])
+def api_pago_aviso():
+    """
+    Mercado Pago avisa acá cada vez que pasa algo con un pago.
+    Nunca se confia en lo que llega: se vuelve a preguntar a Mercado Pago.
+    """
+    d = request.get_json(silent=True) or {}
+    tipo = (d.get("type") or request.args.get("type") or "").lower()
+    idd = str((d.get("data") or {}).get("id")
+              or request.args.get("data.id") or d.get("id") or "")
+
+    if not idd:
+        return jsonify(ok=True, nota="sin identificador"), 200
+
+    # Un pago suelto
+    if "payment" in tipo:
+        ok, pago = _mp("GET", f"/v1/payments/{idd}")
+        if ok:
+            _anotar_pago(pago)
+        return jsonify(ok=True), 200
+
+    # Una suscripcion que cambio de estado
+    if "preapproval" in tipo or "subscription" in tipo:
+        ok, sus = _mp("GET", f"/preapproval/{idd}")
+        if ok:
+            _actualizar_suscripcion(sus)
+        return jsonify(ok=True), 200
+
+    return jsonify(ok=True), 200
+
+
+def _usuario_de_referencia(ref):
+    """De 'usuario-7' o 'usuario-7-premium' saca el 7."""
+    m = re.match(r"usuario-(\d+)", str(ref or ""))
+    return int(m.group(1)) if m else None
+
+
+def _plan_de_referencia(ref):
+    """De 'usuario-7-premium' saca 'premium'. Si no dice, el normal."""
+    m = re.match(r"usuario-\d+-(\w+)", str(ref or ""))
+    clave = m.group(1) if m else "normal"
+    return clave if plan_por_clave(clave) else "normal"
+
+
+def _anotar_pago(pago):
+    """Guarda un pago y, si se aprobo, da un mes mas de acceso."""
+    uid = _usuario_de_referencia(pago.get("external_reference"))
+    estado = pago.get("status", "")
+    ahora = datetime.now().isoformat(timespec="seconds")
+
+    try:
+        con = db()
+        con.execute("""
+            INSERT OR REPLACE INTO pagos(id, usuario_id, monto, estado,
+                                         fecha, detalle, guardado_en)
+            VALUES(?,?,?,?,?,?,?)
+        """, (str(pago.get("id", "")), uid,
+              pago.get("transaction_amount"), estado,
+              pago.get("date_approved") or pago.get("date_created", ""),
+              json.dumps({k: pago.get(k) for k in
+                          ("payment_method_id", "payment_type_id", "description")},
+                         ensure_ascii=False),
+              ahora))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+    if estado == "approved" and uid:
+        _dar_un_mes(uid, pago.get("transaction_amount"),
+                    _plan_de_referencia(pago.get("external_reference")))
+
+
+def _dar_un_mes(usuario_id, monto=None, plan=None):
+    """Suma un mes de acceso desde hoy, o desde cuando vencia."""
+    s = suscripcion_de(usuario_id) or {}
+    plan = plan or s.get("plan") or "normal"
+    hoy = hoy_argentina()
+    desde = hoy
+    if s.get("paga_hasta") and s["paga_hasta"] > hoy:
+        desde = s["paga_hasta"]   # si le quedaban dias, se le suman
+
+    try:
+        hasta = (datetime.strptime(desde, "%Y-%m-%d")
+                 + timedelta(days=30)).strftime("%Y-%m-%d")
+    except ValueError:
+        hasta = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       ultimo_pago, monto, plan,
+                                       creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='al_dia', paga_hasta=excluded.paga_hasta,
+          ultimo_pago=excluded.ultimo_pago, plan=excluded.plan,
+          actualizada_en=excluded.actualizada_en
+    """, (usuario_id, "al_dia", hasta, hoy,
+          monto or precio_de(plan), plan, ahora, ahora))
+    con.commit()
+    con.close()
+
+    # Avisarle al celular que quedo al dia.
+    p = plan_por_clave(plan) or {}
+    try:
+        if plan == "premium":
+            avisar_a_usuario(
+                usuario_id, "Bienvenido al plan Premium",
+                ("Ya tenés tu acceso. Escribinos por WhatsApp para armar "
+                 "tu app a medida."),
+                "/suscripcion", "pago")
+        else:
+            avisar_a_usuario(usuario_id, "Suscripción al día",
+                             f"Tenés acceso completo hasta el {hasta}.",
+                             "/suscripcion", "pago")
+    except Exception:
+        pass
+    return hasta
+
+
+def _actualizar_suscripcion(sus):
+    """Cuando Mercado Pago avisa que una suscripcion cambio."""
+    uid = _usuario_de_referencia(sus.get("external_reference"))
+    if not uid:
+        return
+    estado_mp = (sus.get("status") or "").lower()
+    estado = {"authorized": "al_dia", "paused": "vencida",
+              "cancelled": "cancelada", "pending": "pendiente"}.get(estado_mp, estado_mp)
+
+    plan = _plan_de_referencia(sus.get("external_reference"))
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, id_mercadopago,
+                                       plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado=excluded.estado, id_mercadopago=excluded.id_mercadopago,
+          plan=excluded.plan, actualizada_en=excluded.actualizada_en
+    """, (uid, estado, str(sus.get("id", "")), plan,
+          datetime.now().isoformat(timespec="seconds"),
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+
+@app.get("/suscripcion")
+def pantalla_suscripcion():
+    """La pantalla donde se ve qué incluye y se paga."""
+    return render_template("suscripcion.html",
+                           planes=planes_actuales(),
+                           whatsapp=_solo_numeros(WHATSAPP_PREMIUM),
+                           cobro_prendido=hay_cobro())
+
+
+@app.post("/api/admin/quitar-acceso")
+def admin_quitar_acceso():
+    """
+    Le saca la suscripcion a alguien. La cuenta queda: puede entrar,
+    pero vuelve a ver solo la carrera que esta por correrse.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    f = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+
+    s = con.execute("SELECT id_mercadopago FROM suscripciones_pago WHERE usuario_id=?",
+                    (f["id"],)).fetchone()
+    con.close()
+
+    # Si estaba pagando por Mercado Pago, tambien se corta alla.
+    if s and s["id_mercadopago"]:
+        _mp("POST", f"/preapproval/{s['id_mercadopago']}", {"status": "cancelled"})
+
+    con = db()
+    con.execute("""UPDATE suscripciones_pago
+                   SET estado='cancelada', paga_hasta=NULL, actualizada_en=?
+                   WHERE usuario_id=?""",
+                (datetime.now().isoformat(timespec="seconds"), f["id"]))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True,
+                   mensaje=(f"{f['usuario_visible']} ya no tiene acceso. "
+                            "Su cuenta sigue existiendo."))
+
+
+@app.post("/api/admin/borrar-cuenta")
+def admin_borrar_cuenta():
+    """
+    Borra una cuenta del todo y deja libre su telefono.
+    Hace falta porque un telefono = una cuenta: sin esto, un numero
+    quedaria tomado para siempre.
+    Las carreras y pronosticos NO se tocan: no son datos de la persona.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    if not usuario:
+        return jsonify(ok=False, error="Falta el usuario."), 400
+
+    con = db()
+    f = con.execute("""SELECT id, usuario_visible, telefono, es_admin
+                       FROM usuarios WHERE usuario=?""",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+    if f["es_admin"]:
+        con.close()
+        return jsonify(ok=False,
+                       error="No se puede borrar una cuenta de admin."), 403
+
+    uid = f["id"]
+    # Todo lo que es de esa persona.
+    for tabla in ("sesiones", "suscripciones", "seguidos", "datos_caballo",
+                  "avisos_enviados", "pedidos_clave", "suscripciones_pago"):
+        try:
+            con.execute(f"DELETE FROM {tabla} WHERE usuario_id=?", (uid,))
+        except Exception:
+            pass
+    # El telefono queda libre para otra cuenta.
+    try:
+        con.execute("DELETE FROM pruebas_usadas WHERE usuario_id=?", (uid,))
+    except Exception:
+        pass
+    # Los pagos quedan, pero sin quedar ligados a nadie: hacen falta
+    # para la contabilidad.
+    try:
+        con.execute("UPDATE pagos SET usuario_id=NULL WHERE usuario_id=?", (uid,))
+    except Exception:
+        pass
+    con.execute("DELETE FROM usuarios WHERE id=?", (uid,))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, telefono_liberado=f["telefono"] or "",
+                   mensaje=(f"Se borró la cuenta de {f['usuario_visible']}. "
+                            "Su celular quedó libre para otra cuenta."))
+
+
+@app.post("/api/admin/dar-acceso")
+def admin_dar_acceso():
+    """
+    El admin le da acceso a alguien a mano: un regalo, una prueba,
+    o alguien que pago por fuera.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    usuario = clean(d.get("usuario", ""))
+    plan = clean(d.get("plan", "")) or "normal"
+    if not plan_por_clave(plan) or plan == "gratis":
+        plan = "normal"
+    try:
+        dias = int(d.get("dias", 30))
+    except (TypeError, ValueError):
+        dias = 30
+    dias = max(1, min(3650, dias))
+
+    con = db()
+    f = con.execute("SELECT id, usuario_visible FROM usuarios WHERE usuario=?",
+                    (normalize_text(usuario),)).fetchone()
+    if not f:
+        con.close()
+        return jsonify(ok=False, error="No existe ese usuario."), 404
+
+    hasta = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
+    ahora = datetime.now().isoformat(timespec="seconds")
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       monto, plan, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='al_dia', paga_hasta=excluded.paga_hasta,
+          plan=excluded.plan, actualizada_en=excluded.actualizada_en
+    """, (f["id"], "al_dia", hasta, 0, plan, ahora, ahora))
+    con.commit()
+    con.close()
+
+    nombre_plan = (plan_por_clave(plan) or {}).get("nombre", plan)
+    return jsonify(ok=True, hasta=hasta, plan=plan,
+                   mensaje=(f"{f['usuario_visible']} tiene el plan "
+                            f"{nombre_plan} hasta el {hasta}."))
+
+
+# ============================================================
+# PERIODO DE PRUEBA
+# El que crea cuenta puede probar todo GRATIS hasta las 23:59 de ese
+# dia, pero solo si estamos dentro del calendario de promocion que
+# el admin arma en el panel.
+# Un telefono = una sola prueba. Asi nadie se hace diez cuentas.
+# ============================================================
+
+def promocion_actual():
+    """Desde y hasta cuando hay prueba gratis."""
+    try:
+        con = db()
+        f = con.execute("SELECT desde, hasta FROM promocion WHERE id=1").fetchone()
+        con.close()
+        return dict(f) if f else {"desde": "", "hasta": ""}
+    except Exception:
+        return {"desde": "", "hasta": ""}
+
+
+def hay_promocion():
+    """Si hoy se puede pedir la prueba gratis."""
+    p = promocion_actual()
+    if not p.get("desde") or not p.get("hasta"):
+        return False
+    return p["desde"] <= hoy_argentina() <= p["hasta"]
+
+
+def ya_uso_la_prueba(telefono):
+    """Un telefono, una sola prueba."""
+    solo = _limpiar_telefono(telefono)
+    if not solo:
+        return False
+    try:
+        con = db()
+        f = con.execute("SELECT 1 FROM pruebas_usadas WHERE telefono=?",
+                        (solo,)).fetchone()
+        con.close()
+        return bool(f)
+    except Exception:
+        return False
+
+
+@app.get("/api/promocion")
+def api_promocion():
+    """Si hoy se puede probar gratis, y si YO ya la usé."""
+    p = promocion_actual()
+    u = usuario_actual()
+    usada = False
+    if u:
+        con = db()
+        f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                        (u["id"],)).fetchone()
+        con.close()
+        usada = ya_uso_la_prueba(f["telefono"] if f else "")
+    return jsonify(ok=True, hay=hay_promocion(),
+                   desde=p.get("desde", ""), hasta=p.get("hasta", ""),
+                   ya_la_use=usada)
+
+
+@app.post("/api/probar-gratis")
+def api_probar_gratis():
+    """
+    Da acceso completo hasta las 23:59 de HOY.
+    Solo si estamos en la semana de promocion y ese telefono nunca
+    la uso antes.
+    """
+    u = usuario_actual()
+    if not u:
+        return jsonify(ok=False, necesita_cuenta=True,
+                       error="Creá tu cuenta para probar."), 401
+
+    if not hay_promocion():
+        return jsonify(ok=False, sin_promocion=True,
+                       error=("Por ahora no hay prueba gratis. "
+                              "Suscribite para acceder a todo.")), 403
+
+    con = db()
+    f = con.execute("SELECT telefono FROM usuarios WHERE id=?",
+                    (u["id"],)).fetchone()
+    con.close()
+    tel = _limpiar_telefono(f["telefono"] if f else "")
+
+    if ya_uso_la_prueba(tel):
+        return jsonify(ok=False, ya_usada=True,
+                       error=("Ya usaste tu prueba gratis con este número. "
+                              "Suscribite para seguir viendo todo.")), 403
+
+    if esta_al_dia(u["id"]):
+        return jsonify(ok=False, error="Ya tenés acceso completo."), 400
+
+    # Hasta las 23:59 de hoy.
+    hasta = hoy_argentina()
+    ahora = datetime.now().isoformat(timespec="seconds")
+
+    con = db()
+    con.execute("""
+        INSERT INTO suscripciones_pago(usuario_id, estado, paga_hasta,
+                                       monto, creada_en, actualizada_en)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(usuario_id) DO UPDATE SET
+          estado='prueba', paga_hasta=excluded.paga_hasta,
+          actualizada_en=excluded.actualizada_en
+    """, (u["id"], "prueba", hasta, 0, ahora, ahora))
+    con.execute("""
+        INSERT OR IGNORE INTO pruebas_usadas(telefono, usuario_id, usada_en)
+        VALUES(?,?,?)
+    """, (tel, u["id"], ahora))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, hasta=hasta,
+                   mensaje=("Listo. Tenés acceso completo a todo hasta las "
+                            "23:59 de hoy. Después, suscribite para seguir."))
+
+
+@app.get("/api/admin/planes")
+def admin_ver_planes():
+    """Los planes como estan hoy, para editarlos en el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    planes = planes_actuales()
+    # Se manda tambien como estan de fabrica, para poder volver atras.
+    return jsonify(ok=True, planes=planes,
+                   de_fabrica=[dict(p) for p in PLANES_DE_FABRICA])
+
+
+@app.post("/api/admin/planes")
+def admin_guardar_plan():
+    """El admin cambia el precio y los textos de un plan."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [p["clave"] for p in PLANES_DE_FABRICA]:
+        return jsonify(ok=False, error="Ese plan no existe."), 400
+
+    nombre = clean(d.get("nombre", ""))[:40]
+    resumen = clean(d.get("resumen", ""))[:120]
+
+    precio = None
+    bruto = clean(str(d.get("precio", "")))
+    if bruto != "":
+        n = _to_float(bruto)
+        if n is None or n < 0 or n > 10_000_000:
+            return jsonify(ok=False,
+                           error="El precio tiene que ser un número entre 0 y 10 millones."), 400
+        precio = float(n)
+
+    def lineas(t):
+        if t is None:
+            return None
+        return "\n".join(clean(l)[:120] for l in str(t).split("\n") if clean(l))[:2000]
+
+    incluye = lineas(d.get("incluye"))
+    no_incluye = lineas(d.get("no_incluye"))
+
+    con = db()
+    con.execute("""
+        INSERT INTO planes(clave, nombre, precio, resumen, incluye,
+                           no_incluye, cambiado_en)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(clave) DO UPDATE SET
+          nombre=excluded.nombre, precio=excluded.precio,
+          resumen=excluded.resumen, incluye=excluded.incluye,
+          no_incluye=excluded.no_incluye, cambiado_en=excluded.cambiado_en
+    """, (clave, nombre, precio, resumen, incluye, no_incluye,
+          datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+    p = plan_por_clave(clave)
+    return jsonify(ok=True, plan=p,
+                   mensaje=f"Guardado el plan {p['nombre']}.")
+
+
+@app.post("/api/admin/plan-de-fabrica")
+def admin_plan_de_fabrica():
+    """Vuelve un plan a como estaba al principio."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    clave = clean(d.get("clave", ""))
+    if clave not in [p["clave"] for p in PLANES_DE_FABRICA]:
+        return jsonify(ok=False, error="Ese plan no existe."), 400
+    con = db()
+    con.execute("DELETE FROM planes WHERE clave=?", (clave,))
+    con.commit()
+    con.close()
+    p = plan_por_clave(clave)
+    return jsonify(ok=True, plan=p,
+                   mensaje=f"El plan {p['nombre']} volvió a como estaba.")
+
+
+@app.get("/api/admin/promocion")
+def admin_ver_promocion():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    p = promocion_actual()
+    con = db()
+    n = con.execute("SELECT COUNT(*) c FROM pruebas_usadas").fetchone()["c"]
+    con.close()
+    return jsonify(ok=True, **p, activa=hay_promocion(),
+                   pruebas_usadas=n, hoy=hoy_argentina())
+
+
+@app.post("/api/admin/promocion")
+def admin_guardar_promocion():
+    """El admin arma la ventana de prueba gratis."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    desde = clean(d.get("desde", ""))
+    hasta = clean(d.get("hasta", ""))
+
+    # Vacío = se apaga la promoción.
+    if not desde and not hasta:
+        con = db()
+        con.execute("""
+            INSERT INTO promocion(id, desde, hasta, actualizada_en)
+            VALUES(1,'','',?)
+            ON CONFLICT(id) DO UPDATE SET desde='', hasta='',
+                                          actualizada_en=excluded.actualizada_en
+        """, (datetime.now().isoformat(timespec="seconds"),))
+        con.commit()
+        con.close()
+        return jsonify(ok=True, desde="", hasta="",
+                       mensaje="Prueba gratis apagada.")
+
+    for f, nombre in [(desde, "desde"), (hasta, "hasta")]:
+        try:
+            datetime.strptime(f, "%Y-%m-%d")
+        except ValueError:
+            return jsonify(ok=False, error=f"La fecha «{nombre}» no es válida."), 400
+    if hasta < desde:
+        return jsonify(ok=False,
+                       error="La fecha de fin no puede ser anterior a la de inicio."), 400
+
+    con = db()
+    con.execute("""
+        INSERT INTO promocion(id, desde, hasta, actualizada_en)
+        VALUES(1,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET desde=excluded.desde,
+                                      hasta=excluded.hasta,
+                                      actualizada_en=excluded.actualizada_en
+    """, (desde, hasta, datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    con.close()
+
+    return jsonify(ok=True, desde=desde, hasta=hasta, activa=hay_promocion(),
+                   mensaje=f"Prueba gratis del {desde} al {hasta}.")
+
+
+@app.get("/api/admin/lista-usuarios")
+def admin_lista_usuarios():
+    """
+    Los usuarios separados: quiénes pagan y quiénes no.
+    Sirve para ver de un vistazo cómo viene y para exportar.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    filas = con.execute("""
+        SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
+               u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan,
+               s.se_arrepintio, s.arrepentido_en, s.monto_devuelto
+        FROM usuarios u
+        LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
+        ORDER BY u.id DESC
+    """).fetchall()
+    con.close()
+
+    hoy = hoy_argentina()
+
+    def dias_desde(fecha):
+        """Cuantos dias pasaron desde esa fecha."""
+        if not fecha:
+            return None
+        try:
+            f = datetime.strptime(str(fecha)[:10], "%Y-%m-%d")
+            return (datetime.strptime(hoy, "%Y-%m-%d") - f).days
+        except ValueError:
+            return None
+
+    pagan, no_pagan, probando, premium = [], [], [], []
+    for f in filas:
+        d = dict(f)
+        d["al_dia"] = esta_al_dia(d["id"])
+        d["estado"] = d.get("estado") or "sin_suscripcion"
+
+        # Desde cuando esta registrado, y desde cuando sin suscripcion.
+        d["dias_registrado"] = dias_desde(d.get("creado_en"))
+        if d["al_dia"]:
+            d["sin_suscripcion_desde"] = ""
+            d["dias_sin_suscripcion"] = None
+        elif d.get("paga_hasta"):
+            # Se le vencio: sin suscripcion desde el dia siguiente.
+            d["sin_suscripcion_desde"] = d["paga_hasta"]
+            d["dias_sin_suscripcion"] = dias_desde(d["paga_hasta"])
+        else:
+            # Nunca tuvo: desde que se registro.
+            d["sin_suscripcion_desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias_sin_suscripcion"] = d["dias_registrado"]
+
+        # IMPORTANTE: se separa por lo que DE VERDAD tiene cada uno, no
+        # por si puede ver la app. Con el cobro apagado todos pueden ver,
+        # y antes eso los contaba a todos como "pagando".
+        vence = d.get("paga_hasta") or ""
+        vigente = bool(vence) and vence >= hoy and d["estado"] != "cancelada"
+
+        d["plan"] = d.get("plan") or "normal"
+
+        if d["estado"] == "prueba" and vigente:
+            probando.append(d)
+        elif vigente and d["estado"] in ("al_dia", "pendiente"):
+            if d["plan"] == "premium":
+                premium.append(d)
+            else:
+                pagan.append(d)
+        else:
+            no_pagan.append(d)
+
+    return jsonify(
+        ok=True,
+        total=len(filas),
+        premium=premium, pagan=pagan, no_pagan=no_pagan, probando=probando,
+        resumen={"premium": len(premium), "pagan": len(pagan),
+                 "probando": len(probando), "no_pagan": len(no_pagan)},
+    )
+
+
+@app.get("/api/admin/exportar-usuarios")
+def admin_exportar_usuarios():
+    """
+    Baja la lista de usuarios como archivo. Sirve para trabajar con
+    ella en una planilla o mandarla a otro lado.
+    Formato: csv (planilla) o json (para programas).
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+    formato = (request.args.get("formato", "csv") or "csv").lower()
+
+    con = db()
+    filas = con.execute("""
+        SELECT u.id, u.usuario_visible, u.telefono, u.creado_en,
+               u.ultimo_ingreso, u.bloqueado, u.es_admin, u.acepto_en,
+               s.estado, s.paga_hasta, s.ultimo_pago, s.monto, s.plan,
+               s.se_arrepintio, s.arrepentido_en, s.monto_devuelto
+        FROM usuarios u
+        LEFT JOIN suscripciones_pago s ON s.usuario_id = u.id
+        ORDER BY u.id
+    """).fetchall()
+    con.close()
+
+    hoy = hoy_argentina()
+
+    def dias_desde(fecha):
+        if not fecha:
+            return ""
+        try:
+            f = datetime.strptime(str(fecha)[:10], "%Y-%m-%d")
+            return (datetime.strptime(hoy, "%Y-%m-%d") - f).days
+        except ValueError:
+            return ""
+
+    datos = []
+    for f in filas:
+        d = dict(f)
+        d["estado"] = d.get("estado") or "sin_suscripcion"
+        al_dia = esta_al_dia(d["id"])
+        d["al_dia"] = "si" if al_dia else "no"
+        d["plan"] = (d.get("plan") or "normal") if al_dia else "gratis"
+        d["se_arrepintio"] = "si" if d.get("se_arrepintio") else "no"
+        d["arrepentido_en"] = str(d.get("arrepentido_en") or "")[:10]
+        d["dias_registrado"] = dias_desde(d.get("creado_en"))
+        if al_dia:
+            d["sin_suscripcion_desde"] = ""
+            d["dias_sin_suscripcion"] = ""
+        elif d.get("paga_hasta"):
+            d["sin_suscripcion_desde"] = d["paga_hasta"]
+            d["dias_sin_suscripcion"] = dias_desde(d["paga_hasta"])
+        else:
+            d["sin_suscripcion_desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias_sin_suscripcion"] = d["dias_registrado"]
+        datos.append(d)
+
+    nombre = f"usuarios-lea-win-ia-{hoy_argentina()}"
+
+    if formato == "json":
+        return Response(
+            json.dumps({"app": "LEA WIN IA", "fecha": hoy_argentina(),
+                        "usuarios": datos}, ensure_ascii=False, indent=1),
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{nombre}.json"'},
+        )
+
+    # Planilla, con punto y coma: asi Excel en español la abre bien.
+    # Lo que mas se mira va primero: nombre, telefono, desde cuando y
+    # cuantos dias. El resto queda despues, por si hace falta.
+    for d in datos:
+        # Desde cuando esta en su situacion actual.
+        if d["al_dia"] == "no":
+            d["desde"] = d.get("sin_suscripcion_desde", "")
+            d["dias"] = d.get("dias_sin_suscripcion", "")
+        else:
+            d["desde"] = str(d.get("creado_en", ""))[:10]
+            d["dias"] = d.get("dias_registrado", "")
+
+    # De mayor a menor: primero los que hace mas tiempo estan asi.
+    datos.sort(key=lambda x: x["dias"] if isinstance(x["dias"], int) else -1,
+               reverse=True)
+
+    columnas = ["usuario_visible", "telefono", "desde", "dias",
+                "plan", "al_dia", "se_arrepintio", "arrepentido_en",
+                "monto_devuelto", "estado", "paga_hasta", "ultimo_pago",
+                "monto", "creado_en", "ultimo_ingreso", "acepto_en",
+                "bloqueado", "es_admin", "id"]
+    titulos = ["Nombre", "Teléfono", "Fecha de inicio", "Días transcurridos",
+               "Plan", "Al día", "Se arrepintió", "Cuándo se arrepintió",
+               "Monto devuelto", "Estado", "Paga hasta", "Último pago",
+               "Monto", "Se registró", "Último ingreso", "Aceptó términos",
+               "Bloqueado", "Es admin", "Nº"]
+
+    def limpiar(v):
+        t = "" if v is None else str(v)
+        return t.replace(";", ",").replace("\n", " ")
+
+    lineas = [";".join(titulos)]
+    for d in datos:
+        lineas.append(";".join(limpiar(d.get(c)) for c in columnas))
+
+    # El BOM hace que Excel muestre bien los acentos.
+    texto = "\ufeff" + "\r\n".join(lineas)
+    return Response(
+        texto, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}.csv"'},
+    )
+
+
+# ============================================================
+# QUE SE USA MAS
+# Cuenta cuantas veces se mira cada cosa, para saber que le interesa
+# a la gente. NO guarda quien hizo que: solo el total.
+# Asi no hay datos personales de por medio.
+# ============================================================
+
+def anotar_uso(tipo, cosa=""):
+    """
+    Suma uno al contador de esa cosa. Nunca falla hacia afuera: si algo
+    sale mal, la app sigue andando igual.
+    """
+    try:
+        cosa = clean(str(cosa))[:120]
+        if not cosa:
+            cosa = "(sin nombre)"
+        ahora = datetime.now().isoformat(timespec="seconds")
+        hoy = hoy_argentina()
+        con = db()
+        con.execute("""
+            INSERT INTO uso(tipo, cosa, veces, primera_vez, ultima_vez)
+            VALUES(?,?,1,?,?)
+            ON CONFLICT(tipo, cosa) DO UPDATE SET
+              veces = uso.veces + 1, ultima_vez = excluded.ultima_vez
+        """, (tipo, cosa, ahora, ahora))
+        con.execute("""
+            INSERT INTO uso_por_dia(fecha, tipo, veces) VALUES(?,?,1)
+            ON CONFLICT(fecha, tipo) DO UPDATE SET veces = uso_por_dia.veces + 1
+        """, (hoy, tipo))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+@app.post("/api/uso")
+def api_anotar_uso():
+    """La pantalla avisa que se toco algo."""
+    d = request.get_json(silent=True) or {}
+    tipo = clean(d.get("tipo", ""))[:20]
+    if tipo not in ("pantalla", "caballo", "carrera", "hipodromo", "boton"):
+        return jsonify(ok=True), 200
+    anotar_uso(tipo, d.get("cosa", ""))
+    return jsonify(ok=True), 200
+
+
+@app.get("/api/admin/uso")
+def admin_uso():
+    """Que se usa mas, para verlo en el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    con = db()
+    grupos = {}
+    for tipo in ("pantalla", "boton", "caballo", "carrera", "hipodromo"):
+        filas = con.execute("""
+            SELECT cosa, veces, ultima_vez FROM uso
+            WHERE tipo=? ORDER BY veces DESC LIMIT 30
+        """, (tipo,)).fetchall()
+        grupos[tipo] = [dict(f) for f in filas]
+
+    por_dia = con.execute("""
+        SELECT fecha, SUM(veces) veces FROM uso_por_dia
+        GROUP BY fecha ORDER BY fecha DESC LIMIT 30
+    """).fetchall()
+    total = con.execute("SELECT SUM(veces) t FROM uso").fetchone()["t"] or 0
+    cuantas = con.execute("SELECT COUNT(*) c FROM uso").fetchone()["c"]
+    con.close()
+
+    return jsonify(ok=True, grupos=grupos,
+                   por_dia=[dict(d) for d in por_dia],
+                   total=total, cosas_distintas=cuantas)
+
+
+@app.get("/api/admin/exportar-uso")
+def admin_exportar_uso():
+    """Baja lo que se usa como planilla o para programas."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    from flask import Response
+    formato = (request.args.get("formato", "csv") or "csv").lower()
+
+    con = db()
+    filas = con.execute("""
+        SELECT tipo, cosa, veces, primera_vez, ultima_vez FROM uso
+        ORDER BY tipo, veces DESC
+    """).fetchall()
+    dias = con.execute("""
+        SELECT fecha, tipo, veces FROM uso_por_dia ORDER BY fecha DESC
+    """).fetchall()
+    con.close()
+
+    nombre = f"uso-lea-win-ia-{hoy_argentina()}"
+
+    if formato == "json":
+        return Response(
+            json.dumps({"app": "LEA WIN IA", "fecha": hoy_argentina(),
+                        "uso": [dict(f) for f in filas],
+                        "por_dia": [dict(d) for d in dias]},
+                       ensure_ascii=False, indent=1),
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{nombre}.json"'},
+        )
+
+    def limpiar(v):
+        t = "" if v is None else str(v)
+        return t.replace(";", ",").replace("\n", " ")
+
+    lineas = ["Qué;Nombre;Veces;Primera vez;Última vez"]
+    for f in filas:
+        lineas.append(";".join([
+            limpiar(f["tipo"]), limpiar(f["cosa"]), limpiar(f["veces"]),
+            limpiar(f["primera_vez"]), limpiar(f["ultima_vez"])]))
+    lineas.append("")
+    lineas.append("POR DIA")
+    lineas.append("Fecha;Qué;Veces")
+    for d in dias:
+        lineas.append(";".join([limpiar(d["fecha"]), limpiar(d["tipo"]),
+                                limpiar(d["veces"])]))
+
+    texto = "\ufeff" + "\r\n".join(lineas)
+    return Response(
+        texto, mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nombre}.csv"'},
+    )
+
+
+@app.post("/api/admin/borrar-uso")
+def admin_borrar_uso():
+    """Empieza a contar de cero."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    con = db()
+    n = con.execute("SELECT SUM(veces) t FROM uso").fetchone()["t"] or 0
+    con.execute("DELETE FROM uso")
+    con.execute("DELETE FROM uso_por_dia")
+    con.commit()
+    con.close()
+    return jsonify(ok=True, mensaje=f"Se borraron {n} toques. Empieza de cero.")
+
+
+# ============================================================
+# TRANSMISIONES EN VIVO
+# Los hipodromos transmiten por YouTube. La app busca el video UNA
+# VEZ, 25 minutos antes de la primera carrera. Si no lo encuentra,
+# avisa al admin para que lo cargue a mano o marque que no transmite.
+# El video NO pasa por el servidor: lo trae YouTube directo al
+# celular del usuario.
+# ============================================================
+
+CANALES = {
+    "palermo": "UCBQnpH3GKOKRGg4O8PpqQSw",
+    "san isidro": "UCxHHKMSJXJkTsJHMHkYQOYQ",
+    "la plata": "UCmwGF3xHxFwvvBLD0xQfjZw",
+}
+MINUTOS_ANTES_DE_BUSCAR = int(os.getenv("MINUTOS_BUSCAR_VIVO", "25"))
+
+
+def _id_de_youtube(texto):
+    """Saca el identificador del video de cualquier forma de enlace."""
+    t = clean(texto)
+    if not t:
+        return ""
+    if re.fullmatch(r"[\w-]{11}", t):
+        return t
+    for patron in (r"[?&]v=([\w-]{11})", r"youtu\.be/([\w-]{11})",
+                   r"/embed/([\w-]{11})", r"/live/([\w-]{11})"):
+        m = re.search(patron, t)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _buscar_transmision(hipodromo):
+    """
+    Busca la transmision en vivo de ese hipodromo.
+    Devuelve el id del video, o vacio si no hay ninguna.
+    Se lee la pagina del canal: no hace falta clave ni pagar nada.
+    """
+    canal = CANALES.get(normalize_text(hipodromo))
+    if not canal:
+        return ""
+    try:
+        r = requests.get(
+            f"https://www.youtube.com/channel/{canal}/live",
+            headers={"User-Agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
+                     "Accept-Language": "es-AR,es"},
+            timeout=(4, 8), allow_redirects=True)
+        texto = r.text
+    except Exception:
+        return ""
+
+    # Solo sirve si YouTube dice que esta EN VIVO ahora. Si es un video
+    # viejo, no se muestra.
+    if '"isLiveNow":true' not in texto and '"isLive":true' not in texto:
+        return ""
+    m = re.search(r'"videoId":"([\w-]{11})"', texto)
+    return m.group(1) if m else ""
+
+
+def transmision_de(fecha, hipodromo):
+    """Lo que hay guardado para ese dia e hipodromo."""
+    try:
+        con = db()
+        f = con.execute("""SELECT video, buscada, a_mano FROM transmisiones
+                           WHERE fecha=? AND hipodromo=?""",
+                        (fecha, normalize_text(hipodromo))).fetchone()
+        con.close()
+        return dict(f) if f else None
+    except Exception:
+        return None
+
+
+def _guardar_transmision(fecha, hipodromo, video="", a_mano=False):
+    try:
+        con = db()
+        con.execute("""
+            INSERT INTO transmisiones(fecha, hipodromo, video, buscada,
+                                      a_mano, guardada_en)
+            VALUES(?,?,?,1,?,?)
+            ON CONFLICT(fecha, hipodromo) DO UPDATE SET
+              video=excluded.video, buscada=1, a_mano=excluded.a_mano,
+              guardada_en=excluded.guardada_en
+        """, (fecha, normalize_text(hipodromo), video, 1 if a_mano else 0,
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def buscar_las_transmisiones():
+    """
+    Busca las transmisiones del dia. Se llama cada tanto, pero cada
+    hipodromo se busca UNA SOLA VEZ: 25 minutos antes de su primera
+    carrera. Si no la encuentra, avisa al admin.
+    """
+    hoy = hoy_argentina()
+    ahora = ahora_argentina()
+    buscadas = 0
+
+    # La primera carrera de cada hipodromo de hoy.
+    primeras = {}
+    for c in _carreras_de_hoy_guardadas():
+        hip = c["hipodromo"]
+        if not c.get("hora"):
+            continue
+        if hip not in primeras or c["hora"] < primeras[hip]:
+            primeras[hip] = c["hora"]
+
+    for hip, hora in primeras.items():
+        ya = transmision_de(hoy, hip)
+        if ya and ya.get("buscada"):
+            continue      # ya se busco hoy: no se insiste
+
+        faltan = _minutos_para(hora)
+        if faltan is None or faltan > MINUTOS_ANTES_DE_BUSCAR:
+            continue      # todavia falta
+
+        video = _buscar_transmision(hip)
+        _guardar_transmision(hoy, hip, video)
+        buscadas += 1
+
+        if not video:
+            # Avisar al admin para que la cargue o marque que no hay.
+            try:
+                con = db()
+                admins = con.execute(
+                    "SELECT id FROM usuarios WHERE es_admin=1").fetchall()
+                con.close()
+                for a in admins:
+                    avisar_a_usuario(
+                        a["id"], f"Sin transmisión de {hip}",
+                        ("No se encontró el vivo. Cargalo a mano o marcá "
+                         "que hoy no transmite."),
+                        "/admin", "sin_vivo")
+            except Exception:
+                pass
+
+    return buscadas
+
+
+@app.get("/api/transmision")
+def api_transmision():
+    """
+    El vivo de esa fecha e hipodromo.
+
+    SOLO para carreras de HOY. Antes, si no venia la fecha se usaba la
+    de hoy, y una carrera del 5 de septiembre terminaba mostrando la
+    transmision de hoy: el video daba error 153 y tapaba la carrera.
+    """
+    fecha = clean(request.args.get("fecha", ""))
+    hip = clean(request.args.get("hipodromo", ""))
+    if not hip or not fecha:
+        return jsonify(ok=True, hay=False)
+
+    # Una carrera de otro dia no tiene transmision en vivo.
+    if fecha != hoy_argentina():
+        return jsonify(ok=True, hay=False, otro_dia=True)
+
+    t = transmision_de(fecha, hip)
+    video = (t or {}).get("video", "")
+    # "NO" quiere decir que el admin marco que hoy no transmite: no es
+    # un video, es una marca. No se muestra nada.
+    if video == "NO":
+        video = ""
+    return jsonify(ok=True, hay=bool(video), video=video,
+                   hipodromo=_limpiar_nombre_hipodromo(hip))
+
+
+@app.get("/api/admin/transmisiones")
+def admin_transmisiones():
+    """Las transmisiones de hoy, para el panel."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    hoy = hoy_argentina()
+    hipodromos, primeras = [], {}
+    for c in _carreras_de_hoy_guardadas():
+        hip = c["hipodromo"]
+        if hip not in primeras:
+            primeras[hip] = c.get("hora", "")
+        elif c.get("hora") and c["hora"] < primeras[hip]:
+            primeras[hip] = c["hora"]
+
+    for hip, hora in sorted(primeras.items()):
+        t = transmision_de(hoy, hip) or {}
+        video = t.get("video", "")
+        if video == "NO":
+            estado, modo = "no transmite", "no"
+        elif video and t.get("a_mano"):
+            estado, modo = "cargada a mano", "enlace"
+        elif video:
+            estado, modo = "la encontró", "sola"
+        elif t.get("buscada"):
+            estado, modo = "no la encontró", "sola"
+        else:
+            estado, modo = "todavía no la buscó", "sola"
+        hipodromos.append({
+            "hipodromo": hip, "primera": hora, "estado": estado,
+            "modo": modo, "video": "" if video == "NO" else video,
+        })
+
+    return jsonify(ok=True, fecha=hoy, hipodromos=hipodromos,
+                   minutos_antes=MINUTOS_ANTES_DE_BUSCAR)
+
+
+@app.post("/api/admin/transmision")
+def admin_guardar_transmision():
+    """El admin carga el enlace o marca que hoy no transmite."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    d = request.get_json(silent=True) or {}
+    hip = clean(d.get("hipodromo", ""))
+    modo = clean(d.get("modo", "")) or "sola"
+    if not hip:
+        return jsonify(ok=False, error="Falta el hipódromo."), 400
+
+    hoy = hoy_argentina()
+
+    if modo == "no":
+        _guardar_transmision(hoy, hip, "NO", a_mano=True)
+        return jsonify(ok=True, mensaje=f"{hip}: hoy no transmite.")
+
+    if modo == "enlace":
+        video = _id_de_youtube(d.get("enlace", ""))
+        if not video:
+            return jsonify(ok=False,
+                           error="Ese enlace de YouTube no se entiende."), 400
+        _guardar_transmision(hoy, hip, video, a_mano=True)
+        return jsonify(ok=True, video=video,
+                       mensaje=f"{hip}: transmisión cargada.")
+
+    # Buscar de nuevo, a pedido
+    video = _buscar_transmision(hip)
+    _guardar_transmision(hoy, hip, video)
+    return jsonify(ok=True, video=video,
+                   mensaje=(f"{hip}: se encontró la transmisión."
+                            if video else
+                            f"{hip}: no se encontró ninguna transmisión."))
+
+
+@app.get("/api/videos")
+def videos():
+    horse = request.args.get("caballo","").strip()
+    if not horse:
+        return jsonify(ok=False,error="Falta el caballo."),400
+    query = f'{horse} carrera caballo Argentina'
+    if not YOUTUBE_API_KEY:
+        return jsonify(ok=True,modo="busqueda",url="https://www.youtube.com/results?search_query="+quote_plus(query),videos=[])
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {"part":"snippet","q":query,"type":"video","maxResults":5,"key":YOUTUBE_API_KEY}
+    r = requests.get(url,params=params,timeout=20)
+    r.raise_for_status()
+    items = [{
+        "id":x["id"]["videoId"],
+        "titulo":x["snippet"]["title"],
+        "miniatura":x["snippet"]["thumbnails"]["medium"]["url"]
+    } for x in r.json().get("items",[])]
+    return jsonify(ok=True,modo="api",videos=items)
+
+@app.post("/api/guardar")
+def guardar():
+    data = request.get_json(silent=True) or {}
+    if not all(data.get(k) for k in ["fecha","hipodromo","numero","participantes"]):
+        return jsonify(ok=False,error="Faltan datos."),400
+    con = db()
+    con.execute("""
+    INSERT INTO carreras(fecha,hipodromo,numero,premio,distancia,superficie,
+    estado_publicado,condicion,pista_dia,clima,viento,retiros,observaciones,
+    participantes,analisis,resultado_real,creado_en)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(fecha,hipodromo,numero) DO UPDATE SET
+    pista_dia=excluded.pista_dia,clima=excluded.clima,viento=excluded.viento,
+    retiros=excluded.retiros,observaciones=excluded.observaciones,
+    participantes=excluded.participantes,analisis=excluded.analisis,
+    creado_en=excluded.creado_en
+    """,(
+      data["fecha"],data["hipodromo"],int(data["numero"]),data.get("premio",""),
+      data.get("distancia"),data.get("superficie",""),data.get("estado_publicado",""),
+      data.get("condicion",""),data.get("pista_dia",""),data.get("clima",""),
+      data.get("viento",""),json.dumps(data.get("retiros",[]),ensure_ascii=False),
+      data.get("observaciones",""),json.dumps(data["participantes"],ensure_ascii=False),
+      json.dumps(data.get("analisis",{}),ensure_ascii=False),"",
+      datetime.now().isoformat(timespec="seconds")
+    ))
+    con.commit(); con.close()
+    return jsonify(ok=True,mensaje="Carrera y análisis guardados.")
+
+@app.get("/api/historial")
+def historial():
+    con=db()
+    rows=con.execute("""SELECT id,fecha,hipodromo,numero,premio,pista_dia,clima,
+    analisis,resultado_real FROM carreras ORDER BY fecha DESC,numero""").fetchall()
+    con.close()
+    return jsonify(ok=True,carreras=[dict(x) for x in rows])
+
+# ============================================================
+# RECOLECTOR AUTOMATICO
+# Recorre las reuniones del Stud Book, analiza cada carrera y compara
+# contra el resultado real. Corre solo en el servidor, sin que nadie
+# tenga que abrir la app.
+# ============================================================
+
+RECOLECTOR = {
+    "corriendo": False,
+    "desde": "",
+    "hasta": "",
+    "reuniones_totales": 0,
+    "reuniones_hechas": 0,
+    "carreras_guardadas": 0,
+    "carreras_comparadas": 0,
+    "errores": 0,
+    "ultimo_mensaje": "",
+    "inicio": "",
+    "fin": "",
+}
+
+PAUSA_ENTRE_PEDIDOS = float(os.getenv("PAUSA_SCRAPING", "1.5"))  # segundos
+
+
+def _log_recolector(msg):
+    RECOLECTOR["ultimo_mensaje"] = f"{datetime.now().strftime('%H:%M:%S')} — {msg}"
+
+
+def procesar_carrera(url_reunion, numero, fecha, hipodromo):
+    """
+    Analiza una carrera y la registra. Devuelve 'comparada' si la carrera
+    ya se corrio (habia puestos), 'guardada' si todavia no, o None si fallo.
+    """
+    try:
+        soup = fetch(url_reunion)
+        data = parse_race(soup, numero)
+        if not data:
+            return None
+        participantes = [p for p in data.get("participantes", []) if not p.get("retirado")]
+        if len(participantes) < 2:
+            return None
+
+        # Enriquecer solo si la carrera todavia no corrio: si ya corrio,
+        # el puesto real ya alcanza y evitamos miles de pedidos extra.
+        ya_corrida = any(p.get("puesto") for p in participantes)
+        if not ya_corrida:
+            participantes = [enrich_horse(dict(p), ir_al_sitio=True)
+                             for p in participantes]
+
+        pesos = cargar_pesos()
+        ranked, top = rankear(
+            participantes,
+            {"participantes": participantes, "pista_dia": data.get("estado", "")},
+            pesos,
+        )
+
+        registrar_pronostico(
+            url=url_reunion, numero=numero, fecha=fecha, hipodromo=hipodromo,
+            top=top, participantes=participantes, pesos=pesos, ya_corrida=ya_corrida,
+        )
+        return "comparada" if ya_corrida else "guardada"
+    except Exception:
+        return None
+
+
+def recolectar(desde, hasta):
+    """Recorre todas las reuniones entre dos fechas y procesa sus carreras."""
+    RECOLECTOR.update({
+        "corriendo": True, "desde": desde, "hasta": hasta,
+        "reuniones_totales": 0, "reuniones_hechas": 0,
+        "carreras_guardadas": 0, "carreras_comparadas": 0, "errores": 0,
+        "inicio": datetime.now().isoformat(timespec="seconds"), "fin": "",
+    })
+    try:
+        _log_recolector("Pidiendo el calendario oficial…")
+        calendario = calendar_from_meetings(fetch(BASE + "/reuniones"))
+
+        reuniones = [r for r in calendario if desde <= r["fecha"] <= hasta]
+        # De lo mas nuevo a lo mas viejo: primero los resultados de ayer
+        # y anteayer, que son los que la gente busca. Antes empezaba por
+        # la fecha mas vieja del tramo y los de ayer entraban al final.
+        reuniones.sort(key=lambda r: r["fecha"], reverse=True)
+        RECOLECTOR["reuniones_totales"] = len(reuniones)
+        _log_recolector(f"{len(reuniones)} reuniones encontradas entre {desde} y {hasta}")
+
+        for reunion in reuniones:
+            if not RECOLECTOR["corriendo"]:
+                _log_recolector("Detenido a pedido.")
+                break
+            try:
+                soup = fetch(reunion["url"])
+                carreras = extract_races_from_meeting(soup)
+                _log_recolector(
+                    f"{reunion['fecha']} {reunion['hipodromo']}: {len(carreras)} carreras"
+                )
+                for c in carreras:
+                    if not RECOLECTOR["corriendo"]:
+                        break
+                    r = procesar_carrera(
+                        reunion["url"], c["numero"], reunion["fecha"], reunion["hipodromo"]
+                    )
+                    if r == "comparada":
+                        RECOLECTOR["carreras_comparadas"] += 1
+                    elif r == "guardada":
+                        RECOLECTOR["carreras_guardadas"] += 1
+                    else:
+                        RECOLECTOR["errores"] += 1
+                    time.sleep(PAUSA_ENTRE_PEDIDOS)
+            except Exception:
+                RECOLECTOR["errores"] += 1
+            RECOLECTOR["reuniones_hechas"] += 1
+            time.sleep(PAUSA_ENTRE_PEDIDOS)
+
+        _log_recolector("Terminado.")
+    except Exception as e:
+        _log_recolector(f"Error general: {e}")
+    finally:
+        RECOLECTOR["corriendo"] = False
+        RECOLECTOR["fin"] = datetime.now().isoformat(timespec="seconds")
+
+
+@app.post("/api/admin/recolectar")
+def admin_recolectar():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if RECOLECTOR["corriendo"]:
+        return jsonify(ok=False, error="Ya hay una recolección en curso."), 409
+
+    body = request.get_json(silent=True) or {}
+    hoy = hoy_argentina()
+    desde = body.get("desde") or request.args.get("desde") or "2026-01-01"
+    hasta = body.get("hasta") or request.args.get("hasta") or hoy
+
+    hilo = threading.Thread(target=recolectar, args=(desde, hasta), daemon=True)
+    hilo.start()
+    return jsonify(ok=True, mensaje=f"Recolección iniciada de {desde} a {hasta}.")
+
+
+@app.post("/api/admin/detener")
+def admin_detener():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    RECOLECTOR["corriendo"] = False
+    return jsonify(ok=True, mensaje="Se pidió detener la recolección.")
+
+
+@app.get("/api/admin/medir-tabuladas")
+def admin_medir_tabuladas():
+    """
+    Cuenta cuantas TABULADAS FALTAN para las carreras que vienen.
+
+    Por que existe: el pronostico se arma con la campaña de cada caballo,
+    pero la tabulada de esas carreras viejas puede no estar guardada. Si
+    no esta, la pantalla no tiene con que llenar la tarjeta.
+
+    NO VA AL SITIO. Solo cuenta lo que hay guardado. Sirve para saber el
+    numero REAL antes de cambiar nada.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+
+    dias = int(request.args.get("dias", "7"))
+    anios = int(request.args.get("anios", "2"))
+
+    hoy = hoy_argentina()
+    hasta = (ahora_argentina() + timedelta(days=dias)).strftime("%Y-%m-%d")
+    # La campaña del caballo trae la fecha como 26/07/2025. El calendario
+    # la trae como 2025-07-26. Hay que comparar en el mismo idioma.
+    limite = ahora_argentina() - timedelta(days=365 * anios)
+
+    def _es_reciente(fecha_ficha):
+        try:
+            d, m, a = fecha_ficha.split("/")
+            return datetime(int(a), int(m), int(d)) >= limite.replace(tzinfo=None)
+        except Exception:
+            return False
+
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted(
+        [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
+        key=lambda r: r["fecha"])
+
+    con = db()
+    try:
+        # 1) Los caballos que corren en esos dias, de lo guardado.
+        perfiles, detalle = set(), []
+        for reunion in proximas:
+            clave = (f"reuniones:{reunion['fecha']}:"
+                     f"{normalize_text(reunion['hipodromo'])}")
+            guardada = lo_guardado(clave) or []
+            if not guardada:
+                detalle.append({
+                    "fecha": reunion["fecha"],
+                    "hipodromo": reunion.get("hipodromo", ""),
+                    "nota": "la reunion todavia no se guardo",
+                })
+                continue
+            bloque = guardada[0]
+            antes_de_esta = len(perfiles)
+            con_datos = 0
+            for c in bloque.get("carreras", []):
+                data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+                if not data:
+                    continue
+                con_datos += 1
+                for p in data.get("participantes", []):
+                    if p.get("perfil") and not p.get("retirado"):
+                        perfiles.add(p["perfil"])
+            detalle.append({
+                "fecha": reunion["fecha"],
+                "hipodromo": reunion.get("hipodromo", ""),
+                "carreras_guardadas": con_datos,
+                "caballos_nuevos": len(perfiles) - antes_de_esta,
+            })
+
+        # 2) De la ficha de cada uno, sus carreras de los ultimos años.
+        #    Se usa un conjunto: la misma carrera la corrieron varios, y
+        #    se pide UNA sola vez.
+        enlaces, sin_ficha, sin_enlace = set(), 0, 0
+        for perfil in perfiles:
+            fila = con.execute(
+                "SELECT carreras FROM fichas WHERE perfil=?",
+                (perfil,)).fetchone()
+            if not fila or fila["carreras"] is None:
+                sin_ficha += 1
+                continue
+            try:
+                for c in json.loads(fila["carreras"]):
+                    if not _es_reciente(c.get("fecha", "")):
+                        continue
+                    if c.get("enlace"):
+                        enlaces.add(c["enlace"])
+                    else:
+                        sin_enlace += 1
+            except Exception:
+                continue
+
+        # 3) Cuantas de esas tabuladas YA estan guardadas.
+        ya_estan = 0
+        for enlace in enlaces:
+            if con.execute("SELECT 1 FROM historico WHERE url=?",
+                           (enlace,)).fetchone():
+                ya_estan += 1
+    finally:
+        con.close()
+
+    faltan = len(enlaces) - ya_estan
+    # Medido antes: una pagina del sitio tarda ~6,75 s con la pausa.
+    minutos = round(faltan * 6.75 / 60)
+
+    return jsonify(
+        ok=True,
+        PARA_LEER=(
+            f"Faltan {faltan} tabuladas para las carreras de los proximos "
+            f"{dias} dias. Traerlas tardaria {minutos} minutos."),
+        reuniones=len(proximas),
+        caballos_que_corren=len(perfiles),
+        caballos_sin_ficha=sin_ficha,
+        tabuladas_necesarias=len(enlaces),
+        tabuladas_ya_guardadas=ya_estan,
+        TABULADAS_QUE_FALTAN=faltan,
+        minutos_para_traerlas=minutos,
+        carreras_sin_enlace=sin_enlace,
+        dias_mirados=dias,
+        anios_de_campana=anios,
+        por_reunion=detalle,
+    )
+
+
+@app.get("/api/admin/estado")
+def admin_estado():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    return jsonify(ok=True, **RECOLECTOR)
+
+
+def revision_diaria():
+    """
+    Tarea de fondo permanente: cada 6 horas revisa los ultimos 7 dias.
+    Asi las carreras que se van corriendo se comparan solas, sin que
+    nadie abra la app.
+    """
+    time.sleep(60)  # dejar que el servidor termine de arrancar
+    while True:
+        try:
+            if not RECOLECTOR["corriendo"]:
+                hoy = datetime.now()
+                desde = (hoy - timedelta(days=7)).strftime("%Y-%m-%d")
+                hasta = hoy.strftime("%Y-%m-%d")
+                recolectar(desde, hasta)
+        except Exception:
+            pass
+        time.sleep(6 * 60 * 60)
+
+
+init_db()
+
+if os.getenv("REVISION_AUTOMATICA", "1") == "1":
+    threading.Thread(target=revision_diaria, daemon=True).start()
+
+# Revision de avisos: cada 15 minutos, para que el "una hora antes" llegue a tiempo.
+if os.getenv("AVISOS_AUTOMATICOS", "1") == "1":
+    threading.Thread(target=revision_de_avisos, daemon=True).start()
+
+# El historico se junta de madrugada, despacio. Se puede apagar desde el panel.
+if os.getenv("RECOLECCION_HISTORICO", "1") == "1":
+    threading.Thread(target=recolectar_historico, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=os.getenv("FLASK_DEBUG","0")=="1")
