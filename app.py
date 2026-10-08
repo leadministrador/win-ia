@@ -451,6 +451,10 @@ def init_db():
         cols_cola = [f[1] for f in con.execute("PRAGMA table_info(por_explorar)").fetchall()]
         if cols_cola and "fecha" not in cols_cola:
             con.execute("ALTER TABLE por_explorar ADD COLUMN fecha TEXT")
+        # Prioridad: lo que necesitan las carreras que vienen va primero.
+        if cols_cola and "prioridad" not in cols_cola:
+            con.execute("ALTER TABLE por_explorar "
+                        "ADD COLUMN prioridad INTEGER DEFAULT 0")
         cols_arr = [f[1] for f in con.execute(
             "PRAGMA table_info(suscripciones_pago)").fetchall()]
         for col, tipo in (("se_arrepintio", "INTEGER DEFAULT 0"),
@@ -5706,6 +5710,148 @@ ADELANTO = {
 
 
 
+# ---------------------------------------------------------------------
+# LAS TABULADAS DE LOS QUE CORREN
+#
+# Idea de Leandro (7/10/2026): si una carrera ya tiene pronostico, tiene
+# que tener tambien el respaldo de la tabulada. Hasta ahora esas carreras
+# caian al final de la cola del historico, atras de 86.981 pendientes: a
+# ese ritmo tardaban mas de un año en llegar, y la pantalla mostraba
+# "Buscando la tabulada..." para siempre.
+#
+# Como se arregla: se anotan en la MISMA cola, pero con prioridad. Asi
+# usan la maquinaria que ya existe —el horario de 3 a 7, el interruptor
+# del panel, las tandas cortas que sobreviven a los reinicios de Render—
+# y nunca sale al sitio una segunda tarea en paralelo.
+#
+# Medido en la base real el 7/10/2026, para 3 dias de carreras:
+#   hacen falta 2.777 tabuladas, estaban guardadas 791 (28%).
+# ---------------------------------------------------------------------
+ANIOS_TABULADAS = int(os.getenv("ANIOS_TABULADAS", "2"))
+DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "3"))
+
+TABULADAS = {"anotadas": 0, "ultima_siembra": ""}
+
+
+def _fecha_de_la_campana(texto):
+    """La campaña trae la fecha como 26/07/2025. Devuelve None si no se puede."""
+    try:
+        d, m, a = texto.split("/")
+        return datetime(int(a), int(m), int(d))
+    except Exception:
+        return None
+
+
+def _anotar_tabuladas_que_faltan():
+    """
+    Anota en la cola, CON PRIORIDAD, las tabuladas que les faltan a las
+    carreras que vienen. Todo de lo guardado: esta funcion no toca el
+    sitio, solo mira y anota. Quien sale a buscarlas es el historico, en
+    su horario.
+
+    El orden importa: se recorre de la reunion mas proxima a la mas
+    lejana, asi lo que se corre antes queda primero en la cola.
+    """
+    limite = (ahora_argentina()
+              - timedelta(days=365 * ANIOS_TABULADAS)).replace(tzinfo=None)
+    hoy = hoy_argentina()
+    hasta = (ahora_argentina()
+             + timedelta(days=DIAS_TABULADAS)).strftime("%Y-%m-%d")
+
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted(
+        [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
+        key=lambda r: r["fecha"])
+
+    anotadas, vistas = 0, set()
+    con = db()
+    try:
+        for reunion in proximas:
+            clave = (f"reuniones:{reunion['fecha']}:"
+                     f"{normalize_text(reunion['hipodromo'])}")
+            guardada = lo_guardado(clave) or []
+            if not guardada:
+                continue
+            bloque = guardada[0]
+            for c in bloque.get("carreras", []):
+                data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+                if not data:
+                    continue
+                for p in data.get("participantes", []):
+                    perfil = p.get("perfil", "")
+                    if not perfil or p.get("retirado") or perfil in vistas:
+                        continue
+                    vistas.add(perfil)
+                    fila = con.execute(
+                        "SELECT carreras FROM fichas WHERE perfil=?",
+                        (perfil,)).fetchone()
+                    if not fila or fila["carreras"] is None:
+                        # Sin ficha no se sabe que corrio. Se anota al
+                        # caballo con prioridad: al traerle la ficha
+                        # aparecen sus carreras y entran en la proxima
+                        # siembra.
+                        anotadas += _anotar_con_prioridad(
+                            con, perfil, "caballo", "")
+                        continue
+                    try:
+                        campana = json.loads(fila["carreras"])
+                    except Exception:
+                        continue
+                    for v in campana:
+                        url = v.get("enlace")
+                        if not url or url in vistas:
+                            continue
+                        vistas.add(url)
+                        f = _fecha_de_la_campana(v.get("fecha", ""))
+                        if not f or f < limite:
+                            continue
+                        if _ya_guardada(url):
+                            continue
+                        anotadas += _anotar_con_prioridad(
+                            con, url, "carrera",
+                            f.strftime("%Y-%m-%d"))
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+    TABULADAS["anotadas"] = anotadas
+    TABULADAS["ultima_siembra"] = ahora_argentina().strftime("%Y-%m-%d %H:%M")
+    return anotadas
+
+
+def _anotar_con_prioridad(con, url, tipo, fecha):
+    """
+    Lo pone en la cola adelante de todo. Si ya estaba anotado sin
+    prioridad, se la sube: no alcanza con INSERT OR IGNORE, que lo
+    dejaria esperando al fondo igual que antes.
+    """
+    try:
+        con.execute("""
+            INSERT INTO por_explorar(url, tipo, fecha, agregado_en, prioridad)
+            VALUES(?,?,?,?,1)
+            ON CONFLICT(url) DO UPDATE SET prioridad=1
+        """, (url, tipo, fecha or "",
+              datetime.now().isoformat(timespec="seconds")))
+        return 1
+    except Exception:
+        return 0
+
+
+def _cuantas_prioritarias():
+    """Cuantas quedan por buscar de las urgentes."""
+    try:
+        con = db()
+        n = con.execute("SELECT COUNT(*) c FROM por_explorar "
+                        "WHERE prioridad=1 AND hecho=0 AND intentos<3"
+                        ).fetchone()["c"]
+        con.close()
+        return n
+    except Exception:
+        return 0
+
+
 def _dejar_todo_listo(data, reunion, carrera):
     """
     Deja una carrera lista para que el usuario no espere nada:
@@ -5846,6 +5992,11 @@ def traer_las_que_vienen(forzar=False):
     finally:
         ADELANTO["trabajando"] = False
 
+
+# La ventana para traer las carreras que vienen. De 22 a 23, para que
+# queden guardadas antes de que el historico arranque de madrugada.
+ADELANTO_DESDE = int(os.getenv("ADELANTO_DESDE", "22"))
+ADELANTO_HASTA = int(os.getenv("ADELANTO_HASTA", "23"))
 
 MINUTOS_PARA_EL_RESULTADO = int(os.getenv("MINUTOS_RESULTADO", "40"))
 
@@ -6074,11 +6225,23 @@ def revision_de_avisos():
         except Exception:
             pass
 
-        # De madrugada, traer todas las que vienen y dejarlas guardadas.
+        # De noche, traer todas las que vienen y dejarlas guardadas.
+        #
+        # Por que a las 22 y no a las 2 (cambio del 7/10/2026, idea de
+        # Leandro): el Stud Book publica las carreras cada varios dias, a
+        # cualquier hora. Buscandolas de noche quedan guardadas ANTES de
+        # que arranque el historico, asi esa misma madrugada el histórico
+        # ya puede traer las tabuladas de esos caballos. Antes se traian
+        # a las 2 y el historico arrancaba a las 3: una hora de margen.
+        #
+        # Es una ventana y no una hora exacta porque Render reinicia el
+        # proceso cada tanto: si justo cae en la unica hora buena, ese
+        # dia no se traia nada.
         try:
             h = ahora_argentina().hour
             hoy = hoy_argentina()
-            if h == 2 and ADELANTO.get("ultima_vez", "")[:10] != hoy:
+            if (ADELANTO_DESDE <= h <= ADELANTO_HASTA
+                    and ADELANTO.get("ultima_vez", "")[:10] != hoy):
                 traer_las_que_vienen()
         except Exception:
             pass
@@ -6912,7 +7075,12 @@ def api_soy_admin():
 # Corre de madrugada, despacio, para no molestar al sitio.
 # ============================================================
 
-HORA_INICIO_RECOLECCION = int(os.getenv("RECOLECCION_DESDE", "3"))   # 3 de la mañana
+# De medianoche a las 7 (cambio del 7/10/2026, pedido de Leandro).
+# Antes eran las 3: con 4 horas no entraban las tabuladas de los que
+# corren (medido: 3 h 43 la primera vez) mas el historico viejo. Y
+# arrancando a las 00 no se pisa con la busqueda de las carreras que
+# vienen, que quedo de 22 a 23.
+HORA_INICIO_RECOLECCION = int(os.getenv("RECOLECCION_DESDE", "0"))   # medianoche
 HORA_FIN_RECOLECCION = int(os.getenv("RECOLECCION_HASTA", "7"))      # 7 de la mañana
 PAUSA_HISTORICO = float(os.getenv("PAUSA_HISTORICO", "3.0"))         # segundos
 
@@ -7000,7 +7168,14 @@ def _siguiente_de_la_cola():
         fila = con.execute("""
             SELECT url, tipo FROM por_explorar
             WHERE hecho=0 AND intentos < 3
-            ORDER BY (tipo='caballo') DESC,
+            ORDER BY prioridad DESC,
+                     -- Entre las urgentes manda el orden en que se
+                     -- anotaron, que va de la reunion mas proxima a la
+                     -- mas lejana. Si mandara la fecha, saldria primero
+                     -- la carrera vieja mas reciente, que no es lo que
+                     -- pidio Leandro: lo que se corre antes va antes.
+                     CASE prioridad WHEN 1 THEN rowid END ASC,
+                     (tipo='caballo') DESC,
                      (fecha IS NULL OR fecha='') ASC,
                      fecha DESC,
                      rowid ASC
@@ -7690,6 +7865,18 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
         except Exception:
             pass
 
+        # Las tabuladas de los que corren van primero. Se resiembra
+        # sola cuando termino con las de ayer: asi cada dia entran las
+        # de la reunion nueva sin que nadie toque nada.
+        try:
+            if (os.getenv("TRAER_TABULADAS", "1") == "1"
+                    and _cuantas_prioritarias() == 0):
+                n = _anotar_tabuladas_que_faltan()
+                if n:
+                    HISTORICO["ultimo"] = f"Anotadas {n} tabuladas de los que corren."
+        except Exception:
+            pass
+
         if _contar_pendientes() == 0:
             try:
                 rehacer = _completar_lo_que_falta()
@@ -8137,6 +8324,7 @@ def admin_carreras_guardadas():
     return jsonify(ok=True, hoy=hoy, fechas=fechas,
                    dias_publicados=len(fechas),
                    estado=ADELANTO,
+                   tabuladas=TABULADAS,
                    espera_segundos=ESPERA_RESPUESTA)
 
 
