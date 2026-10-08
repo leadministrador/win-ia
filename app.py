@@ -455,6 +455,20 @@ def init_db():
         if cols_cola and "prioridad" not in cols_cola:
             con.execute("ALTER TABLE por_explorar "
                         "ADD COLUMN prioridad INTEGER DEFAULT 0")
+        # El orden DENTRO de las urgentes. No sirve el numero de fila:
+        # una tabulada que ya estaba anotada hace meses conserva un
+        # numero viejo y se adelantaba a la de la carrera de mañana.
+        # Este numero se reescribe en cada siembra. (Bug encontrado por
+        # Leandro el 8/10/2026: le faltaba la tabulada al segundo caballo
+        # de la primera reunion, que tendria que haber sido de las
+        # primeras en traerse.)
+        if cols_cola and "orden" not in cols_cola:
+            con.execute("ALTER TABLE por_explorar "
+                        "ADD COLUMN orden INTEGER DEFAULT 0")
+        # Sin este indice, elegir el proximo de la cola recorre las
+        # 87.000 filas enteras, y eso pasa una vez por pedido.
+        con.execute("CREATE INDEX IF NOT EXISTS idx_cola_elegir "
+                    "ON por_explorar(prioridad DESC, hecho, intentos, orden)")
         cols_arr = [f[1] for f in con.execute(
             "PRAGMA table_info(suscripciones_pago)").fetchall()]
         for col, tipo in (("se_arrepintio", "INTEGER DEFAULT 0"),
@@ -5727,6 +5741,26 @@ ADELANTO = {
 # Medido en la base real el 7/10/2026, para 3 dias de carreras:
 #   hacen falta 2.777 tabuladas, estaban guardadas 791 (28%).
 # ---------------------------------------------------------------------
+# Para saber por que de noche rinde menos de lo que deberia. Se guarda
+# en la base y no en memoria: si Render reinicia el proceso, lo de
+# memoria se borra y justo eso es lo que hay que medir.
+def _anotar_marca(clave, suma=1):
+    try:
+        con = db()
+        hoy = hoy_argentina()
+        con.execute("""
+            INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)
+            ON CONFLICT(clave) DO UPDATE SET
+              valor = CAST(COALESCE(ajustes.valor,'0') AS INTEGER) + ?,
+              cambiado_en = excluded.cambiado_en
+        """, (f"marca:{hoy}:{clave}", str(suma),
+              ahora_argentina().strftime("%Y-%m-%d %H:%M:%S"), suma))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
 ANIOS_TABULADAS = int(os.getenv("ANIOS_TABULADAS", "2"))
 DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "3"))
 
@@ -5763,7 +5797,7 @@ def _anotar_tabuladas_que_faltan():
         [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
         key=lambda r: r["fecha"])
 
-    anotadas, vistas = 0, set()
+    anotadas, vistas, orden = 0, set(), 0
     con = db()
     try:
         for reunion in proximas:
@@ -5790,8 +5824,9 @@ def _anotar_tabuladas_que_faltan():
                         # caballo con prioridad: al traerle la ficha
                         # aparecen sus carreras y entran en la proxima
                         # siembra.
+                        orden += 1
                         anotadas += _anotar_con_prioridad(
-                            con, perfil, "caballo", "")
+                            con, perfil, "caballo", "", orden)
                         continue
                     try:
                         campana = json.loads(fila["carreras"])
@@ -5807,9 +5842,10 @@ def _anotar_tabuladas_que_faltan():
                             continue
                         if _ya_guardada(url):
                             continue
+                        orden += 1
                         anotadas += _anotar_con_prioridad(
                             con, url, "carrera",
-                            f.strftime("%Y-%m-%d"))
+                            f.strftime("%Y-%m-%d"), orden)
         con.commit()
     except Exception:
         pass
@@ -5821,19 +5857,23 @@ def _anotar_tabuladas_que_faltan():
     return anotadas
 
 
-def _anotar_con_prioridad(con, url, tipo, fecha):
+def _anotar_con_prioridad(con, url, tipo, fecha, orden):
     """
-    Lo pone en la cola adelante de todo. Si ya estaba anotado sin
-    prioridad, se la sube: no alcanza con INSERT OR IGNORE, que lo
-    dejaria esperando al fondo igual que antes.
+    Lo pone en la cola adelante de todo, con su numero de orden.
+
+    El numero se REESCRIBE aunque ya estuviera anotado. Si no, la que ya
+    estaba en la cola desde hacia meses se colaba adelante de la que
+    hace falta para la carrera de mañana.
     """
     try:
         con.execute("""
-            INSERT INTO por_explorar(url, tipo, fecha, agregado_en, prioridad)
-            VALUES(?,?,?,?,1)
-            ON CONFLICT(url) DO UPDATE SET prioridad=1
+            INSERT INTO por_explorar(url, tipo, fecha, agregado_en,
+                                     prioridad, orden)
+            VALUES(?,?,?,?,1,?)
+            ON CONFLICT(url) DO UPDATE SET prioridad=1, orden=excluded.orden,
+                                           hecho=0, intentos=0
         """, (url, tipo, fecha or "",
-              datetime.now().isoformat(timespec="seconds")))
+              datetime.now().isoformat(timespec="seconds"), orden))
         return 1
     except Exception:
         return 0
@@ -7166,7 +7206,7 @@ def _siguiente_de_la_cola():
     try:
         con = db()
         fila = con.execute("""
-            SELECT url, tipo FROM por_explorar
+            SELECT url, tipo, prioridad FROM por_explorar
             WHERE hecho=0 AND intentos < 3
             ORDER BY prioridad DESC,
                      -- Entre las urgentes manda el orden en que se
@@ -7174,7 +7214,7 @@ def _siguiente_de_la_cola():
                      -- mas lejana. Si mandara la fecha, saldria primero
                      -- la carrera vieja mas reciente, que no es lo que
                      -- pidio Leandro: lo que se corre antes va antes.
-                     CASE prioridad WHEN 1 THEN rowid END ASC,
+                     CASE prioridad WHEN 1 THEN orden END ASC,
                      (tipo='caballo') DESC,
                      (fecha IS NULL OR fecha='') ASC,
                      fecha DESC,
@@ -7849,6 +7889,7 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
     HISTORICO["corriendo"] = True
     HISTORICO["frenado_por_el_sitio"] = False
     hechos, fallos = 0, 0
+    _anotar_marca("tandas")
 
     try:
         # Si no hay nada por hacer, se busca por donde empezar.
@@ -7917,13 +7958,17 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
 
             if r < 0:
                 fallos += 1
+                _anotar_marca("fallos")
                 if fallos >= 3:
                     HISTORICO["frenado_por_el_sitio"] = True
                     HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
+                    _anotar_marca("tandas_cortadas")
                     break
             else:
                 fallos = 0
                 hechos += 1
+                _anotar_marca("urgentes" if siguiente.get("prioridad")
+                              else "normales")
 
             HISTORICO["pendientes"] = _contar_pendientes()
             _pausa_prudente()
@@ -7938,7 +7983,10 @@ def recolectar_historico():
     Sigue existiendo por si el servidor permite tareas de fondo.
     En Render no sobrevive, por eso ademas se trabaja en tandas.
     """
-    time.sleep(120)
+    # 30 y no 120: Render reinicia el proceso cada tanto y cada reinicio
+    # perdia dos minutos enteros de la madrugada.
+    time.sleep(30)
+    _anotar_marca("arranques_del_proceso")
 
     while True:
         try:
@@ -8321,10 +8369,26 @@ def admin_carreras_guardadas():
         por_fecha[f]["por_revisar"] += por_revisar
 
     fechas = sorted(por_fecha.values(), key=lambda x: x["fecha"])
+    # Que paso de madrugada, para saber si rindio o si Render la corto.
+    marcas = {}
+    try:
+        con = db()
+        for f in con.execute(
+                "SELECT clave, valor FROM ajustes WHERE clave LIKE ?",
+                (f"marca:{hoy}:%",)).fetchall():
+            marcas[f["clave"].split(":")[-1]] = int(f["valor"])
+        marcas["urgentes_en_cola"] = con.execute(
+            "SELECT COUNT(*) c FROM por_explorar "
+            "WHERE prioridad=1 AND hecho=0 AND intentos<3").fetchone()["c"]
+        con.close()
+    except Exception:
+        pass
+
     return jsonify(ok=True, hoy=hoy, fechas=fechas,
                    dias_publicados=len(fechas),
                    estado=ADELANTO,
                    tabuladas=TABULADAS,
+                   DE_HOY=marcas,
                    espera_segundos=ESPERA_RESPUESTA)
 
 
