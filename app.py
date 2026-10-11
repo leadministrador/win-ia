@@ -5877,7 +5877,9 @@ def _anotar_falla(url, error):
     """
     try:
         nombre = type(error).__name__
-        if "Timeout" in nombre:
+        if isinstance(error, str):
+            motivo = error[:80]
+        elif "Timeout" in nombre:
             motivo = "tardo demasiado"
         elif "Connection" in nombre:
             motivo = "no se pudo conectar"
@@ -7454,8 +7456,13 @@ def guardar_carrera_historica(url):
         if data and data.get("participantes"):
             break
     if not data or not data.get("participantes"):
-        _marcar_hecho(url)
-        return 0
+        # La pagina bajo pero no se pudo leer la tabla. Antes se marcaba
+        # como HECHA y se contaba como guardada: la tabulada quedaba vacia
+        # para siempre y el panel decia "carrera guardada". Ahora cuenta
+        # como falla: suma un intento, se reintenta, y a los 3 aparece en
+        # la lista de "tabuladas que fallaron" para mirarla a mano.
+        _anotar_falla(url, "bajo bien pero no se pudo leer la tabla")
+        return -1
 
     # La fecha esta en la direccion o en el texto.
     fecha = meeting_date_from_url(url)
@@ -7621,6 +7628,15 @@ def explorar_caballo(url_perfil):
         return -1
 
     carreras = _tabla_carreras_del_perfil(soup)
+
+    # Si la pagina bajo pero la tabla de campaña no se pudo leer, NO se
+    # guarda nada. Antes se guardaba la ficha VACIA (y como es INSERT OR
+    # REPLACE, pisaba la buena que ya estaba), se marcaba hecho y el panel
+    # decia "caballo explorado". Ese caballo despues no aportaba ninguna
+    # carrera a la siembra, y el medidor lo contaba como "con ficha".
+    if not carreras:
+        _anotar_falla(url_perfil, "bajo bien pero no se pudo leer la campaña")
+        return -1
 
     # Se guarda la campaña UNA sola vez por caballo. Un caballo que corrio
     # 20 veces aparece en 20 carreras: guardarla en cada una seria repetir
@@ -8139,11 +8155,19 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
                 else:
                     fallos += 1
                     _anotar_marca("fallos")
+                    # YA NO SE CORTA. Antes, a la tercera falla seguida se
+                    # tiraba la tanda entera. Medido el 11/10/2026: la noche
+                    # del 10 al 11 dio 221 vueltas asi y guardo CERO
+                    # carreras. Ahora sigue con la siguiente de la cola;
+                    # la que fallo suma un intento y se reintenta despues.
+                    # El cartel solo avisa, no frena.
                     if fallos >= 3:
                         HISTORICO["frenado_por_el_sitio"] = True
-                        HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
-                        _anotar_marca("tandas_cortadas")
-                        corto = True
+                        HISTORICO["ultimo"] = (
+                            f"{fallos} fallas seguidas. Sigo con la siguiente.")
+                        _anotar_marca("rachas_de_fallas")
+                    else:
+                        HISTORICO["ultimo"] = f"falló · {url[-38:]}"
             HISTORICO["pendientes"] = _contar_pendientes()
             if corto:
                 break
