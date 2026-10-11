@@ -5762,7 +5762,20 @@ def _anotar_marca(clave, suma=1):
 
 
 ANIOS_TABULADAS = int(os.getenv("ANIOS_TABULADAS", "2"))
-DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "3"))
+# Cuantos dias de carreras mirar. 1 = solo HOY.
+#
+# Estaba en 3 y era un error mio: repartia el esfuerzo de la noche entre
+# tres dias y no completaba ninguno. Leandro lo dijo claro el 9/10/2026:
+# "quiero que complete las carreras del dia". Primero el dia que la gente
+# esta mirando; si sobra tiempo, la noche sigue con lo demas igual.
+DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "1"))
+
+# Cuanto esperar al Stud Book en las tareas de madrugada. El usuario
+# espera 5 segundos porque esta mirando la pantalla; de noche no hay
+# nadie esperando, y con 5 una pagina lenta contaba como "el sitio
+# fallo", sumaba un intento de los tres y al tercero la carrera quedaba
+# descartada para siempre. Medido el 9/10/2026: 283 fallos de 1.023.
+ESPERA_DE_NOCHE = float(os.getenv("ESPERA_DE_NOCHE", "20"))
 
 TABULADAS = {"anotadas": 0, "ultima_siembra": ""}
 
@@ -5790,7 +5803,7 @@ def _anotar_tabuladas_que_faltan():
               - timedelta(days=365 * ANIOS_TABULADAS)).replace(tzinfo=None)
     hoy = hoy_argentina()
     hasta = (ahora_argentina()
-             + timedelta(days=DIAS_TABULADAS)).strftime("%Y-%m-%d")
+             + timedelta(days=max(0, DIAS_TABULADAS - 1))).strftime("%Y-%m-%d")
 
     calendario = lo_guardado("calendario") or []
     proximas = sorted(
@@ -5840,7 +5853,7 @@ def _anotar_tabuladas_que_faltan():
                         f = _fecha_de_la_campana(v.get("fecha", ""))
                         if not f or f < limite:
                             continue
-                        if _ya_guardada(url):
+                        if _sirve_para_tabulada(url):
                             continue
                         orden += 1
                         anotadas += _anotar_con_prioridad(
@@ -5855,6 +5868,55 @@ def _anotar_tabuladas_que_faltan():
     TABULADAS["anotadas"] = anotadas
     TABULADAS["ultima_siembra"] = ahora_argentina().strftime("%Y-%m-%d %H:%M")
     return anotadas
+
+
+def _anotar_falla(url, error):
+    """
+    Guarda por que fallo un pedido al Stud Book, en pocas palabras.
+    Se queda con el ultimo motivo de cada direccion.
+    """
+    try:
+        nombre = type(error).__name__
+        if "Timeout" in nombre:
+            motivo = "tardo demasiado"
+        elif "Connection" in nombre:
+            motivo = "no se pudo conectar"
+        else:
+            motivo = f"{nombre}: {str(error)[:70]}"
+        con = db()
+        con.execute("""
+            INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)
+            ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                             cambiado_en=excluded.cambiado_en
+        """, (f"falla:{url[-60:]}", motivo,
+              ahora_argentina().strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _sirve_para_tabulada(url):
+    """
+    Si esa carrera ya esta guardada CON LOS PUESTOS, no hace falta
+    pedirla de nuevo: la pantalla ya la puede mostrar.
+
+    Es mas permisivo que _ya_guardada, que ademas exige el perfil de cada
+    caballo (lo necesita el afinamiento del algoritmo, no la tabulada).
+    Con el criterio estricto se gastaban pedidos de la madrugada en
+    carreras que ya se veian bien.
+    """
+    try:
+        con = db()
+        f = con.execute("SELECT participantes FROM historico WHERE url=?",
+                        (url,)).fetchone()
+        con.close()
+        if not f or not f["participantes"]:
+            return False
+        ps = json.loads(f["participantes"])
+        return bool(ps) and any(p.get("puesto") for p in ps)
+    except Exception:
+        return False
 
 
 def _anotar_con_prioridad(con, url, tipo, fecha, orden):
@@ -5877,6 +5939,67 @@ def _anotar_con_prioridad(con, url, tipo, fecha, orden):
         return 1
     except Exception:
         return 0
+
+
+def _revivir_urgentes():
+    """
+    Una vez por dia, las tabuladas de los que corren vuelven a tener sus
+    tres intentos.
+
+    Por que: si el Stud Book falla tres veces con una, queda afuera de
+    la cola. Y el rescate que ya existia solo corre con la cola vacia,
+    que con 86.000 pendientes no pasa nunca. Resultado: una carrera que
+    fallo un dia no se pedia mas, y la reunion nunca quedaba completa.
+    (Lo noto Leandro el 8/10/2026: le faltaba la misma tabulada dos dias
+    seguidos.)
+
+    Una vez por dia y no siempre, para no quedar insistiendo toda la
+    noche con una pagina que no existe.
+    """
+    hoy = hoy_argentina()
+    # Si lo prendio a mano, revive SIEMPRE: el sentido de apretar
+    # Arrancar es justamente que busque lo que falta ahora.
+    a_mano = bool(A_MANO.get("prendido"))
+    try:
+        con = db()
+        ya = con.execute("SELECT valor FROM ajustes WHERE clave=?",
+                         ("urgentes_revividas",)).fetchone()
+        if ya and ya["valor"] == hoy and not a_mano:
+            con.close()
+            return 0
+        cur = con.execute(
+            "UPDATE por_explorar SET intentos=0 "
+            "WHERE prioridad=1 AND hecho=0 AND intentos >= 3")
+        cuantas = cur.rowcount or 0
+        con.execute("""
+            INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)
+            ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor,
+                                             cambiado_en=excluded.cambiado_en
+        """, ("urgentes_revividas", hoy,
+              ahora_argentina().strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit()
+        con.close()
+        return cuantas
+    except Exception:
+        return 0
+
+
+def _urgentes_que_fallaron():
+    """
+    Las tabuladas de los que corren que fallaron sus tres intentos.
+    Para mirarlas a mano: devuelve la direccion en el Stud Book.
+    """
+    try:
+        con = db()
+        filas = con.execute("""
+            SELECT url, fecha, intentos FROM por_explorar
+            WHERE prioridad=1 AND hecho=0 AND intentos >= 3
+            ORDER BY orden ASC LIMIT 200
+        """).fetchall()
+        con.close()
+        return [dict(f) for f in filas]
+    except Exception:
+        return []
 
 
 def _cuantas_prioritarias():
@@ -7190,37 +7313,38 @@ def _marcar_hecho(url):
         pass
 
 
-def _siguiente_de_la_cola():
+def _siguiente_de_la_cola(saltear=None):
     """
     Lo proximo a visitar.
 
-    Primero los CABALLOS, despues las carreras. Es al reves de como
-    estaba, y por un motivo: habia 10.957 carreras guardadas pero solo
-    904 fichas de caballos. Y en la ficha esta el tiempo, la edad, el
-    padre, la categoria... o sea todo lo que el algoritmo necesita para
-    medir si esas variables sirven. Sin ficha, esas variables no se
-    pueden usar.
+    Primero lo URGENTE: las tabuladas que necesitan las carreras que
+    vienen. Entre esas manda el numero de orden, que se reescribe en
+    cada siembra y va de la reunion mas proxima a la mas lejana.
 
-    Dentro de cada tipo, de lo mas nuevo a lo mas viejo.
+    Despues los CABALLOS y al final las carreras viejas. Es al reves de
+    como estaba, y por un motivo: habia 10.957 carreras guardadas pero
+    solo 904 fichas de caballos. Y en la ficha esta el tiempo, la edad,
+    el padre, la categoria... o sea todo lo que el algoritmo necesita.
+
+    saltear: las que ya se tomaron para el mismo lote, para no pedir dos
+    veces la misma pagina al mismo tiempo.
     """
+    fuera = list(saltear) if saltear else []
+    huecos = ",".join("?" * len(fuera)) if fuera else ""
     try:
         con = db()
-        fila = con.execute("""
+        fila = con.execute(f"""
             SELECT url, tipo, prioridad FROM por_explorar
             WHERE hecho=0 AND intentos < 3
+              {"AND url NOT IN (" + huecos + ")" if fuera else ""}
             ORDER BY prioridad DESC,
-                     -- Entre las urgentes manda el orden en que se
-                     -- anotaron, que va de la reunion mas proxima a la
-                     -- mas lejana. Si mandara la fecha, saldria primero
-                     -- la carrera vieja mas reciente, que no es lo que
-                     -- pidio Leandro: lo que se corre antes va antes.
                      CASE prioridad WHEN 1 THEN orden END ASC,
                      (tipo='caballo') DESC,
                      (fecha IS NULL OR fecha='') ASC,
                      fecha DESC,
                      rowid ASC
             LIMIT 1
-        """).fetchone()
+        """, fuera).fetchone()
         con.close()
         return dict(fila) if fila else None
     except Exception:
@@ -7315,9 +7439,13 @@ def guardar_carrera_historica(url):
         return 0
 
     try:
-        soup = fetch(url)
-    except Exception:
-        return -1   # el sitio no respondio
+        soup = fetch(url, espera=ESPERA_DE_NOCHE)
+    except Exception as e:
+        # Se anota QUE paso. Antes el error se tiraba y quedaba solo
+        # "el sitio fallo", sin saber si era lentitud, un rechazo o la
+        # pagina rota. Con esto se puede mirar al dia siguiente.
+        _anotar_falla(url, e)
+        return -1
 
     # La pagina de una carrera trae una sola; se busca cual es.
     data = None
@@ -7488,7 +7616,7 @@ def explorar_caballo(url_perfil):
     Devuelve cuantas carreras nuevas encontro.
     """
     try:
-        soup = fetch(url_perfil)
+        soup = fetch(url_perfil, espera=ESPERA_DE_NOCHE)
     except Exception:
         return -1
 
@@ -7909,9 +8037,21 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
         # Las tabuladas de los que corren van primero. Se resiembra
         # sola cuando termino con las de ayer: asi cada dia entran las
         # de la reunion nueva sin que nadie toque nada.
+        # Las tabuladas de los que corren hoy. Se anotan EN CADA TANDA.
+        #
+        # Antes esto corria solo cuando la fila de urgentes quedaba en
+        # cero, y como siempre quedaban algunas vivas, nunca volvia a
+        # anotar: las carreras que se guardaban despues de la ultima
+        # siembra no entraban jamas en la fila. Medido el 9/10/2026:
+        # faltaban 1.473 tabuladas y en la fila habia 38.
+        #
+        # Anotar es barato: no toca el sitio, solo mira lo guardado.
         try:
-            if (os.getenv("TRAER_TABULADAS", "1") == "1"
-                    and _cuantas_prioritarias() == 0):
+            revividas = _revivir_urgentes()
+            if revividas:
+                HISTORICO["ultimo"] = (
+                    f"{revividas} tabuladas vuelven a intentarse.")
+            if os.getenv("TRAER_TABULADAS", "1") == "1":
                 n = _anotar_tabuladas_que_faltan()
                 if n:
                     HISTORICO["ultimo"] = f"Anotadas {n} tabuladas de los que corren."
@@ -7929,49 +8069,84 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
             except Exception:
                 pass
 
-        for _ in range(cuantos):
-            siguiente = _siguiente_de_la_cola()
-            if not siguiente:
-                HISTORICO["ultimo"] = "No queda nada por explorar."
-                break
+        # De a varios a la vez. Antes iba de uno en uno: cada pedido
+        # esperaba 3 segundos al Stud Book mas 3 a 5 de pausa, y el
+        # servidor se pasaba el 99,7% del tiempo esperando sin hacer
+        # nada (medido: la base se lleva 1,2 s de una tanda de 270).
+        # La app ya pedia de a 8 al abrir una carrera, asi que el sitio
+        # tolera varios juntos; aca se usan menos, por prudencia.
+        # Cada uno espera su pausa igual: no se golpea mas rapido, se
+        # esperan varios al mismo tiempo.
+        # Arranca en 1, igual que siempre: primero hay que saber POR QUE
+        # falla el sitio. Si resulta que te frena por pedir mucho, pedir
+        # de a varios lo empeoraria. Se sube a 3 desde Render cuando se
+        # sepa, sin tocar el codigo.
+        juntos = max(1, int(os.getenv("PEDIDOS_HISTORICO_A_LA_VEZ", "1")))
 
+        def _hacer_uno(siguiente):
+            """Trae uno. Devuelve (siguiente, resultado)."""
             url, tipo = siguiente["url"], siguiente["tipo"]
             try:
                 con = db()
-                con.execute("UPDATE por_explorar SET intentos=intentos+1 WHERE url=?",
-                            (url,))
+                con.execute("UPDATE por_explorar SET intentos=intentos+1 "
+                            "WHERE url=?", (url,))
                 con.commit()
                 con.close()
             except Exception:
                 pass
-
-            if tipo == "carrera":
-                r = guardar_carrera_historica(url)
-                if r >= 0:
-                    HISTORICO["carreras_guardadas"] += 1
-                    HISTORICO["ultimo"] = f"carrera guardada · {url[-38:]}"
-            else:
-                r = explorar_caballo(url)
-                if r >= 0:
-                    HISTORICO["caballos_vistos"] += 1
-                    HISTORICO["ultimo"] = f"caballo explorado · {url[-38:]}"
-
-            if r < 0:
-                fallos += 1
-                _anotar_marca("fallos")
-                if fallos >= 3:
-                    HISTORICO["frenado_por_el_sitio"] = True
-                    HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
-                    _anotar_marca("tandas_cortadas")
-                    break
-            else:
-                fallos = 0
-                hechos += 1
-                _anotar_marca("urgentes" if siguiente.get("prioridad")
-                              else "normales")
-
-            HISTORICO["pendientes"] = _contar_pendientes()
+            try:
+                if tipo == "carrera":
+                    r = guardar_carrera_historica(url)
+                else:
+                    r = explorar_caballo(url)
+            except Exception:
+                r = -1
             _pausa_prudente()
+            return siguiente, r
+
+        quedan = cuantos
+        while quedan > 0:
+            # Se sacan varios de la cola ANTES de salir, y se marcan como
+            # tomados para que no los agarre otro hilo.
+            lote = []
+            for _ in range(min(juntos, quedan)):
+                s = _siguiente_de_la_cola(saltear=[x["url"] for x in lote])
+                if not s:
+                    break
+                lote.append(s)
+            if not lote:
+                HISTORICO["ultimo"] = "No queda nada por explorar."
+                break
+            quedan -= len(lote)
+
+            with ThreadPoolExecutor(max_workers=len(lote)) as pool:
+                resultados = list(pool.map(_hacer_uno, lote))
+
+            corto = False
+            for siguiente, r in resultados:
+                url, tipo = siguiente["url"], siguiente["tipo"]
+                if r >= 0:
+                    fallos = 0
+                    hechos += 1
+                    if tipo == "carrera":
+                        HISTORICO["carreras_guardadas"] += 1
+                        HISTORICO["ultimo"] = f"carrera guardada · {url[-38:]}"
+                    else:
+                        HISTORICO["caballos_vistos"] += 1
+                        HISTORICO["ultimo"] = f"caballo explorado · {url[-38:]}"
+                    _anotar_marca("urgentes" if siguiente.get("prioridad")
+                                  else "normales")
+                else:
+                    fallos += 1
+                    _anotar_marca("fallos")
+                    if fallos >= 3:
+                        HISTORICO["frenado_por_el_sitio"] = True
+                        HISTORICO["ultimo"] = "El sitio no responde. Se corta la tanda."
+                        _anotar_marca("tandas_cortadas")
+                        corto = True
+            HISTORICO["pendientes"] = _contar_pendientes()
+            if corto:
+                break
     finally:
         HISTORICO["corriendo"] = False
 
@@ -10719,6 +10894,43 @@ def admin_detener():
     return jsonify(ok=True, mensaje="Se pidió detener la recolección.")
 
 
+@app.get("/api/admin/tabuladas-que-fallaron")
+def admin_tabuladas_que_fallaron():
+    """
+    Las tabuladas de los que corren que el Stud Book no entrego en tres
+    intentos. Con la direccion, para mirarlas a mano.
+
+    Se vuelven a intentar solas una vez por dia; esta pantalla es para
+    las que siguen sin salir.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    fallaron = _urgentes_que_fallaron()
+    # El motivo de cada una, si quedo anotado.
+    try:
+        con = db()
+        for f in fallaron:
+            m = con.execute("SELECT valor, cambiado_en FROM ajustes "
+                            "WHERE clave=?",
+                            (f"falla:{f['url'][-60:]}",)).fetchone()
+            f["por_que"] = m["valor"] if m else "no quedó anotado"
+            f["cuando"] = m["cambiado_en"] if m else ""
+        con.close()
+    except Exception:
+        pass
+    motivos = {}
+    for f in fallaron:
+        motivos[f.get("por_que", "?")] = motivos.get(f.get("por_que", "?"), 0) + 1
+    return jsonify(
+        ok=True,
+        PARA_LEER=(f"{len(fallaron)} tabuladas no salieron en tres "
+                   f"intentos. Se reintentan al apretar Arrancar."),
+        cuantas=len(fallaron),
+        POR_QUE=motivos,
+        lista=fallaron,
+    )
+
+
 @app.get("/api/admin/medir-tabuladas")
 def admin_medir_tabuladas():
     """
@@ -10738,7 +10950,8 @@ def admin_medir_tabuladas():
     anios = int(request.args.get("anios", "2"))
 
     hoy = hoy_argentina()
-    hasta = (ahora_argentina() + timedelta(days=dias)).strftime("%Y-%m-%d")
+    hasta = (ahora_argentina()
+             + timedelta(days=max(0, dias - 1))).strftime("%Y-%m-%d")
     # La campaña del caballo trae la fecha como 26/07/2025. El calendario
     # la trae como 2025-07-26. Hay que comparar en el mismo idioma.
     limite = ahora_argentina() - timedelta(days=365 * anios)
@@ -10792,6 +11005,7 @@ def admin_medir_tabuladas():
         #    Se usa un conjunto: la misma carrera la corrieron varios, y
         #    se pide UNA sola vez.
         enlaces, sin_ficha, sin_enlace = set(), 0, 0
+        de_que_reunion = {}
         for perfil in perfiles:
             fila = con.execute(
                 "SELECT carreras FROM fichas WHERE perfil=?",
@@ -10805,6 +11019,8 @@ def admin_medir_tabuladas():
                         continue
                     if c.get("enlace"):
                         enlaces.add(c["enlace"])
+                        de_que_reunion[c["enlace"]] = (
+                            f"{c.get('fecha','')}|{c.get('hipodromo','')}")
                     else:
                         sin_enlace += 1
             except Exception:
@@ -10812,10 +11028,16 @@ def admin_medir_tabuladas():
 
         # 3) Cuantas de esas tabuladas YA estan guardadas.
         ya_estan = 0
+        faltan_reuniones = set()
         for enlace in enlaces:
             if con.execute("SELECT 1 FROM historico WHERE url=?",
                            (enlace,)).fetchone():
                 ya_estan += 1
+            else:
+                # Para saber si convendria pedir la reunion entera en vez
+                # de carrera por carrera: una reunion es una fecha en un
+                # hipodromo, y su pagina trae todas sus carreras juntas.
+                faltan_reuniones.add(de_que_reunion.get(enlace, enlace))
     finally:
         con.close()
 
@@ -10834,6 +11056,9 @@ def admin_medir_tabuladas():
         tabuladas_necesarias=len(enlaces),
         tabuladas_ya_guardadas=ya_estan,
         TABULADAS_QUE_FALTAN=faltan,
+        reuniones_distintas=len(faltan_reuniones),
+        carreras_por_reunion=(round(faltan / len(faltan_reuniones), 1)
+                              if faltan_reuniones else 0),
         minutos_para_traerlas=minutos,
         carreras_sin_enlace=sin_enlace,
         dias_mirados=dias,
