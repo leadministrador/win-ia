@@ -2159,6 +2159,29 @@ def normalize_text(value):
     return value
 
 
+_RE_LINK_CARRERA_CON_CABALLO = re.compile(
+    r"^(https?://(?:www\.)?studbook\.org\.ar/reuniones/carrera/\d+/\d+-[^/?#]+)/\d+/?$")
+
+
+def _url_canonica(url):
+    """
+    El link "de verdad" de una carrera, sin el numero del final.
+
+    MEDIDO el 11/10/2026: el link de una carrera termina con el ID del
+    CABALLO desde cuya ficha se llego (.../6-clasico-etoile-l-1200/434500
+    es ENVIDIADA, perfil/434500). La misma carrera tiene un link distinto
+    por cada caballo que corrio, y el sitio la devuelve igual sin ese
+    numero. Con el numero puesto, una carrera de 7 caballos se anotaba,
+    se pedia y se guardaba 7 veces, y la ficha de un caballo no
+    encontraba la carrera guardada con el link de otro.
+    Los links que no son de carrera (perfiles, reuniones) vuelven igual.
+    """
+    if not url:
+        return url
+    m = _RE_LINK_CARRERA_CON_CABALLO.match(url.strip())
+    return m.group(1) if m else url.strip()
+
+
 def meeting_date_from_url(url):
     match = re.search(r"(?<!\d)(20\d{6})(?!\d)", url or "")
     if not match:
@@ -4465,7 +4488,7 @@ def _carrera_guardada_para_tabulada(url, numero):
         con = db()
         f = con.execute(
             "SELECT numero, distancia, pista, estado, participantes "
-            "FROM historico WHERE url=?", (url,)).fetchone()
+            "FROM historico WHERE url=?", (_url_canonica(url),)).fetchone()
         con.close()
         if f and f["participantes"]:
             return {
@@ -4496,6 +4519,7 @@ def api_tabulada():
     if not (url.startswith(BASE) or url.startswith("https://studbook.org.ar")):
         return jsonify(ok=False, error="Dirección inválida."), 400
 
+    url = _url_canonica(url)
     clave = f"tabulada:{url}:{numero}"
     # NADIE VA AL SITIO. Una carrera corrida no cambia nunca: la tabulada
     # guardada vale para siempre. Antes vencia a los 30 dias, iba al Stud
@@ -5846,7 +5870,9 @@ def _anotar_tabuladas_que_faltan():
                     except Exception:
                         continue
                     for v in campana:
-                        url = v.get("enlace")
+                        # Sin el numero del caballo al final: asi la misma
+                        # carrera, vista desde 7 caballos, se anota UNA vez.
+                        url = _url_canonica(v.get("enlace"))
                         if not url or url in vistas:
                             continue
                         vistas.add(url)
@@ -5911,7 +5937,7 @@ def _sirve_para_tabulada(url):
     try:
         con = db()
         f = con.execute("SELECT participantes FROM historico WHERE url=?",
-                        (url,)).fetchone()
+                        (_url_canonica(url),)).fetchone()
         con.close()
         if not f or not f["participantes"]:
             return False
@@ -5930,6 +5956,7 @@ def _anotar_con_prioridad(con, url, tipo, fecha, orden):
     hace falta para la carrera de mañana.
     """
     try:
+        url = _url_canonica(url)
         con.execute("""
             INSERT INTO por_explorar(url, tipo, fecha, agregado_en,
                                      prioridad, orden)
@@ -7290,6 +7317,7 @@ def _sumar_a_la_cola(url, tipo, fecha=""):
     """
     if not url:
         return
+    url = _url_canonica(url)
     # Si no vino la fecha, se intenta sacar de la propia direccion.
     if not fecha:
         fecha = meeting_date_from_url(url)
@@ -7305,8 +7333,95 @@ def _sumar_a_la_cola(url, tipo, fecha=""):
         pass
 
 
+def _unificar_links_repetidos():
+    """
+    POR UNICA VEZ: junta las carreras guardadas bajo varios links (uno
+    por caballo) en un solo link, el canonico. Lo mismo en la cola.
+    Se guarda la marca "links_canonicos" en ajustes y no se repite.
+    Si dos copias de la misma carrera tienen datos distintos, se queda
+    con la que tiene mas puestos cargados.
+    Devuelve un resumen en palabras, o None si ya se habia hecho.
+    """
+    con = db()
+    try:
+        if con.execute("SELECT 1 FROM ajustes WHERE clave='links_canonicos'"
+                       ).fetchone():
+            return None
+
+        def puestos(url):
+            f = con.execute("SELECT participantes FROM historico WHERE url=?",
+                            (url,)).fetchone()
+            try:
+                return sum(1 for p in json.loads(f["participantes"])
+                           if p.get("puesto")) if f else -1
+            except Exception:
+                return 0
+
+        # --- historico ---
+        urls = [f["url"] for f in con.execute("SELECT url FROM historico")]
+        existen = set(urls)
+        h_renombradas = h_borradas = 0
+        for u in urls:
+            c = _url_canonica(u)
+            if c == u:
+                continue
+            if c in existen:
+                # Dos copias: se queda la que tiene mas puestos.
+                if puestos(u) > puestos(c):
+                    con.execute("DELETE FROM historico WHERE url=?", (c,))
+                    con.execute("UPDATE historico SET url=? WHERE url=?", (c, u))
+                else:
+                    con.execute("DELETE FROM historico WHERE url=?", (u,))
+                h_borradas += 1
+            else:
+                con.execute("UPDATE historico SET url=? WHERE url=?", (c, u))
+                existen.add(c)
+                h_renombradas += 1
+
+        # --- cola ---
+        filas = con.execute("SELECT url, hecho, intentos, prioridad, orden "
+                            "FROM por_explorar WHERE tipo='carrera'").fetchall()
+        por_url = {f["url"]: f for f in filas}
+        c_renombradas = c_borradas = 0
+        for f in filas:
+            u = f["url"]
+            c = _url_canonica(u)
+            if c == u:
+                continue
+            otra = por_url.get(c)
+            if otra is not None:
+                # Se funden: hecha si alguna lo estaba, prioridad si
+                # alguna la tenia, los intentos mas bajos, el orden mas bajo.
+                ordenes = [x for x in (otra["orden"], f["orden"]) if x is not None]
+                con.execute(
+                    "UPDATE por_explorar SET hecho=?, prioridad=?, intentos=?, "
+                    "orden=? WHERE url=?",
+                    (max(otra["hecho"] or 0, f["hecho"] or 0),
+                     max(otra["prioridad"] or 0, f["prioridad"] or 0),
+                     min(otra["intentos"] or 0, f["intentos"] or 0),
+                     min(ordenes) if ordenes else None, c))
+                con.execute("DELETE FROM por_explorar WHERE url=?", (u,))
+                c_borradas += 1
+            else:
+                con.execute("UPDATE por_explorar SET url=? WHERE url=?", (c, u))
+                por_url[c] = f
+                c_renombradas += 1
+
+        resumen = (f"historico: {h_renombradas} renombradas, {h_borradas} "
+                   f"repetidas borradas · cola: {c_renombradas} renombradas, "
+                   f"{c_borradas} fundidas")
+        con.execute("INSERT INTO ajustes(clave, valor, cambiado_en) VALUES(?,?,?)",
+                    ("links_canonicos", resumen,
+                     ahora_argentina().strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit()
+        return resumen
+    finally:
+        con.close()
+
+
 def _marcar_hecho(url):
     try:
+        url = _url_canonica(url)
         con = db()
         con.execute("UPDATE por_explorar SET hecho=1 WHERE url=?", (url,))
         con.commit()
@@ -7363,7 +7478,7 @@ def _ya_guardada(url):
     try:
         con = db()
         f = con.execute("SELECT participantes FROM historico WHERE url=?",
-                        (url,)).fetchone()
+                        (_url_canonica(url),)).fetchone()
         con.close()
         if not f:
             return False
@@ -7436,6 +7551,7 @@ def guardar_carrera_historica(url):
     Abre una carrera vieja, guarda quienes corrieron y anota a cada
     caballo para visitarlo despues. Devuelve cuantos caballos nuevos sumo.
     """
+    url = _url_canonica(url)
     if _ya_guardada(url):
         _marcar_hecho(url)
         return 0
@@ -8161,8 +8277,10 @@ def trabajar_una_tanda(cuantos=None, forzar=False):
                     # carreras. Ahora sigue con la siguiente de la cola;
                     # la que fallo suma un intento y se reintenta despues.
                     # El cartel solo avisa, no frena.
+                    # La marca "frenado_por_el_sitio" ya no se prende: el
+                    # panel la traducia como "Se freno... Sigue mañana", y
+                    # ahora no se frena. Solo el texto y la cuenta.
                     if fallos >= 3:
-                        HISTORICO["frenado_por_el_sitio"] = True
                         HISTORICO["ultimo"] = (
                             f"{fallos} fallas seguidas. Sigo con la siguiente.")
                         _anotar_marca("rachas_de_fallas")
@@ -8435,6 +8553,10 @@ def admin_diag_historico():
     }
 
     con = db()
+    u = con.execute("SELECT valor, cambiado_en FROM ajustes "
+                    "WHERE clave='links_canonicos'").fetchone()
+    informe["links_unificados"] = (
+        f"{u['valor']} ({u['cambiado_en']})" if u else "todavía no")
     informe["en_la_base"] = {
         "carreras": con.execute("SELECT COUNT(*) c FROM historico").fetchone()["c"],
         "fichas": con.execute("SELECT COUNT(*) c FROM fichas").fetchone()["c"],
@@ -11042,8 +11164,8 @@ def admin_medir_tabuladas():
                     if not _es_reciente(c.get("fecha", "")):
                         continue
                     if c.get("enlace"):
-                        enlaces.add(c["enlace"])
-                        de_que_reunion[c["enlace"]] = (
+                        enlaces.add(_url_canonica(c["enlace"]))
+                        de_que_reunion[_url_canonica(c["enlace"])] = (
                             f"{c.get('fecha','')}|{c.get('hipodromo','')}")
                     else:
                         sin_enlace += 1
@@ -11118,6 +11240,14 @@ def revision_diaria():
 
 
 init_db()
+
+# Por unica vez: unificar los links de carrera (uno por caballo -> uno
+# por carrera). Si falla, la app arranca igual; se reintenta al proximo
+# arranque porque no queda la marca.
+try:
+    _unificar_links_repetidos()
+except Exception:
+    pass
 
 if os.getenv("REVISION_AUTOMATICA", "1") == "1":
     threading.Thread(target=revision_diaria, daemon=True).start()
