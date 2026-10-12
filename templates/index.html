@@ -2509,6 +2509,39 @@ async function elegirCarrera(c, itemEl){
   verSiHayVivo(fechaElegida || '',
                (hipodromoElegido || {}).hipodromo || '');
 
+  // MOTOR (12/10/2026): si está prendido, la carrera ya viene armada de
+  // fondo. La pantalla la muestra y no calcula nada. Si el motor todavía
+  // no llegó a esta carrera, lo dice. Con el motor apagado, lo de siempre.
+  try{
+    const listo = await apiGet('/api/motor/pronostico?url=' + encodeURIComponent(meetingUrlElegida)
+                               + '&numero=' + encodeURIComponent(c.numero));
+    if (listo && listo.listo){
+      participantesActuales = listo.participantes && listo.participantes.length
+                              ? listo.participantes : participantesActuales;
+      ultimoContexto = {pista_dia: carreraData.estado || '', url: meetingUrlElegida,
+                        numero: c.numero, fecha: fechaElegida,
+                        hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
+                        hora: c.hora || ''};
+      ultimosParticipantes = participantesActuales;
+      ultimaCarreraData = carreraData;
+      retiradosPorMi = []; misDatos = {}; historialCaballo = {};
+      try{
+        await traerDatosOficiales(ultimoContexto.fecha, ultimoContexto.hipodromo);
+        await traerCondiciones(ultimoContexto.fecha, ultimoContexto.hipodromo);
+      }catch(e){}
+      renderCompetidores(participantesActuales);
+      renderPronostico(listo.ranking || [], listo);
+      ocultarBarra();
+      return;
+    }
+    if (listo && listo.motor && !listo.listo){
+      renderCompetidores(participantesActuales);
+      pron.innerHTML = estadoMsg(listo.mensaje || 'El motor todavía no armó esta carrera.', false);
+      ocultarBarra();
+      return;
+    }
+  }catch(e){ /* motor apagado o sin respuesta: sigue lo de siempre */ }
+
   // Enriquecer (campaña) y luego pedir el análisis.
   const n = participantesActuales.length;
   mostrarBarra(`Campaña de ${n} participantes`, 'Analizando la carrera');
