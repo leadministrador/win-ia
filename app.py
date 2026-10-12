@@ -1339,7 +1339,14 @@ def detalle_de_carrera(url_carrera, ir_al_sitio=True):
 TTL_FICHA_CABALLO = 6 * 60 * 60   # 6 horas: la campaña no cambia en el día
 
 
-def enrich_horse(horse, ir_al_sitio=False):
+# Cuantos dias puede tener la ficha guardada de un caballo QUE CORRE
+# antes de volver a traerla. MEDIDO el 11/10/2026: EL ANGUS tenia la ficha
+# de hace semanas y la tarjeta no mostraba sus 2 carreras mas nuevas
+# (17/09 y 05/10), porque la ficha guardada se usaba "para siempre".
+DIAS_FICHA_FRESCA = int(os.getenv("DIAS_FICHA_FRESCA", "1"))
+
+
+def enrich_horse(horse, ir_al_sitio=False, refrescar=False):
     """
     Completa el caballo con su campaña.
 
@@ -1370,9 +1377,26 @@ def enrich_horse(horse, ir_al_sitio=False):
     # de campañas guardadas y no las usaba: iba al sitio igual.
     try:
         con = db()
-        f = con.execute("SELECT carreras, datos FROM fichas WHERE perfil=?",
-                        (profile,)).fetchone()
+        f = con.execute("SELECT carreras, datos, actualizada_en FROM fichas "
+                        "WHERE perfil=?", (profile,)).fetchone()
         con.close()
+        # refrescar=True lo manda SOLO la tarea de las 22 (los que corren
+        # mañana). Si la ficha tiene mas de DIAS_FICHA_FRESCA dias, se
+        # vuelve a traer entera con explorar_caballo: eso actualiza la
+        # tabla fichas (la que lee la tarjeta) y anota en la cola las
+        # carreras nuevas, para que el historico traiga sus tabuladas.
+        # Si el sitio falla, se sigue con la ficha vieja: mejor que nada.
+        if (f and ir_al_sitio and refrescar
+                and (f["actualizada_en"] or "") <
+                    (datetime.now() - timedelta(days=DIAS_FICHA_FRESCA)
+                     ).isoformat(timespec="seconds")):
+            if explorar_caballo(profile) >= 0:
+                con = db()
+                f = con.execute("SELECT carreras, datos, actualizada_en "
+                                "FROM fichas WHERE perfil=?",
+                                (profile,)).fetchone()
+                con.close()
+                horse["refrescada"] = True
         if f and f["carreras"] is not None:
             carreras = json.loads(f["carreras"])
             if not carreras:
@@ -6067,8 +6091,9 @@ def _dejar_todo_listo(data, reunion, carrera):
         for p in corredores:
             perfil = p.get("perfil", "")
             antes = cache_get(f"ficha:{perfil}", TTL_FICHA_CABALLO)[1] if perfil else True
-            completos.append(enrich_horse(dict(p), ir_al_sitio=True))
-            if perfil and not antes:
+            completo = enrich_horse(dict(p), ir_al_sitio=True, refrescar=True)
+            completos.append(completo)
+            if perfil and (not antes or completo.get("refrescada")):
                 ADELANTO["campanas"] = ADELANTO.get("campanas", 0) + 1
                 time.sleep(pausa)
 
