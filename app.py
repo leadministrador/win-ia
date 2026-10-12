@@ -7765,7 +7765,8 @@ def explorar_caballo(url_perfil):
     """
     try:
         soup = fetch(url_perfil, espera=ESPERA_DE_NOCHE)
-    except Exception:
+    except Exception as e:
+        _anotar_falla(url_perfil, e)   # antes se perdia el motivo
         return -1
 
     carreras = _tabla_carreras_del_perfil(soup)
@@ -7775,7 +7776,11 @@ def explorar_caballo(url_perfil):
     # REPLACE, pisaba la buena que ya estaba), se marcaba hecho y el panel
     # decia "caballo explorado". Ese caballo despues no aportaba ninguna
     # carrera a la siembra, y el medidor lo contaba como "con ficha".
-    if not carreras:
+    # OJO: un DEBUTANTE tampoco tiene tabla. El Stud Book pone "Sin
+    # actuación" (MEDIDO el 12/10/2026 con TU BELLEZA, que corre el 12/10).
+    # Ese se guarda con la campaña vacia, como siempre: la app lo muestra
+    # como DEBUTANTE. Solo es falla si la pagina no dice eso.
+    if not carreras and "sin actuaci" not in clean(soup.get_text(" ")).lower():
         _anotar_falla(url_perfil, "bajo bien pero no se pudo leer la campaña")
         return -1
 
