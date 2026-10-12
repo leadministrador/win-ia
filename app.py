@@ -1292,7 +1292,7 @@ def _resumen_del_perfil(soup, texto):
 TTL_DETALLE_CARRERA = 30 * 24 * 60 * 60   # 30 dias: una carrera corrida ya no cambia
 
 
-def detalle_de_carrera(url_carrera, ir_al_sitio=True):
+def detalle_de_carrera(url_carrera, ir_al_sitio=True, soup=None):
     """
     Entra a la pagina de una carrera y saca, en palabras, la condicion
     y el estado de la pista. Se guarda en cache porque una carrera ya
@@ -1313,7 +1313,11 @@ def detalle_de_carrera(url_carrera, ir_al_sitio=True):
         return {}
 
     try:
-        soup = fetch(url_carrera)
+        # Si quien llama ya tiene la pagina (el historico la acaba de
+        # bajar), no se pide de nuevo. MEDIDO 12/10/2026: cada tabulada
+        # eran DOS pedidos al Stud Book por esto. Ahora uno.
+        if soup is None:
+            soup = fetch(url_carrera)
         texto = clean(soup.get_text(" "))
 
         def sacar(patron):
@@ -1386,10 +1390,14 @@ def enrich_horse(horse, ir_al_sitio=False, refrescar=False):
         # tabla fichas (la que lee la tarjeta) y anota en la cola las
         # carreras nuevas, para que el historico traiga sus tabuladas.
         # Si el sitio falla, se sigue con la ficha vieja: mejor que nada.
+        # refrescar="siempre": el caballo CORRIO HOY (decision de Leandro
+        # 12/10/2026, opcion A): su ficha quedo vieja seguro, se trae sin
+        # mirar la edad. Asi al otro dia, al buscarlo, esta la de ayer.
         if (f and ir_al_sitio and refrescar
-                and (f["actualizada_en"] or "") <
-                    (datetime.now() - timedelta(days=DIAS_FICHA_FRESCA)
-                     ).isoformat(timespec="seconds")):
+                and (refrescar == "siempre"
+                     or (f["actualizada_en"] or "") <
+                        (datetime.now() - timedelta(days=DIAS_FICHA_FRESCA)
+                         ).isoformat(timespec="seconds"))):
             if explorar_caballo(profile) >= 0:
                 con = db()
                 f = con.execute("SELECT carreras, datos, actualizada_en "
@@ -5816,7 +5824,18 @@ ANIOS_TABULADAS = int(os.getenv("ANIOS_TABULADAS", "2"))
 # tres dias y no completaba ninguno. Leandro lo dijo claro el 9/10/2026:
 # "quiero que complete las carreras del dia". Primero el dia que la gente
 # esta mirando; si sobra tiempo, la noche sigue con lo demas igual.
-DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "1"))
+# 0 = TODO lo publicado, sin tope de dias (decision de Leandro, 12/10/2026:
+# "que mire todo"). Antes 1 = solo hoy (9/10), antes 3. La siembra va de la
+# reunion mas proxima a la mas lejana, asi que hoy sigue yendo primero.
+DIAS_TABULADAS = int(os.getenv("DIAS_TABULADAS", "0"))
+
+
+def _hasta_cuando_tabuladas():
+    """Ultimo dia que mira la siembra. Sin tope si DIAS_TABULADAS es 0."""
+    if DIAS_TABULADAS <= 0:
+        return "9999-12-31"
+    return (ahora_argentina()
+            + timedelta(days=max(0, DIAS_TABULADAS - 1))).strftime("%Y-%m-%d")
 
 # Cuanto esperar al Stud Book en las tareas de madrugada. El usuario
 # espera 5 segundos porque esta mirando la pantalla; de noche no hay
@@ -5850,8 +5869,7 @@ def _anotar_tabuladas_que_faltan():
     limite = (ahora_argentina()
               - timedelta(days=365 * ANIOS_TABULADAS)).replace(tzinfo=None)
     hoy = hoy_argentina()
-    hasta = (ahora_argentina()
-             + timedelta(days=max(0, DIAS_TABULADAS - 1))).strftime("%Y-%m-%d")
+    hasta = _hasta_cuando_tabuladas()
 
     calendario = lo_guardado("calendario") or []
     proximas = sorted(
@@ -6088,10 +6106,15 @@ def _dejar_todo_listo(data, reunion, carrera):
         #    un caballo que corre varias veces se pide una sola vez.
         completos = []
         pausa = float(os.getenv("PAUSA_ADELANTO", "1.0"))
+        # La reunion de HOY ya se corrio cuando esto arranca (22 hs): sus
+        # caballos tienen una carrera nueva seguro -> ficha de nuevo, sin
+        # mirar la edad. Las de los dias que vienen: solo si esta vieja.
+        corrio_hoy = reunion.get("fecha", "") == hoy_argentina()
         for p in corredores:
             perfil = p.get("perfil", "")
             antes = cache_get(f"ficha:{perfil}", TTL_FICHA_CABALLO)[1] if perfil else True
-            completo = enrich_horse(dict(p), ir_al_sitio=True, refrescar=True)
+            completo = enrich_horse(dict(p), ir_al_sitio=True,
+                                    refrescar=("siempre" if corrio_hoy else True))
             completos.append(completo)
             if perfil and (not antes or completo.get("refrescada")):
                 ADELANTO["campanas"] = ADELANTO.get("campanas", 0) + 1
@@ -6458,7 +6481,8 @@ def revision_de_avisos():
             h = ahora_argentina().hour
             hoy = hoy_argentina()
             if (ADELANTO_DESDE <= h <= ADELANTO_HASTA
-                    and ADELANTO.get("ultima_vez", "")[:10] != hoy):
+                    and ADELANTO.get("ultima_vez", "")[:10] != hoy
+                    and not ajuste("motor")):
                 traer_las_que_vienen()
         except Exception:
             pass
@@ -6870,6 +6894,12 @@ AJUSTES_POSIBLES = [
      "ayuda": ("De 3 a 7 de la mañana busca carreras viejas, despacio, "
                "para no molestar al Stud Book. Apagalo si algo anda mal."),
      "por_defecto": "1"},
+    {"clave": "motor", "titulo": "Motor nuevo: un solo circuito",
+     "ayuda": ("Reunión más próxima → carrera → caballos → todas sus tabuladas → "
+               "pronóstico guardado. Prendido, reemplaza a las tareas de las 22 "
+               "y de 0 a 7, y la pantalla muestra el pronóstico guardado. "
+               "Apagado, todo sigue como siempre."),
+     "por_defecto": "0"},
 ]
 
 
@@ -7683,7 +7713,7 @@ def guardar_carrera_historica(url):
 
     detalle = {}
     try:
-        detalle = detalle_de_carrera(url)
+        detalle = detalle_de_carrera(url, soup=soup)   # misma pagina, sin otro pedido
     except Exception:
         pass
 
@@ -7835,6 +7865,10 @@ def explorar_caballo(url_perfil):
         """, (url_perfil, nombre, json.dumps(livianas, ensure_ascii=False),
               json.dumps(propios, ensure_ascii=False),
               datetime.now().isoformat(timespec="seconds")))
+        # Y se tira el cache de 6 horas de esta ficha: /api/enriquecer lo
+        # mira ANTES que la tabla, y si no, la pantalla seguia mostrando
+        # la campaña vieja hasta 6 horas despues de refrescarla.
+        con.execute("DELETE FROM cache WHERE clave=?", (f"ficha:{url_perfil}",))
         con.commit()
         con.close()
     except Exception:
@@ -8337,7 +8371,9 @@ def recolectar_historico():
 
     while True:
         try:
-            if _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
+            if ajuste("motor"):
+                pass   # el motor hace este trabajo
+            elif _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
                 trabajar_una_tanda(cuantos=40)
 
             # El afinamiento va DESPUES del historico, de 7 a 9, nunca
@@ -8513,8 +8549,13 @@ def admin_historico_arrancar():
     A_MANO["desde"] = ahora_argentina().strftime("%H:%M")
 
     # Arranca a trabajar YA, sin esperar nada.
-    threading.Thread(target=trabajar_una_tanda,
-                     kwargs={"forzar": True}, daemon=True).start()
+    if ajuste("motor"):
+        # Con el motor prendido, Arrancar hace una pasada del circuito
+        # entero, a cualquier hora (de a uno, con pausa, como siempre).
+        threading.Thread(target=motor.una_pasada, daemon=True).start()
+    else:
+        threading.Thread(target=trabajar_una_tanda,
+                         kwargs={"forzar": True}, daemon=True).start()
 
     return jsonify(ok=True, prendido=True,
                    mensaje=("Arrancando. Va a juntar carreras hasta que lo "
@@ -11128,6 +11169,94 @@ def admin_tabuladas_que_fallaron():
     )
 
 
+@app.get("/api/motor/pronostico")
+def api_motor_pronostico():
+    """
+    El pronóstico GUARDADO de una carrera, para la pantalla. No va al
+    sitio, no calcula. Si el motor está apagado, la pantalla sigue con
+    lo de siempre (calcular al abrir).
+    """
+    url = request.args.get("url", "").strip()
+    numero = request.args.get("numero", "").strip()
+    encendido = ajuste("motor")
+    if not encendido:
+        return jsonify(ok=True, motor=False, listo=False)
+    listo = motor.pronostico_guardado(url, numero) if url and numero else None
+    if not listo or not listo.get("ranking"):
+        return jsonify(ok=True, motor=True, listo=False,
+                       mensaje="El motor todavía no armó esta carrera. "
+                               "Se arma sola, de fondo.")
+    return jsonify(ok=True, motor=True, listo=True,
+                   ranking=listo.get("ranking", []),
+                   participantes=listo.get("participantes", []),
+                   confianza=listo.get("confianza", 0),
+                   ya_corrida=listo.get("ya_corrida", False),
+                   condiciones_oficiales=listo.get("condiciones_oficiales", {}),
+                   armado_en=listo.get("armado_en", ""))
+
+
+@app.get("/api/admin/motor")
+def admin_motor():
+    """En qué anda el motor: reunión, carrera, cuántas listas, fallas."""
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    return jsonify(ok=True, **motor.estado())
+
+
+@app.get("/api/admin/refrescar-fichas-de-hoy")
+def admin_refrescar_fichas_de_hoy():
+    """
+    Anota ADELANTE DE TODO en la cola el perfil de cada caballo que corre
+    hoy (y los dias de DIAS_TABULADAS), para que el historico vuelva a
+    traer su ficha entera. No toca el sitio: solo anota. El historico
+    (Arrancar, o su horario) los trae uno por uno, y la siembra de cada
+    tanda anota despues las carreras nuevas que aparezcan en esas fichas.
+
+    Para que: la tarea de las 22 del 11/10/2026 corrio con el codigo
+    viejo, que no refrescaba fichas, y los 131 de Palermo del 12/10
+    salieron con la campaña vieja (EL ANGUS sin su carrera del 05/10).
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    hoy = hoy_argentina()
+    hasta = _hasta_cuando_tabuladas()
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted(
+        [r for r in calendario if hoy <= r.get("fecha", "") <= hasta],
+        key=lambda r: r["fecha"])
+    perfiles, vistos = [], set()
+    for reunion in proximas:
+        clave = (f"reuniones:{reunion['fecha']}:"
+                 f"{normalize_text(reunion['hipodromo'])}")
+        guardada = lo_guardado(clave) or []
+        if not guardada:
+            continue
+        bloque = guardada[0]
+        for c in bloque.get("carreras", []):
+            data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+            for p in (data or {}).get("participantes", []):
+                perfil = p.get("perfil", "")
+                if perfil and not p.get("retirado") and perfil not in vistos:
+                    vistos.add(perfil)
+                    perfiles.append(perfil)
+    con = db()
+    try:
+        # Orden negativo: van ANTES que las tabuladas urgentes (orden 1..n),
+        # en el orden de las carreras del dia.
+        for i, perfil in enumerate(perfiles):
+            _anotar_con_prioridad(con, perfil, "caballo", "", i - len(perfiles))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(
+        ok=True,
+        PARA_LEER=(f"{len(perfiles)} perfiles de los que corren anotados "
+                   f"adelante de todo. Apretar Arrancar para traerlos ahora; "
+                   f"a ~1 por minuto tardan {len(perfiles)} minutos."),
+        perfiles=len(perfiles), reuniones=len(proximas),
+    )
+
+
 @app.get("/api/admin/medir-tabuladas")
 def admin_medir_tabuladas():
     """
@@ -11147,8 +11276,10 @@ def admin_medir_tabuladas():
     anios = int(request.args.get("anios", "2"))
 
     hoy = hoy_argentina()
-    hasta = (ahora_argentina()
-             + timedelta(days=max(0, dias - 1))).strftime("%Y-%m-%d")
+    # dias=0 -> todo lo publicado, igual que la siembra.
+    hasta = ("9999-12-31" if dias <= 0 else
+             (ahora_argentina() + timedelta(days=max(0, dias - 1))
+              ).strftime("%Y-%m-%d"))
     # La campaña del caballo trae la fecha como 26/07/2025. El calendario
     # la trae como 2025-07-26. Hay que comparar en el mismo idioma.
     limite = ahora_argentina() - timedelta(days=365 * anios)
@@ -11291,6 +11422,14 @@ def revision_diaria():
 
 
 init_db()
+
+# El motor (motor.py): el circuito del dibujo. Solo trabaja si el
+# interruptor "motor" del panel esta prendido.
+import sys
+import motor
+motor.conectar(sys.modules[__name__])
+if os.getenv("MOTOR_HILO", "1") == "1":
+    motor.arrancar_hilo()
 
 # Por unica vez: unificar los links de carrera (uno por caballo -> uno
 # por carrera). Si falla, la app arranca igual; se reintenta al proximo
