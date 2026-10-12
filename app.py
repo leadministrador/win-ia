@@ -11092,6 +11092,25 @@ def admin_tabuladas_que_fallaron():
     motivos = {}
     for f in fallaron:
         motivos[f.get("por_que", "?")] = motivos.get(f.get("por_que", "?"), 0) + 1
+
+    # Las ULTIMAS FALLAS, vengan de donde vengan. La lista de arriba solo
+    # muestra las urgentes con 3 intentos, y con Arrancar prendido se les
+    # ponen los intentos en cero en cada tanda: nunca llegan. Esto lee
+    # derecho lo que anota _anotar_falla, sin mirar intentos ni prioridad.
+    ultimas, cuenta = [], {}
+    try:
+        con = db()
+        for f in con.execute(
+                "SELECT clave, valor, cambiado_en FROM ajustes "
+                "WHERE clave LIKE 'falla:%' ORDER BY cambiado_en DESC LIMIT 30"):
+            ultimas.append({"cuando": f["cambiado_en"][11:16],
+                            "motivo": f["valor"],
+                            "link": "…" + f["clave"][6:][-40:]})
+            cuenta[f["valor"]] = cuenta.get(f["valor"], 0) + 1
+        con.close()
+    except Exception:
+        pass
+
     return jsonify(
         ok=True,
         PARA_LEER=(f"{len(fallaron)} tabuladas no salieron en tres "
@@ -11099,6 +11118,8 @@ def admin_tabuladas_que_fallaron():
         cuantas=len(fallaron),
         POR_QUE=motivos,
         lista=fallaron,
+        ULTIMAS_FALLAS=ultimas,
+        ULTIMAS_FALLAS_POR_MOTIVO=cuenta,
     )
 
 
