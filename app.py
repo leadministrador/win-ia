@@ -11259,6 +11259,216 @@ def admin_refrescar_fichas_de_hoy():
     )
 
 
+# ===================================================================
+# LO QUE VIENE (Leandro, 13/10/2026): un lugar en el panel que dice cuantas
+# carreras hay a la vista, cuantas estan cargadas, cuantas tienen su
+# pronostico y TODAS sus tabuladas (de la ultima hacia atras), y que es lo
+# que el motor NO pudo traer (tabuladas en "a mano", fichas, debutantes).
+# La app le AVISA al celular cuando hay algo nuevo sin traer; el lo mira y
+# aprieta "Traer ahora". Nada va al sitio salvo ese boton.
+# ===================================================================
+_LO_QUE_VIENE_CACHE = {"cuando": 0.0, "datos": None}
+
+
+def resumen_lo_que_viene():
+    """Cuenta todo de lo guardado. 0 pedidos al sitio. Se guarda 60 s."""
+    if time.time() - _LO_QUE_VIENE_CACHE["cuando"] < 60 and _LO_QUE_VIENE_CACHE["datos"]:
+        return _LO_QUE_VIENE_CACHE["datos"]
+    hoy = hoy_argentina()
+    calendario = lo_guardado("calendario") or []
+    proximas = sorted([r for r in calendario if r.get("fecha", "") >= hoy],
+                      key=lambda r: r["fecha"])
+    con = db()
+    # Todo el historico con puestos, una sola vez (en vez de una consulta por link).
+    con_puestos = set()
+    for f in con.execute("SELECT url, participantes FROM historico").fetchall():
+        try:
+            if any(p.get("puesto") for p in json.loads(f["participantes"] or "[]")):
+                con_puestos.add(f["url"])
+        except Exception:
+            continue
+    a_mano_cola = {f["url"]: f["intentos"] for f in con.execute(
+        "SELECT url, intentos FROM por_explorar WHERE hecho=0 AND intentos>=3").fetchall()}
+    motivos = {f["clave"][len("falla:"):]: f["valor"] for f in con.execute(
+        "SELECT clave, valor FROM ajustes WHERE clave LIKE 'falla:%'").fetchall()}
+
+    def motivo_de(url):
+        return motivos.get(url[-60:], "")
+
+    reuniones, faltan = [], []
+    tot = {"carreras": 0, "cargadas": 0, "con_pronostico": 0, "completas": 0,
+           "tabuladas_necesarias": 0, "tabuladas_guardadas": 0, "caballos": 0,
+           "sin_ficha": 0, "debutantes": 0, "a_mano": 0}
+    vistos_perfil, vistos_link = set(), set()
+    for reunion in proximas:
+        clave = f"reuniones:{reunion['fecha']}:{normalize_text(reunion['hipodromo'])}"
+        guardada = lo_guardado(clave) or []
+        hip = _limpiar_nombre_hipodromo(reunion.get("hipodromo", ""))
+        fila_r = {"fecha": reunion["fecha"], "hipodromo": hip, "url": reunion["url"],
+                  "carreras": []}
+        if not guardada:
+            fila_r["nota"] = "publicada, todavía no cargada"
+            reuniones.append(fila_r)
+            continue
+        bloque = guardada[0]
+        for c in bloque.get("carreras", []):
+            tot["carreras"] += 1
+            data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
+            fc = {"numero": c["numero"], "hora": c.get("hora", ""), "cargada": bool(data),
+                  "pronostico": False, "corredores": 0, "tab_necesarias": 0, "tab_guardadas": 0}
+            if data:
+                tot["cargadas"] += 1
+                listo = lo_guardado(f"listo:{bloque['url']}:{c['numero']}")
+                fc["pronostico"] = bool(listo and listo.get("ranking"))
+                tot["con_pronostico"] += 1 if fc["pronostico"] else 0
+                for p in data.get("participantes", []):
+                    if p.get("retirado") or not p.get("perfil"):
+                        continue
+                    fc["corredores"] += 1
+                    perfil = p["perfil"]
+                    nombre = p.get("nombre", "")
+                    etiqueta = f"{reunion['fecha']} {hip} {c['numero']}ª · {nombre}"
+                    ficha = con.execute("SELECT carreras FROM fichas WHERE perfil=?", (perfil,)).fetchone()
+                    if perfil not in vistos_perfil:
+                        vistos_perfil.add(perfil); tot["caballos"] += 1
+                        if not ficha:
+                            tot["sin_ficha"] += 1
+                            faltan.append({"tipo": "ficha", "que": etiqueta, "url": perfil,
+                                           "motivo": motivo_de(perfil) or "todavía no se pidió"})
+                        else:
+                            try:
+                                camp = json.loads(ficha["carreras"] or "[]")
+                            except Exception:
+                                camp = []
+                            if not camp:
+                                tot["debutantes"] += 1
+                                faltan.append({"tipo": "debutante", "que": etiqueta, "url": perfil,
+                                               "motivo": "sin campaña en el Stud Book (debutante)"})
+                    if not ficha:
+                        continue
+                    try:
+                        camp = json.loads(ficha["carreras"] or "[]")
+                    except Exception:
+                        camp = []
+                    for x in camp:
+                        url = _url_canonica(x.get("enlace") or "")
+                        if not url.startswith("http"):
+                            continue
+                        fc["tab_necesarias"] += 1
+                        if url in con_puestos:
+                            fc["tab_guardadas"] += 1
+                        elif url in a_mano_cola and url not in vistos_link:
+                            vistos_link.add(url)
+                            tot["a_mano"] += 1
+                            faltan.append({"tipo": "tabulada", "que": f"{etiqueta} · {x.get('fecha','')} {x.get('hipodromo','')}",
+                                           "url": url, "motivo": motivo_de(url) or f"{a_mano_cola[url]} intentos"})
+                fc["completa"] = fc["tab_necesarias"] == fc["tab_guardadas"]
+                tot["completas"] += 1 if fc["completa"] else 0
+                tot["tabuladas_necesarias"] += fc["tab_necesarias"]
+                tot["tabuladas_guardadas"] += fc["tab_guardadas"]
+            fila_r["carreras"].append(fc)
+        reuniones.append(fila_r)
+    con.close()
+    datos = {"ok": True, "hoy": hoy, "totales": tot, "reuniones": reuniones, "faltan": faltan,
+             "PARA_LEER": (f"{tot['carreras']} carreras a la vista · {tot['cargadas']} cargadas · "
+                           f"{tot['con_pronostico']} con pronóstico · {tot['completas']} con todas sus tabuladas · "
+                           f"faltan {tot['tabuladas_necesarias'] - tot['tabuladas_guardadas']} tabuladas · "
+                           f"{len(faltan)} cosas para traer a mano")}
+    _LO_QUE_VIENE_CACHE.update(cuando=time.time(), datos=datos)
+    return datos
+
+
+@app.get("/api/admin/lo-que-viene")
+def admin_lo_que_viene():
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    if request.args.get("fresco") == "1":
+        _LO_QUE_VIENE_CACHE["cuando"] = 0.0
+    return jsonify(resumen_lo_que_viene())
+
+
+@app.post("/api/admin/traer-ahora")
+def admin_traer_ahora():
+    """
+    El boton "Traer ahora": pide UNA cosa al Stud Book (una tabulada o una
+    ficha) y la carga como si la hubiera traido el motor. Es la unica
+    excepcion a "nadie va al sitio", y la aprieta Leandro.
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    d = request.get_json(silent=True) or {}
+    tipo, url = d.get("tipo", ""), (d.get("url") or "").strip()
+    if not url.startswith(BASE):
+        return jsonify(ok=False, error="Dirección inválida."), 400
+    try:
+        if tipo == "tabulada":
+            url = _url_canonica(url)
+            con = db()
+            con.execute("UPDATE por_explorar SET intentos=0 WHERE url=?", (url,))
+            con.commit(); con.close()
+            r = guardar_carrera_historica(url)
+            bien = r >= 0 or _sirve_para_tabulada(url)
+        else:
+            r = explorar_caballo(url)
+            bien = r >= 0
+    except Exception as e:
+        _anotar_falla(url, e)
+        bien = False
+    _LO_QUE_VIENE_CACHE["cuando"] = 0.0
+    con = db()
+    motivo = con.execute("SELECT valor FROM ajustes WHERE clave=?", (f"falla:{url[-60:]}",)).fetchone()
+    con.close()
+    return jsonify(ok=bien, url=url,
+                   mensaje="Traída y cargada." if bien else
+                           f"No se pudo: {(motivo['valor'] if motivo else 'sin motivo')}")
+
+
+def avisar_a_los_admins(titulo, cuerpo, url="/admin"):
+    """Un aviso al celular de cada usuario marcado como admin."""
+    try:
+        con = db()
+        subs = con.execute("""
+            SELECT s.* FROM suscripciones s JOIN usuarios u ON u.id = s.usuario_id
+            WHERE u.es_admin = 1""").fetchall()
+        con.close()
+    except Exception:
+        return 0
+    return sum(1 for s in subs if enviar_aviso(dict(s), titulo, cuerpo, url=url, etiqueta="lo-que-viene"))
+
+
+def avisar_lo_que_viene():
+    """
+    La llama el motor al terminar cada pasada. Si hay cosas sin traer y
+    son DISTINTAS a las del ultimo aviso, manda UN aviso al celular de
+    Leandro. Si no cambio nada, no molesta.
+    """
+    try:
+        _LO_QUE_VIENE_CACHE["cuando"] = 0.0
+        d = resumen_lo_que_viene()
+        faltan = d["faltan"]
+        huella = "|".join(sorted(f["url"] for f in faltan))
+        con = db()
+        ultimo = con.execute("SELECT valor FROM ajustes WHERE clave='aviso_lo_que_viene'").fetchone()
+        con.close()
+        if not faltan or (ultimo and ultimo["valor"] == huella):
+            return 0
+        por_tipo = {}
+        for f in faltan:
+            por_tipo[f["tipo"]] = por_tipo.get(f["tipo"], 0) + 1
+        partes = [f"{n} {t}{'s' if n != 1 else ''}" for t, n in por_tipo.items()]
+        cuerpo = ("El motor no pudo traer: " + ", ".join(partes)
+                  + ". Tocá para verlas y traerlas con un botón.")
+        n = avisar_a_los_admins("LEA WIN IA · falta algo", cuerpo, url="/admin#lo-que-viene")
+        con = db()
+        con.execute("""INSERT INTO ajustes(clave, valor, cambiado_en) VALUES('aviso_lo_que_viene',?,?)
+                       ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, cambiado_en=excluded.cambiado_en""",
+                    (huella, ahora_argentina().strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit(); con.close()
+        return n
+    except Exception:
+        return 0
+
+
 @app.get("/api/admin/medir-tabuladas")
 def admin_medir_tabuladas():
     """

@@ -604,6 +604,12 @@ def una_pasada():
         ESTADO["ultima_pasada_termino"] = A.ahora_argentina().strftime("%H:%M:%S")
         ESTADO["ultimo"] = (f"pasada {ESTADO['pasada']}: {listas} carreras listas, "
                             f"{pendientes_total} tabuladas pendientes")
+        # Si quedó algo sin traer y es nuevo, un aviso al celular de Leandro
+        # (regla del 13/10: "que me mande una notificación y yo lo voy a prender").
+        try:
+            ESTADO["avisos_enviados"] = ESTADO.get("avisos_enviados", 0) + (A.avisar_lo_que_viene() or 0)
+        except Exception:
+            pass
         return {"hecho": True, "listas": listas, "pendientes": pendientes_total}
     finally:
         ESTADO["corriendo"] = False
