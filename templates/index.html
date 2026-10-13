@@ -2529,6 +2529,14 @@ async function elegirCarrera(c, itemEl){
       if (!yaCorrio){
         participantesActuales = listo.participantes && listo.participantes.length
                                 ? listo.participantes : participantesActuales;
+      } else {
+        // Corredores reales (con puesto, kilos y pago) MÁS su campaña, para
+        // que la tarjeta del caballo no quede en "Buscando la campaña…".
+        // /api/enriquecer lee lo guardado: 0 pedidos al sitio (medido 3/10).
+        try{
+          const enr = await apiPost('/api/enriquecer', {participantes: participantesActuales});
+          if (enr && enr.participantes && enr.participantes.length) participantesActuales = enr.participantes;
+        }catch(e){}
       }
       ultimoContexto = {pista_dia: carreraData.estado || '', url: meetingUrlElegida,
                         numero: c.numero, fecha: fechaElegida,

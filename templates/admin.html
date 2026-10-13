@@ -413,6 +413,23 @@
 <div class="wrap">
 
 
+  <h2 id="lo-que-viene">Lo que viene</h2>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Las carreras que publicó el Stud Book: cuántas están cargadas, cuántas
+    tienen pronóstico y cuántas tienen TODAS sus tabuladas (de la última
+    participación hacia atrás). Abajo, lo que el motor no pudo traer: la
+    app te avisa al celular cuando aparece algo nuevo, y vos lo traés con
+    un botón. Nada va al sitio salvo ese botón.
+  </p>
+  <div class="caja-recolector">
+    <div class="chips" id="chips-viene"></div>
+    <div id="viene-reuniones" style="margin-top:16px;"></div>
+    <div id="viene-faltan" style="margin-top:16px;"></div>
+    <button class="btn btn-ghost" style="width:100%; margin-top:10px;"
+            onclick="verLoQueViene(true)">Volver a contar</button>
+    <div class="progreso-txt" id="viene-estado" style="margin-top:11px;"></div>
+  </div>
+
   <h2>Carreras listas</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Las carreras se traen de madrugada y quedan guardadas, así el usuario
@@ -1339,6 +1356,96 @@ async function verCarrerasListas(){
   }catch(e){}
 }
 
+// ---------- LO QUE VIENE (13/10/2026) ----------
+async function verLoQueViene(fresco){
+  const est = document.getElementById('viene-estado');
+  try{
+    if (fresco) est.textContent = 'Contando…';
+    const r = await fetch('/api/admin/lo-que-viene?clave=' + encodeURIComponent(clave)
+                          + (fresco ? '&fresco=1' : ''));
+    const d = await r.json();
+    if (d.ok === false) return;
+    const t = d.totales;
+    const faltanTab = t.tabuladas_necesarias - t.tabuladas_guardadas;
+    document.getElementById('chips-viene').innerHTML = `
+      <div class="chip-dato"><b>${t.carreras}</b>carreras a la vista</div>
+      <div class="chip-dato"><b>${t.cargadas}</b>cargadas</div>
+      <div class="chip-dato"><b>${t.con_pronostico}</b>con pronóstico</div>
+      <div class="chip-dato"><b>${t.completas}</b>con todas sus tabuladas</div>
+      <div class="chip-dato"><b>${t.tabuladas_guardadas}/${t.tabuladas_necesarias}</b>tabuladas</div>
+      <div class="chip-dato"><b>${t.caballos}</b>caballos</div>
+      ${t.debutantes ? `<div class="chip-dato"><b>${t.debutantes}</b>debutantes</div>` : ''}
+      ${t.sin_ficha ? `<div class="chip-dato"><b>${t.sin_ficha}</b>sin ficha</div>` : ''}`;
+
+    document.getElementById('viene-reuniones').innerHTML = d.reuniones.length
+      ? '<div class="previa-rot">Por reunión</div>' + d.reuniones.map(rn => {
+          if (rn.nota) return `<div class="dia-fila"><div><div class="dia-f">${alFechaCorta(rn.fecha)}</div>
+              <div class="dia-h">${rn.hipodromo}</div></div><div class="dia-est falta">${rn.nota}</div></div>`;
+          const n = rn.carreras.length, carg = rn.carreras.filter(c => c.cargada).length,
+                pron = rn.carreras.filter(c => c.pronostico).length,
+                comp = rn.carreras.filter(c => c.completa).length,
+                tabF = rn.carreras.reduce((s,c) => s + (c.tab_necesarias - c.tab_guardadas), 0);
+          const ok = n > 0 && comp === n && pron === n;
+          const detalle = rn.carreras.map(c =>
+            `<span title="${c.corredores} corredores · tabuladas ${c.tab_guardadas}/${c.tab_necesarias}"
+                   style="display:inline-block; margin:2px 3px 0 0; padding:1px 6px; border-radius:6px; font-size:11px;
+                   background:${c.completa && c.pronostico ? '#e8f4ef' : (c.cargada ? '#fff4d6' : '#fde8e8')}">
+               ${c.numero}ª${c.pronostico ? '' : ' sin pron.'}${c.tab_necesarias - c.tab_guardadas ? ' −' + (c.tab_necesarias - c.tab_guardadas) : ''}</span>`).join('');
+          return `<div class="dia-fila"><div>
+              <div class="dia-f">${alFechaCorta(rn.fecha)}${rn.fecha === d.hoy ? ' · hoy' : ''}</div>
+              <div class="dia-h">${rn.hipodromo} · ${carg}/${n} cargadas · ${pron}/${n} con pronóstico · ${comp}/${n} completas${tabF ? ' · faltan ' + tabF + ' tabuladas' : ''}</div>
+              <div>${detalle}</div></div>
+              <div class="dia-est ${ok ? 'ok' : 'falta'}">${ok ? 'lista' : 'falta'}</div></div>`;
+        }).join('')
+      : '<div class="progreso-txt">No hay reuniones publicadas.</div>';
+
+    document.getElementById('viene-faltan').innerHTML = d.faltan.length
+      ? '<div class="previa-rot">Lo que el motor no pudo traer (' + d.faltan.length + ')</div>'
+        + d.faltan.map((f, i) => `
+          <div class="dia-fila" id="falta-${i}">
+            <div><div class="dia-f">${f.tipo === 'tabulada' ? 'Tabulada' : (f.tipo === 'ficha' ? 'Ficha' : 'Debutante')} · ${f.que}</div>
+                 <div class="dia-h">${f.motivo}</div></div>
+            ${f.tipo === 'debutante'
+              ? '<div class="dia-est falta">sin campaña</div>'
+              : `<button class="btn btn-run" style="padding:6px 10px; font-size:12px;"
+                        onclick="traerAhora(${i}, '${f.tipo}', '${f.url}')">Traer ahora</button>`}
+          </div>`).join('')
+        + (d.faltan.some(f => f.tipo !== 'debutante')
+           ? `<button class="btn btn-run" style="width:100%; margin-top:10px;" onclick="traerTodo()">Traer todo lo que falta, de a uno</button>` : '')
+      : '<div class="progreso-txt">No falta nada: todo lo que el motor necesitaba está guardado.</div>';
+    est.textContent = d.PARA_LEER || '';
+    window._faltan = d.faltan;
+  }catch(e){ est.textContent = 'No se pudo contar: ' + e.message; }
+}
+
+async function traerAhora(i, tipo, url){
+  const fila = document.getElementById('falta-' + i);
+  const boton = fila ? fila.querySelector('button') : null;
+  if (boton){ boton.disabled = true; boton.textContent = 'Trayendo…'; }
+  try{
+    const r = await fetch('/api/admin/traer-ahora?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({tipo, url})
+    });
+    const d = await r.json();
+    if (boton){ boton.textContent = d.ok ? '✅ Traída' : '❌ ' + (d.mensaje || 'No se pudo'); }
+    return d.ok;
+  }catch(e){
+    if (boton) boton.textContent = '❌ ' + e.message;
+    return false;
+  }
+}
+
+async function traerTodo(){
+  const lista = (window._faltan || []).map((f, i) => ({...f, i})).filter(f => f.tipo !== 'debutante');
+  let bien = 0;
+  for (const f of lista){                // DE A UNO, como todo lo demás
+    if (await traerAhora(f.i, f.tipo, f.url)) bien++;
+  }
+  document.getElementById('viene-estado').textContent = `Traídas ${bien} de ${lista.length}. Volviendo a contar…`;
+  setTimeout(() => verLoQueViene(true), 1500);
+}
+
 function alFechaCorta(f){
   const p = String(f || '').split('-');
   return p.length === 3 ? `${p[2]}/${p[1]}` : f;
@@ -1790,6 +1897,7 @@ verUsuarios();
 verTransmisiones();
 verUso();
 verCarrerasListas();
+verLoQueViene();
 verPlanes();
 verPromocion();
 verHistorico();
@@ -1986,6 +2094,7 @@ verUsuarios();
 verTransmisiones();
 verUso();
 verCarrerasListas();
+verLoQueViene();
 verPlanes();
 verPromocion();
 verHistorico();
