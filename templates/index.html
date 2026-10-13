@@ -2517,12 +2517,19 @@ async function elegirCarrera(c, itemEl){
   // MOTOR (12/10/2026): si está prendido, la carrera ya viene armada de
   // fondo. La pantalla la muestra y no calcula nada. Si el motor todavía
   // no llegó a esta carrera, lo dice. Con el motor apagado, lo de siempre.
+  // Si la carrera YA SE CORRIÓ, lo que vale es el resultado (puestos, kilos
+  // reales, orden de llegada): el pronóstico guardado es de antes de la
+  // largada y tiene datos provisorios. Error visto el 13/10 (Palermo 10/10
+  // 1ª: todos 57 kg y botones + y − en una carrera ya corrida).
+  const yaCorrio = participantesActuales.some(p => p && p.puesto);
   try{
     const listo = await apiGet('/api/motor/pronostico?url=' + encodeURIComponent(meetingUrlElegida)
                                + '&numero=' + encodeURIComponent(c.numero));
     if (listo && listo.listo){
-      participantesActuales = listo.participantes && listo.participantes.length
-                              ? listo.participantes : participantesActuales;
+      if (!yaCorrio){
+        participantesActuales = listo.participantes && listo.participantes.length
+                                ? listo.participantes : participantesActuales;
+      }
       ultimoContexto = {pista_dia: carreraData.estado || '', url: meetingUrlElegida,
                         numero: c.numero, fecha: fechaElegida,
                         hipodromo: hipodromoElegido ? hipodromoElegido.hipodromo : '',
@@ -2539,7 +2546,7 @@ async function elegirCarrera(c, itemEl){
       ocultarBarra();
       return;
     }
-    if (listo && listo.motor && !listo.listo){
+    if (listo && listo.motor && !listo.listo && !yaCorrio){
       renderCompetidores(participantesActuales);
       pron.innerHTML = estadoMsg(listo.mensaje || 'El motor todavía no armó esta carrera.', false);
       ocultarBarra();
