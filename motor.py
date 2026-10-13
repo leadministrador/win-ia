@@ -87,6 +87,28 @@ def _hora_arg():
     return A.ahora_argentina().hour
 
 
+def _hora_de_la_carrera_en_el_reloj_del_servidor(hora):
+    """
+    La hora de largada viene en hora ARGENTINA ("12:45"). Las fichas se
+    guardan con el reloj del SERVIDOR (Render está en UTC, +3 h). Para
+    compararlas hay que pasar la largada al reloj del servidor.
+
+    Error real del 12/10/2026: usaba datetime.now() (UTC) con la hora
+    argentina; desde las 21 h argentinas el servidor ya está en el día
+    siguiente y "hoy 12:45" caía mañana → toda ficha parecía vieja →
+    pedía las 130 fichas de Palermo en cada pasada.
+    """
+    try:
+        hh, mm = (hora or "00:00")[:5].split(":")
+        largada_arg = A.ahora_argentina().replace(hour=int(hh), minute=int(mm),
+                                                  second=0, microsecond=0)
+    except Exception:
+        largada_arg = A.ahora_argentina().replace(hour=0, minute=0, second=0, microsecond=0)
+    # .astimezone() sin argumento = al huso del servidor; sin tzinfo queda
+    # igual que datetime.now(), que es lo que guarda actualizada_en.
+    return largada_arg.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+
+
 def _es_hora_de_tabuladas():
     h = _hora_arg()
     if TABULADAS_DESDE <= TABULADAS_HASTA:
@@ -335,13 +357,7 @@ def _una_carrera(reunion, carrera, hoy):
     # carrera nueva: se vuelve a pedir una vez, después de la largada.
     despues_de = None
     if reunion["fecha"] == hoy and any(p.get("puesto") for p in corredores):
-        hora = (carrera.get("hora") or "00:00")[:5]
-        try:
-            hh, mm = hora.split(":")
-            despues_de = datetime.now().replace(hour=int(hh), minute=int(mm), second=0
-                                                ).isoformat(timespec="seconds")
-        except Exception:
-            despues_de = datetime.now().strftime("%Y-%m-%dT00:00:00")
+        despues_de = _hora_de_la_carrera_en_el_reloj_del_servidor(carrera.get("hora"))
 
     # caballos → ficha al día
     for p in corredores:
@@ -408,8 +424,10 @@ def una_pasada():
 
 def bucle():
     """Hilo de fondo. Si el interruptor está apagado, no hace nada."""
+    ESTADO["latido"] = "esperando 45 s"
     time.sleep(45)
     while True:
+        ESTADO["latido"] = A.ahora_argentina().strftime("%H:%M:%S")
         try:
             if prendido():
                 if not ESTADO["prendido"]:
@@ -428,8 +446,17 @@ def bucle():
         time.sleep(PAUSA_ENTRE_PASADAS)
 
 
+def _bucle_protegido():
+    """Si el hilo se muere, que quede escrito por qué."""
+    try:
+        bucle()
+    except BaseException as e:      # noqa
+        ESTADO["hilo_murio"] = f"{type(e).__name__}: {str(e)[:120]}"
+        raise
+
+
 def arrancar_hilo():
-    threading.Thread(target=bucle, daemon=True, name="motor").start()
+    threading.Thread(target=_bucle_protegido, daemon=True, name="motor").start()
 
 
 def estado():
@@ -437,6 +464,9 @@ def estado():
     d["prendido"] = prendido()      # lo que dice el interruptor, no el hilo
     d["hora_argentina"] = A.ahora_argentina().strftime("%H:%M")
     d["hora_de_tabuladas"] = _es_hora_de_tabuladas() or _a_mano()
+    d["hilos_vivos"] = sorted(t.name for t in threading.enumerate())
+    d["hilo_motor_vivo"] = any(t.name == "motor" for t in threading.enumerate())
+    d["reloj_servidor"] = datetime.now().isoformat(timespec="seconds")
     d["PARA_LEER"] = (
         ("Motor prendido. " if d["prendido"] else "Motor apagado. ")
         + (f"Ahora en {d['carrera']}. " if d["corriendo"] and d["carrera"] else "")
