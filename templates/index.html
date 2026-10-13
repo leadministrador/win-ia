@@ -158,15 +158,46 @@
   .btn-ghost:hover{ border-color:var(--bronce-claro); color:var(--bronce-claro); }
   .hero-actions{ display:flex; gap:14px; flex-wrap:wrap; }
 
-  .horse-svg{
+  /* El jinete de la escoba (dibujo de Leandro, 12/10/2026). Corre solo
+     con CSS: 0 pedidos al sitio, 0 memoria en Render. Tres imágenes en
+     static/: el cuerpo y las dos piernas, que giran desde la rodilla. */
+  .escena{
     position:absolute;
-    right:-40px; bottom:-30px;
-    width:min(46vw,460px);
-    opacity:0.95;
+    right:40px; bottom:44px;
+    width:min(24vw,320px);
     z-index:1;
   }
+  .jinete{
+    position:relative; width:100%; aspect-ratio:1129/784;
+    animation:galope .45s ease-in-out infinite; transform-origin:50% 80%;
+  }
+  .jinete img{ position:absolute; display:block; height:auto; }
+  .jinete .base{ left:0; top:0; width:100%; }
+  .jinete .pierna_izq{ left:37.47%; top:77.93%; width:14.17%; transform-origin:65.6% 0%;
+    animation:paso .45s ease-in-out infinite; }
+  .jinete .pierna_der{ left:51.64%; top:77.93%; width:17.71%; transform-origin:37.5% 0%;
+    animation:paso .45s ease-in-out infinite; animation-delay:-.225s; }
+  @keyframes paso{ 0%,100%{ transform:rotate(-16deg); } 50%{ transform:rotate(16deg); } }
+  @keyframes galope{
+    0%,100%{ transform:translateY(0) translateX(0) rotate(0); }
+    30%{ transform:translateY(-7px) translateX(6px) rotate(-2deg); }
+    60%{ transform:translateY(-2px) translateX(-3px) rotate(1.5deg); }
+  }
+  .escena .sombra{ position:absolute; left:14%; right:22%; bottom:-6px; height:16px; border-radius:50%;
+    background:rgba(0,0,0,.28); animation:sombra .45s ease-in-out infinite; }
+  @keyframes sombra{ 0%,100%{ transform:scaleX(1); opacity:.28; } 30%{ transform:scaleX(.82); opacity:.18; } }
+  .escena .piso{ position:absolute; left:-30%; right:-10%; bottom:-12px; height:3px;
+    background:repeating-linear-gradient(90deg,rgba(255,255,255,.55) 0 40px,transparent 40px 90px);
+    animation:piso .5s linear infinite; }
+  @keyframes piso{ to{ transform:translateX(90px); } }
+  .escena::before, .escena::after{ content:""; position:absolute; left:4%; bottom:6%; width:14px; height:14px;
+    border-radius:50%; background:#fff; animation:polvo 1.4s ease-out infinite; }
+  .escena::after{ left:12%; bottom:2%; width:10px; height:10px; animation-delay:.7s; }
+  @keyframes polvo{ 0%{ opacity:.8; transform:translate(0,0) scale(.4); } 100%{ opacity:0; transform:translate(-70px,-10px) scale(1.6); } }
   @media (max-width:720px){
-    .horse-svg{ opacity:0.25; right:-60px; bottom:-10px; width:80vw; }
+    .escena{ right:8px; top:26px; bottom:auto; width:130px; }
+    /* En el celular va arriba, sobre el texto: sin piso ni polvo. */
+    .escena .piso, .escena::before, .escena::after{ display:none; }
   }
 
   /* ---------- CASCADA ---------- */
@@ -1641,7 +1672,6 @@
   .hero .btn-primary:hover{ background:#333; }
   .hero .btn-ghost{ color:#fff; border-color:rgba(255,255,255,.7); }
   .hero .btn-ghost:hover{ border-color:#fff; color:#fff; background:rgba(0,0,0,.12); }
-  .horse-svg{ opacity:.18; }
   .btn{ font-size:18px; font-weight:700; border-radius:10px; }
   .card{ border-radius:14px; }
 
@@ -1700,38 +1730,13 @@
 <body>
 
 <div class="hero">
-  <svg class="horse-svg" viewBox="0 0 500 400" xmlns="http://www.w3.org/2000/svg">
-    <g stroke="#2a5a50" stroke-width="1" opacity="0.5">
-      <line x1="0" y1="60" x2="500" y2="60"/>
-      <line x1="0" y1="340" x2="500" y2="340"/>
-      <line x1="60" y1="0" x2="60" y2="400"/>
-      <circle cx="60" cy="60" r="3" fill="#2a5a50"/>
-      <circle cx="60" cy="340" r="3" fill="#2a5a50"/>
-    </g>
-    <g fill="none" stroke="#d9b877" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
-      <polygon points="330,90 365,105 372,140 350,160 320,150 310,115" fill="#1f4a42"/>
-      <circle cx="345" cy="120" r="5" fill="#8c2a2a" stroke="none"/>
-      <circle cx="345" cy="120" r="9" fill="none" stroke="#d9b877" stroke-width="1.4"/>
-      <polygon points="320,150 350,160 340,210 300,205" fill="#1f4a42"/>
-      <polygon points="300,205 340,210 355,260 300,290 230,280 220,220" fill="#1f4a42"/>
-      <line x1="250" y1="230" x2="300" y2="240" stroke="#8c2a2a" stroke-width="1.4"/>
-      <line x1="260" y1="255" x2="310" y2="258" stroke="#8c2a2a" stroke-width="1.4"/>
-      <circle cx="290" cy="245" r="3" fill="#d9b877" stroke="none"/>
-      <polyline points="240,270 235,310 245,345 240,375"/>
-      <polyline points="290,285 300,320 295,350 305,378"/>
-      <polyline points="330,255 350,290 345,325 358,365"/>
-      <polyline points="300,290 320,320 312,350 325,382"/>
-      <polyline points="310,100 300,120 312,135 302,155 314,168"/>
-      <polyline points="228,225 205,235 215,255 195,268 208,290"/>
-    </g>
-    <g fill="#d9b877" opacity="0.7">
-      <circle cx="120" cy="90" r="2"/>
-      <circle cx="150" cy="70" r="1.5"/>
-      <circle cx="90" cy="130" r="1.5"/>
-      <circle cx="400" cy="200" r="2"/>
-      <circle cx="430" cy="170" r="1.5"/>
-    </g>
-  </svg>
+  <div class="escena"><div class="piso"></div><div class="sombra"></div>
+    <div class="jinete">
+      <img class="base" src="/static/jinete_base.webp" alt="Un chico corre montado en una escoba" width="760" height="528">
+      <img class="pierna_izq" src="/static/pierna_izq.webp" alt="">
+      <img class="pierna_der" src="/static/pierna_der.webp" alt="">
+    </div>
+  </div>
   <div class="hero-inner">
     <div class="brand">LEA WIN <span>IA</span></div>
     <div class="eyebrow">San Isidro · Palermo · La Plata</div>
