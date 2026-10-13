@@ -26,6 +26,7 @@ y este circuito hace el trabajo.
 """
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -53,7 +54,13 @@ ESTADO = {
     "carreras_pendientes": 0,
     "ultima_pasada_termino": "",
     "saltadas": [],          # carreras que el motor no armó, con motivo
+    "cortes": 0,             # veces que el sitio no contestó (no cuentan como intento)
+    "esperando_al_sitio": "",
+    "tabuladas_sin_pedir": 0,  # resultados que ya tenía la app y pasaron a tabulada
 }
+# Si el sitio no contesta: cuánto esperar antes de seguir (segundos, escalonado)
+ESPERAS_POR_CORTE = [int(x) for x in os.getenv("MOTOR_ESPERAS_CORTE", "60,120,300").split(",")]
+_cortes_seguidos = 0
 
 # Cada cuánto vuelve a mirar el calendario del Stud Book (1 pedido).
 # "Ni bien salgan las carreras": cada hora.
@@ -140,6 +147,55 @@ def _anotar_salto(reunion, carrera, motivo):
              f"{carrera.get('numero', '?')}ª: {motivo}")
     if texto not in ESTADO["saltadas"]:
         ESTADO["saltadas"] = (ESTADO["saltadas"] + [texto])[-30:]
+
+
+def _latir():
+    try:
+        ESTADO["latido"] = A.ahora_argentina().strftime("%H:%M:%S")
+    except Exception:
+        pass
+
+
+def _motivo_de(url):
+    """El último motivo anotado por _anotar_falla para esa dirección."""
+    try:
+        con = A.db()
+        f = con.execute("SELECT valor FROM ajustes WHERE clave=?",
+                        (f"falla:{url[-60:]}",)).fetchone()
+        con.close()
+        return (f["valor"] if f else "") or ""
+    except Exception:
+        return ""
+
+
+def _fue_corte_del_sitio(url):
+    """Falló porque el sitio no contestó (no por la carrera en sí)."""
+    m = _motivo_de(url)
+    return m.startswith("no se pudo conectar") or m.startswith("tardo demasiado")
+
+
+def _esperar_al_sitio():
+    """
+    El Stud Book no contestó. Regla de Leandro: no castigar a la carrera,
+    esperar y seguir cuando vuelve. Espera 1, 2, 5 minutos (escalonado)
+    y mientras tanto mira el interruptor para poder apagarse.
+    MEDIDO 13/10: una racha de 50 min mandó 31 carreras a "a mano" sin culpa.
+    """
+    global _cortes_seguidos
+    _cortes_seguidos += 1
+    ESTADO["cortes"] += 1
+    espera = ESPERAS_POR_CORTE[min(_cortes_seguidos, len(ESPERAS_POR_CORTE)) - 1]
+    ESTADO["esperando_al_sitio"] = f"corte {_cortes_seguidos}: espero {espera} s"
+    fin = time.time() + espera
+    while time.time() < fin and prendido():
+        _latir()
+        time.sleep(min(5, max(0, fin - time.time())))
+    ESTADO["esperando_al_sitio"] = ""
+
+
+def _sitio_contesto():
+    global _cortes_seguidos
+    _cortes_seguidos = 0
 
 
 def _clave_listo(url_reunion, numero):
@@ -236,9 +292,12 @@ def _carreras_de(reunion):
 def _ficha_al_dia(perfil, despues_de=None):
     """
     La lista de carreras del caballo, fresca. Va al sitio si la ficha no
-    existe, tiene más de 1 día, o es anterior a `despues_de` (la hora en
-    que el caballo corrió hoy: así se pide UNA vez después de la carrera,
-    no en cada pasada). Devuelve True si fue al sitio.
+    existe, tiene más de 1 día, o es anterior a `despues_de`:
+      - la madrugada del día que corre (regla de Leandro 13/10: la ficha se
+        pide de nuevo el día de la carrera, antes del pronóstico; INMATERIAL
+        corrió con una victoria menos por no hacerlo), o
+      - la hora en que ya corrió hoy (una vez después de la carrera).
+    Devuelve True si fue al sitio.
     """
     con = A.db()
     f = con.execute("SELECT actualizada_en FROM fichas WHERE perfil=?",
@@ -252,12 +311,18 @@ def _ficha_al_dia(perfil, despues_de=None):
     if not vieja:
         return False
     ESTADO["caballo"] = perfil[-30:]
-    r = A.explorar_caballo(perfil)     # anota motivo si falla; -1 si falló
-    A._pausa_prudente()
-    if r >= 0:
-        ESTADO["fichas_traidas"] += 1
-    else:
-        ESTADO["fallas"] += 1
+    while prendido():
+        _latir()
+        r = A.explorar_caballo(perfil)     # anota motivo si falla; -1 si falló
+        A._pausa_prudente()
+        if r >= 0:
+            ESTADO["fichas_traidas"] += 1
+            _sitio_contesto()
+            break
+        if not _fue_corte_del_sitio(perfil):
+            ESTADO["fallas"] += 1
+            break
+        _esperar_al_sitio()                # no es culpa del caballo: espera y reintenta
     return True
 
 
@@ -272,14 +337,95 @@ def _campana(perfil):
 
 
 # ───────────────────────────────────────────── 3) tabuladas: todas, cercana → lejana
+def _fecha_iso(ddmmaaaa):
+    try:
+        return datetime.strptime(ddmmaaaa.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _tabulada_desde_lo_guardado(url, c):
+    """
+    Regla de Leandro (13/10): "ver los resultados y cargarlos en las
+    tabuladas". Si la app ya tiene el resultado de esa carrera (la tarea
+    de cada 15 min lo trae el mismo día, a `carrera:reunion:n`), se pasa
+    al histórico como tabulada SIN pedir nada al sitio.
+    Devuelve True si quedó guardada.
+    """
+    try:
+        fecha = _fecha_iso(c.get("fecha", ""))
+        hip = A.normalize_text(A._limpiar_nombre_hipodromo(c.get("hipodromo", "")))
+        # El número de carrera: en la ficha, la columna "Nº" queda en
+        # `reunion` (y `numero` es el número de partida del caballo:
+        # pendiente 6 del documento). Si no está, va en el link:
+        # .../carrera/231968/5-galitzia-...  → 5ª.
+        numero = str(c.get("reunion", "")).strip()
+        m = re.search(r"/carrera/\d+/(\d+)-", url)
+        if m and (not numero.isdigit() or numero != m.group(1)):
+            numero = m.group(1)
+        if not (fecha and numero.isdigit() and hip):
+            return False
+        reunion = None
+        for r in A.lo_guardado("calendario") or []:
+            if (r.get("fecha") == fecha
+                    and A.normalize_text(A._limpiar_nombre_hipodromo(r.get("hipodromo", ""))) == hip):
+                reunion = r
+                break
+        if not reunion:
+            return False
+        data = A.lo_guardado(f"carrera:{reunion['url']}:{int(numero)}")
+        if not data:
+            return False
+        corredores = [p for p in data.get("participantes", []) if not p.get("retirado")]
+        if len(corredores) < 2 or not any(p.get("puesto") for p in corredores):
+            return False
+        participantes = [{
+            "nombre": p.get("nombre"), "numero": p.get("numero"), "puesto": p.get("puesto"),
+            "peso": p.get("peso"), "peso_corporal": p.get("peso_corporal"),
+            "jockey": p.get("jockey"), "entrenador": p.get("entrenador"),
+            "caballeriza": p.get("caballeriza"), "cuerpos": p.get("cuerpos"),
+            "acumulado": p.get("acumulado"), "pago": p.get("pago"),
+            "perfil": p.get("perfil", ""),
+            "rend_jockey": p.get("rend_jockey"), "rend_entrenador": p.get("rend_entrenador"),
+            "rend_caballeriza": p.get("rend_caballeriza"),
+            "edad": p.get("edad"), "sexo_tabla": p.get("sexo_tabla"), "forma": p.get("forma"),
+            "dias_sin_correr": p.get("dias_sin_correr"), "campana_nums": p.get("campana_nums"),
+            "efectividad": p.get("efectividad"), "ganado": p.get("ganado"),
+            "detalle": p.get("detalle"), "retirado": False,
+        } for p in corredores]
+        con = A.db()
+        con.execute("""
+            INSERT OR REPLACE INTO historico(url, fecha, hipodromo, numero,
+                distancia, pista, estado, participantes, guardado_en)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (url, fecha, A._limpiar_nombre_hipodromo(reunion.get("hipodromo", "")),
+              data.get("carrera") or int(numero), data.get("distancia", ""),
+              data.get("superficie", ""), data.get("estado", ""),
+              json.dumps(participantes, ensure_ascii=False),
+              datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+        con.close()
+        A._marcar_hecho(url)
+        ESTADO["tabuladas_sin_pedir"] += 1
+        return True
+    except Exception:
+        return False
+
+
 def _tabuladas_que_faltan(perfil):
-    """Links de carreras de la campaña que no están guardadas, en orden."""
+    """
+    Links de carreras de la campaña que no están guardadas, en orden
+    (de la más nueva a la más vieja). Antes de darlas por faltantes,
+    las que la app ya tiene como resultado pasan a tabulada sin pedir.
+    """
     faltan = []
     for c in _campana(perfil):          # la campaña viene de la más nueva a la más vieja
         url = A._url_canonica(c.get("enlace") or "")
         if not url or not url.startswith("http"):
             continue
         if A._sirve_para_tabulada(url):
+            continue
+        if _tabulada_desde_lo_guardado(url, c):
             continue
         faltan.append(url)
     return faltan
@@ -294,12 +440,26 @@ def _traer_tabulada(url):
         con.commit(); con.close()
     except Exception:
         pass
-    r = A.guardar_carrera_historica(url)   # anota motivo si falla
-    A._pausa_prudente()
-    if r >= 0:
-        ESTADO["tabuladas_traidas"] += 1
-        return True
-    ESTADO["fallas"] += 1
+    while prendido():
+        _latir()
+        r = A.guardar_carrera_historica(url)   # anota motivo si falla
+        A._pausa_prudente()
+        if r >= 0:
+            ESTADO["tabuladas_traidas"] += 1
+            _sitio_contesto()
+            return True
+        if not _fue_corte_del_sitio(url):
+            ESTADO["fallas"] += 1
+            return False
+        # El sitio no contestó: no es culpa de la carrera. Se devuelve el
+        # intento, se espera, y se vuelve a probar LA MISMA carrera.
+        try:
+            con = A.db()
+            con.execute("UPDATE por_explorar SET intentos=MAX(intentos-1,0) WHERE url=?", (url,))
+            con.commit(); con.close()
+        except Exception:
+            pass
+        _esperar_al_sitio()
     return False
 
 
@@ -377,8 +537,12 @@ def _una_carrera(reunion, carrera, hoy):
     # Si la carrera ya se corrió hoy, la ficha de cada corredor tiene una
     # carrera nueva: se vuelve a pedir una vez, después de la largada.
     despues_de = None
-    if reunion["fecha"] == hoy and any(p.get("puesto") for p in corredores):
-        despues_de = _hora_de_la_carrera_en_el_reloj_del_servidor(carrera.get("hora"))
+    if reunion["fecha"] == hoy:
+        # La madrugada del día que corre: ficha de nuevo, antes del pronóstico.
+        despues_de = _hora_de_la_carrera_en_el_reloj_del_servidor("00:00")
+        if any(p.get("puesto") for p in corredores):
+            # Y una vez más después de la carrera (trae la carrera nueva).
+            despues_de = _hora_de_la_carrera_en_el_reloj_del_servidor(carrera.get("hora"))
 
     # caballos → ficha al día
     for p in corredores:
@@ -483,6 +647,29 @@ def arrancar_hilo():
     threading.Thread(target=_bucle_protegido, daemon=True, name="motor").start()
 
 
+def esta_sano(minutos=15):
+    """
+    Para el plan B de app.py: si el motor está prendido pero muerto (el
+    hilo no existe o lleva `minutos` sin latir), las tareas de siempre
+    vuelven a trabajar solas. Regla de Leandro (13/10): "si el motor no
+    anda, que la otra app siga".
+    """
+    try:
+        if not any(t.name == "motor" and t.is_alive() for t in threading.enumerate()):
+            return False
+        latido = ESTADO.get("latido", "")
+        if not latido or ":" not in latido:
+            return True        # recién arrancó, todavía en los 45 s
+        hh, mm, ss = [int(x) for x in latido.split(":")]
+        ahora = A.ahora_argentina()
+        ultimo = ahora.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        if ultimo > ahora:                  # pasó la medianoche
+            ultimo -= timedelta(days=1)
+        return (ahora - ultimo).total_seconds() < minutos * 60
+    except Exception:
+        return False
+
+
 def estado():
     d = dict(ESTADO)
     d["prendido"] = prendido()      # lo que dice el interruptor, no el hilo
@@ -490,6 +677,7 @@ def estado():
     d["hora_de_tabuladas"] = _es_hora_de_tabuladas() or _a_mano()
     d["hilos_vivos"] = sorted(t.name for t in threading.enumerate())
     d["hilo_motor_vivo"] = any(t.name == "motor" for t in threading.enumerate())
+    d["sano"] = esta_sano()
     d["reloj_servidor"] = datetime.now().isoformat(timespec="seconds")
     d["pid"] = os.getpid()
     d["pid_al_importar"] = PID_AL_IMPORTAR
@@ -501,7 +689,9 @@ def estado():
         + f"Pasada {d['pasada']}: {d['carreras_listas']} carreras listas, "
         + f"{d['carreras_pendientes']} tabuladas pendientes. "
         + f"Trajo {d['fichas_traidas']} fichas, {d['tabuladas_traidas']} tabuladas, "
-        + f"armó {d['pronosticos_armados']} pronósticos, {d['fallas']} fallas."
+        + f"armó {d['pronosticos_armados']} pronósticos, {d['fallas']} fallas, "
+        + f"{d['cortes']} cortes del sitio, {d['tabuladas_sin_pedir']} tabuladas sin pedir."
+        + (f" {d['esperando_al_sitio']}." if d["esperando_al_sitio"] else "")
         + (f" Saltó {len(d['saltadas'])}: " + " · ".join(d["saltadas"][-5:]) if d["saltadas"] else "")
     )
     return d

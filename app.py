@@ -6482,7 +6482,7 @@ def revision_de_avisos():
             hoy = hoy_argentina()
             if (ADELANTO_DESDE <= h <= ADELANTO_HASTA
                     and ADELANTO.get("ultima_vez", "")[:10] != hoy
-                    and not ajuste("motor")):
+                    and not (ajuste("motor") and motor.esta_sano())):
                 traer_las_que_vienen()
         except Exception:
             pass
@@ -8371,8 +8371,10 @@ def recolectar_historico():
 
     while True:
         try:
-            if ajuste("motor"):
+            if ajuste("motor") and motor.esta_sano():
                 pass   # el motor hace este trabajo
+            # Plan B (Leandro, 13/10): si el motor está prendido pero
+            # muerto o sin latir 15 min, la búsqueda de siempre sigue sola.
             elif _es_horario_de_recoleccion() and ajuste("recoleccion_historico"):
                 trabajar_una_tanda(cuantos=40)
 
