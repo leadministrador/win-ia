@@ -31,6 +31,10 @@ import time
 from datetime import datetime, timedelta
 
 A = None   # el modulo app, se conecta con conectar(app)
+# Para saber en qué proceso se importó. Si el que contesta el panel tiene
+# otro pid, la app se importó en un proceso padre y se bifurcó (los hilos
+# no sobreviven a eso).
+PID_AL_IMPORTAR = os.getpid()
 
 ESTADO = {
     "prendido": False,
@@ -467,6 +471,10 @@ def estado():
     d["hilos_vivos"] = sorted(t.name for t in threading.enumerate())
     d["hilo_motor_vivo"] = any(t.name == "motor" for t in threading.enumerate())
     d["reloj_servidor"] = datetime.now().isoformat(timespec="seconds")
+    d["pid"] = os.getpid()
+    d["pid_al_importar"] = PID_AL_IMPORTAR
+    d["pid_padre"] = os.getppid()
+    d["gunicorn_args"] = os.environ.get("GUNICORN_CMD_ARGS", "")
     d["PARA_LEER"] = (
         ("Motor prendido. " if d["prendido"] else "Motor apagado. ")
         + (f"Ahora en {d['carrera']}. " if d["corriendo"] and d["carrera"] else "")
