@@ -1399,20 +1399,26 @@ async function verLoQueViene(fresco){
         }).join('')
       : '<div class="progreso-txt">No hay reuniones publicadas.</div>';
 
-    document.getElementById('viene-faltan').innerHTML = d.faltan.length
-      ? '<div class="previa-rot">Lo que el motor no pudo traer (' + d.faltan.length + ')</div>'
-        + d.faltan.map((f, i) => `
-          <div class="dia-fila" id="falta-${i}">
-            <div><div class="dia-f">${f.tipo === 'tabulada' ? 'Tabulada' : (f.tipo === 'ficha' ? 'Ficha' : 'Debutante')} · ${f.que}</div>
+    // Los debutantes van aparte y plegados (Leandro, 13/10): no tienen
+    // nada que traer y con una reunión grande son 40 o 50 filas.
+    const paraTraer = d.faltan.map((f, i) => ({...f, i})).filter(f => f.tipo !== 'debutante');
+    const debutantes = d.faltan.filter(f => f.tipo === 'debutante');
+    document.getElementById('viene-faltan').innerHTML = (paraTraer.length
+      ? '<div class="previa-rot">Lo que el motor no pudo traer (' + paraTraer.length + ')</div>'
+        + paraTraer.map(f => `
+          <div class="dia-fila" id="falta-${f.i}">
+            <div><div class="dia-f">${f.tipo === 'tabulada' ? 'Tabulada' : 'Ficha'} · ${f.que}</div>
                  <div class="dia-h">${f.motivo}</div></div>
-            ${f.tipo === 'debutante'
-              ? '<div class="dia-est falta">sin campaña</div>'
-              : `<button class="btn btn-run" style="padding:6px 10px; font-size:12px;"
-                        onclick="traerAhora(${i}, '${f.tipo}', '${f.url}')">Traer ahora</button>`}
+            <button class="btn btn-run" style="padding:6px 10px; font-size:12px;"
+                    onclick="traerAhora(${f.i}, '${f.tipo}', '${f.url}')">Traer ahora</button>
           </div>`).join('')
-        + (d.faltan.some(f => f.tipo !== 'debutante')
-           ? `<button class="btn btn-run" style="width:100%; margin-top:10px;" onclick="traerTodo()">Traer todo lo que falta, de a uno</button>` : '')
-      : '<div class="progreso-txt">No falta nada: todo lo que el motor necesitaba está guardado.</div>';
+        + `<button class="btn btn-run" style="width:100%; margin-top:10px;" onclick="traerTodo()">Traer todo lo que falta, de a uno</button>`
+      : '<div class="progreso-txt">No falta nada: todo lo que el motor necesitaba está guardado.</div>')
+      + (debutantes.length
+         ? `<details style="margin-top:14px;"><summary style="cursor:pointer; font-size:13px;">Ver debutantes (${debutantes.length}) — sin campaña, nada que traer</summary>`
+           + debutantes.map(f => `<div class="dia-fila"><div><div class="dia-f">${f.que}</div></div><div class="dia-est falta">debutante</div></div>`).join('')
+           + '</details>'
+         : '');
     est.textContent = d.PARA_LEER || '';
     window._faltan = d.faltan;
   }catch(e){ est.textContent = 'No se pudo contar: ' + e.message; }
