@@ -52,6 +52,7 @@ ESTADO = {
     "carreras_listas": 0,
     "carreras_pendientes": 0,
     "ultima_pasada_termino": "",
+    "saltadas": [],          # carreras que el motor no armó, con motivo
 }
 
 # Cada cuánto vuelve a mirar el calendario del Stud Book (1 pedido).
@@ -110,7 +111,10 @@ def _hora_de_la_carrera_en_el_reloj_del_servidor(hora):
         largada_arg = A.ahora_argentina().replace(hour=0, minute=0, second=0, microsecond=0)
     # .astimezone() sin argumento = al huso del servidor; sin tzinfo queda
     # igual que datetime.now(), que es lo que guarda actualizada_en.
-    return largada_arg.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+    largada_servidor = largada_arg.astimezone().replace(tzinfo=None)
+    # Nunca en el futuro: una ficha no puede ser "anterior a la largada"
+    # si la largada todavía no pasó (pasaría a pedirla en cada pasada).
+    return min(largada_servidor, datetime.now()).isoformat(timespec="seconds")
 
 
 def _es_hora_de_tabuladas():
@@ -126,6 +130,16 @@ def _a_mano():
         return bool(A.A_MANO.get("prendido"))
     except Exception:
         return False
+
+
+def _anotar_salto(reunion, carrera, motivo):
+    """Una carrera que no se armó. Antes se saltaba en silencio: el panel
+    no se enteraba (error visto el 12/10 con Palermo 13ª y La Plata 1ª)."""
+    texto = (f"{reunion.get('fecha', '')} "
+             f"{A._limpiar_nombre_hipodromo(reunion.get('hipodromo', ''))} "
+             f"{carrera.get('numero', '?')}ª: {motivo}")
+    if texto not in ESTADO["saltadas"]:
+        ESTADO["saltadas"] = (ESTADO["saltadas"] + [texto])[-30:]
 
 
 def _clave_listo(url_reunion, numero):
@@ -304,6 +318,8 @@ def _armar_pronostico(reunion, carrera, data):
     """Arma y guarda. Mismo cálculo que la pantalla usaba al abrir."""
     corredores = [p for p in data.get("participantes", []) if not p.get("retirado")]
     if len(corredores) < 2:
+        _anotar_salto(reunion, carrera,
+                      f"{len(corredores)} corredores de {len(data.get('participantes', []))} anotados")
         return False
     completos = [A.enrich_horse(dict(p)) for p in corredores]   # de la base, sin sitio
     fecha = A.meeting_date_from_url(reunion["url"]) or reunion.get("fecha", "")
@@ -353,6 +369,7 @@ def _una_carrera(reunion, carrera, hoy):
     """
     data = A.lo_guardado(f"carrera:{reunion['url']}:{carrera['numero']}")
     if not data:
+        _anotar_salto(reunion, carrera, "carrera no guardada")
         return False, 0
     corredores = [p for p in data.get("participantes", []) if not p.get("retirado")]
     ESTADO["carrera"] = f"{reunion['fecha']} {A._limpiar_nombre_hipodromo(reunion['hipodromo'])} {carrera['numero']}ª"
@@ -372,8 +389,11 @@ def _una_carrera(reunion, carrera, hoy):
             _ficha_al_dia(perfil, despues_de)
 
     # pronóstico (no necesita las tabuladas: usa la campaña de cada ficha)
-    if not _pronostico_sirve(reunion, carrera, data):
-        _armar_pronostico(reunion, carrera, data)
+    if _pronostico_sirve(reunion, carrera, data) or _armar_pronostico(reunion, carrera, data):
+        # tiene pronóstico: si antes figuraba como saltada, ya no
+        ESTADO["saltadas"] = [t for t in ESTADO["saltadas"]
+                              if not t.startswith(f"{reunion['fecha']} ")
+                              or f" {carrera.get('numero')}ª:" not in t]
 
     # tabuladas: todas, de la más cercana a la más lejana, caballo por caballo
     pendientes = 0
@@ -482,5 +502,6 @@ def estado():
         + f"{d['carreras_pendientes']} tabuladas pendientes. "
         + f"Trajo {d['fichas_traidas']} fichas, {d['tabuladas_traidas']} tabuladas, "
         + f"armó {d['pronosticos_armados']} pronósticos, {d['fallas']} fallas."
+        + (f" Saltó {len(d['saltadas'])}: " + " · ".join(d["saltadas"][-5:]) if d["saltadas"] else "")
     )
     return d
