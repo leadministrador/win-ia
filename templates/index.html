@@ -2422,6 +2422,10 @@ async function elegirHip(h, itemEl){
       gridC.appendChild(item);
     });
 
+    // El aviso de jornada terminada va fuera de la grilla, así que no se
+    // borra con ella: se saca el anterior antes de poner uno nuevo. MEDIDO
+    // 14/10/2026: aparecía 4 veces tras entrar 4 veces a la reunión.
+    gridC.parentElement.querySelectorAll('.jornada-fin').forEach(a => a.remove());
     if (jornadaTerminada){
       const aviso = document.createElement('div');
       aviso.className = 'jornada-fin';
