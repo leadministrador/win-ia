@@ -1070,6 +1070,15 @@ def parse_race(soup, numero):
         m = re.search(pattern, block, re.I)
         return clean(m.group(1)) if m else ""
 
+    # MEDIDO el 14/10/2026 con la pagina real (San Isidro 14/10): el Stud
+    # Book cambio la cabecera de cada carrera. Ahora viene con clases
+    # (carrera-cabecera-premio-nombre, carrera-cabecera-distancia,
+    # carrera-cabecera-metadato-pista/-categoria...). Los patrones de texto
+    # de abajo devolvian el premio dos veces ("Angie (2018) Premio: Angie
+    # (2018)") y pista/estado/condicion vacios. Si la pagina trae las
+    # clases se leen de ahi; si no (paginas viejas), siguen los patrones.
+    cabecera = _cabecera_por_clases(heading)
+
     # Buscar la tabla de participantes: la primera que tenga columna 'Ejemplar'
     # y filas con enlaces a /ejemplares/.
     # Se recorre en orden: todo lo que aparezca DESPUES de un titulo
@@ -1114,7 +1123,7 @@ def parse_race(soup, numero):
             if r:
                 p[f"rend_{quien}"] = r
 
-    return {
+    datos = {
         "carrera": numero,
         "premio": get(r"Premio:\s*(.+?)\s+Distancia:"),
         "distancia": get(r"Distancia:\s*(\d+)\s*mts"),
@@ -1124,6 +1133,46 @@ def parse_race(soup, numero):
         "categoria": get(r"Categoria:\s*([A-Za-zÁÉÍÓÚáéíóúñÑ]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?)"),
         "participantes": participants
     }
+    if cabecera:
+        datos.update(cabecera)
+    return datos
+
+
+def _cabecera_por_clases(heading):
+    """
+    Lee premio, distancia, condicion, pista, estado y categoria de la
+    cabecera de la carrera usando las clases del sitio (pagina del
+    14/10/2026). Devuelve {} si la pagina no las tiene.
+    """
+    cont = heading.find_parent(class_="carrera-cabecera-info")
+    if cont is None:
+        return {}
+    d = {}
+    nombre = cont.find(class_="carrera-cabecera-premio-nombre")
+    if nombre is not None:
+        d["premio"] = clean(nombre.get_text(" "))
+    dist = cont.find(class_="carrera-cabecera-distancia")
+    if dist is not None:
+        m = re.search(r"(\d+)\s*mts", dist.get_text(" "), re.I)
+        d["distancia"] = m.group(1) if m else ""
+    for strong in cont.find_all("strong"):
+        if clean(strong.get_text(" ")).lower().startswith("condici"):
+            celda = strong.parent
+            texto = clean(celda.get_text(" ")) if celda is not None else ""
+            d["condicion"] = clean(re.sub(r"^Condici[oó]n:\s*", "", texto, flags=re.I))
+            break
+    # Pista / Estado / Categoria: cada uno es un metadato con etiqueta y valor.
+    nombres = {"pista": "superficie", "estado": "estado", "categoria": "categoria",
+               "categoría": "categoria"}
+    for meta in cont.find_all(class_="carrera-cabecera-metadato"):
+        etiqueta = meta.find(class_="carrera-cabecera-metadato-etiqueta")
+        valor = meta.find(class_="carrera-cabecera-metadato-valor")
+        if etiqueta is None or valor is None:
+            continue
+        campo = nombres.get(clean(etiqueta.get_text(" ")).lower())
+        if campo:
+            d[campo] = clean(valor.get_text(" "))
+    return d
 
 
 # Codigos que usa el Stud Book en la ficha del caballo, comprobados en el sitio.
@@ -11360,8 +11409,20 @@ def resumen_lo_que_viene():
                         elif url in a_mano_cola and url not in vistos_link:
                             vistos_link.add(url)
                             tot["a_mano"] += 1
-                            faltan.append({"tipo": "tabulada", "que": f"{etiqueta} · {x.get('fecha','')} {x.get('hipodromo','')}",
-                                           "url": url, "motivo": motivo_de(url) or f"{a_mano_cola[url]} intentos"})
+                            # Que carrera es la que falta (Leandro, 14/10/2026):
+                            # fecha, hipodromo, nº de carrera, premio y distancia,
+                            # tal como estan en la ficha del caballo.
+                            detalle = " · ".join(filter(None, [
+                                f"{x.get('fecha', '')} {x.get('hipodromo', '')}".strip(),
+                                f"{x.get('reunion')}ª" if str(x.get("reunion", "")).isdigit() else "",
+                                x.get("premio", ""),
+                                f"{x.get('distancia')} m" if str(x.get("distancia", "")).isdigit() else "",
+                            ]))
+                            motivo = motivo_de(url) or f"{a_mano_cola[url]} intentos"
+                            if "404" in motivo:
+                                motivo = "el Stud Book contesta 404 (link roto en el sitio) — Traer ahora no sirve"
+                            faltan.append({"tipo": "tabulada", "que": f"{etiqueta} · carrera que falta: {detalle}",
+                                           "url": url, "motivo": motivo})
                 fc["completa"] = fc["tab_necesarias"] == fc["tab_guardadas"]
                 tot["completas"] += 1 if fc["completa"] else 0
                 tot["tabuladas_necesarias"] += fc["tab_necesarias"]
@@ -11436,33 +11497,67 @@ def avisar_a_los_admins(titulo, cuerpo, url="/admin"):
     return sum(1 for s in subs if enviar_aviso(dict(s), titulo, cuerpo, url=url, etiqueta="lo-que-viene"))
 
 
+# Hora (Argentina) a partir de la cual se manda el resumen del dia.
+RESUMEN_DIARIO_HORA = int(os.getenv("RESUMEN_DIARIO_HORA", "10"))
+
+
+def texto_resumen_diario(desde):
+    """
+    Arma el texto del resumen: que junto el motor desde `desde` (hora del
+    servidor, ISO) y que le falto. Los debutantes NO se cuentan: no hay
+    nada que traer de ellos (Leandro, 14/10/2026). 0 pedidos al sitio.
+    """
+    con = db()
+    fichas = con.execute("SELECT COUNT(*) AS n FROM fichas WHERE actualizada_en >= ?",
+                         (desde,)).fetchone()["n"]
+    tabuladas = con.execute("SELECT COUNT(*) AS n FROM historico WHERE guardado_en >= ?",
+                            (desde,)).fetchone()["n"]
+    pronosticos = con.execute("SELECT COUNT(*) AS n FROM cache WHERE clave LIKE 'listo:%' "
+                              "AND actualizado_en >= ?", (desde,)).fetchone()["n"]
+    con.close()
+    _LO_QUE_VIENE_CACHE["cuando"] = 0.0
+    d = resumen_lo_que_viene()
+    t = d["totales"]
+    falto_tab = sum(1 for f in d["faltan"] if f["tipo"] == "tabulada")
+    falto_fichas = sum(1 for f in d["faltan"] if f["tipo"] == "ficha")
+    por_traer = t["tabuladas_necesarias"] - t["tabuladas_guardadas"]
+    cuerpo = (f"Trajo: {fichas} fichas · {tabuladas} tabuladas · {pronosticos} pronósticos. "
+              f"Faltó: {falto_tab} tabulada{'s' if falto_tab != 1 else ''} · "
+              f"{falto_fichas} ficha{'s' if falto_fichas != 1 else ''}. "
+              f"A la vista: {t['carreras']} carreras, {t['con_pronostico']} con pronóstico, "
+              f"{t['completas']} completas, {por_traer} tabuladas por traer.")
+    return cuerpo
+
+
 def avisar_lo_que_viene():
     """
-    La llama el motor al terminar cada pasada. Si hay cosas sin traer y
-    son DISTINTAS a las del ultimo aviso, manda UN aviso al celular de
-    Leandro. Si no cambio nada, no molesta.
+    La llama el motor al terminar cada pasada. Manda UN aviso por dia al
+    celular de Leandro, en la primera pasada que termina despues de las
+    RESUMEN_DIARIO_HORA (10 de la mañana, hora argentina): que junto el
+    motor desde el resumen anterior y que le falto. Nunca por debutantes.
+    Antes avisaba cada vez que cambiaba la lista de faltantes, y como los
+    debutantes estaban en esa lista, avisaba a cada rato (14/10/2026).
     """
     try:
-        _LO_QUE_VIENE_CACHE["cuando"] = 0.0
-        d = resumen_lo_que_viene()
-        faltan = d["faltan"]
-        huella = "|".join(sorted(f["url"] for f in faltan))
-        con = db()
-        ultimo = con.execute("SELECT valor FROM ajustes WHERE clave='aviso_lo_que_viene'").fetchone()
-        con.close()
-        if not faltan or (ultimo and ultimo["valor"] == huella):
+        ahora = ahora_argentina()
+        if ahora.hour < RESUMEN_DIARIO_HORA:
             return 0
-        por_tipo = {}
-        for f in faltan:
-            por_tipo[f["tipo"]] = por_tipo.get(f["tipo"], 0) + 1
-        partes = [f"{n} {t}{'s' if n != 1 else ''}" for t, n in por_tipo.items()]
-        cuerpo = ("El motor no pudo traer: " + ", ".join(partes)
-                  + ". Tocá para verlas y traerlas con un botón.")
-        n = avisar_a_los_admins("LEA WIN IA · falta algo", cuerpo, url="/admin#lo-que-viene")
+        hoy = ahora.strftime("%Y-%m-%d")
         con = db()
-        con.execute("""INSERT INTO ajustes(clave, valor, cambiado_en) VALUES('aviso_lo_que_viene',?,?)
+        ultimo = con.execute("SELECT valor, cambiado_en FROM ajustes WHERE clave='resumen_diario'").fetchone()
+        con.close()
+        if ultimo and ultimo["valor"] == hoy:
+            return 0
+        # Desde cuando contar: el resumen anterior (hora del servidor, como
+        # guardan fichas/historico/cache), o las ultimas 24 h si es el primero.
+        desde = (ultimo["cambiado_en"] if ultimo and ultimo["cambiado_en"]
+                 else (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds"))
+        cuerpo = texto_resumen_diario(desde)
+        n = avisar_a_los_admins("LEA WIN IA · resumen de la noche", cuerpo, url="/admin#lo-que-viene")
+        con = db()
+        con.execute("""INSERT INTO ajustes(clave, valor, cambiado_en) VALUES('resumen_diario',?,?)
                        ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, cambiado_en=excluded.cambiado_en""",
-                    (huella, ahora_argentina().strftime("%Y-%m-%d %H:%M:%S")))
+                    (hoy, datetime.now().isoformat(timespec="seconds")))
         con.commit(); con.close()
         return n
     except Exception:
