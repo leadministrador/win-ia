@@ -57,6 +57,7 @@ ESTADO = {
     "cortes": 0,             # veces que el sitio no contestó (no cuentan como intento)
     "esperando_al_sitio": "",
     "tabuladas_sin_pedir": 0,  # resultados que ya tenía la app y pasaron a tabulada
+    "esperando_pagos": [],     # llegadas sin pagos todavía: no se guardan en cero (14/10)
 }
 # Si el sitio no contesta: cuánto esperar antes de seguir (segundos, escalonado)
 ESPERAS_POR_CORTE = [int(x) for x in os.getenv("MOTOR_ESPERAS_CORTE", "60,120,300").split(",")]
@@ -379,6 +380,15 @@ def _tabulada_desde_lo_guardado(url, c):
         corredores = [p for p in data.get("participantes", []) if not p.get("retirado")]
         if len(corredores) < 2 or not any(p.get("puesto") for p in corredores):
             return False
+        # Regla de Leandro (14/10/2026): "no debe guardar en cero". El Stud
+        # Book publica la llegada primero y los pagos unos minutos después;
+        # si la relectura de la reunión cayó en el medio, los pagos vienen
+        # 0.00. Entonces NO se guarda: queda pendiente y se vuelve a mirar
+        # en la pasada siguiente (0 pedidos). MEDIDO 14/10: San Isidro 11ª
+        # quedó en el histórico con 0.00 por esto.
+        if not _hay_pagos(corredores):
+            _anotar_sin_pagos(url)
+            return False
         participantes = [{
             "nombre": p.get("nombre"), "numero": p.get("numero"), "puesto": p.get("puesto"),
             "peso": p.get("peso"), "peso_corporal": p.get("peso_corporal"),
@@ -412,6 +422,50 @@ def _tabulada_desde_lo_guardado(url, c):
         return False
 
 
+def _hay_pagos(corredores):
+    """True si al menos un corredor con puesto tiene un pago mayor a 0."""
+    for p in corredores:
+        if not p.get("puesto"):
+            continue
+        try:
+            if float(str(p.get("pago") or "0").replace("$", "").replace(",", ".")) > 0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _anotar_sin_pagos(url):
+    """Para el panel: qué carreras esperan los pagos (no se guardan en cero)."""
+    texto = f"{A.ahora_argentina().strftime('%H:%M')} · {url[-45:]}"
+    if not any(t.endswith(url[-45:]) for t in ESTADO["esperando_pagos"]):
+        ESTADO["esperando_pagos"] = (ESTADO["esperando_pagos"] + [texto])[-20:]
+
+
+def _guardada_en_cero(url, c):
+    """
+    True si esa carrera ya está en el histórico con la llegada pero sin
+    pagos, y es de hoy o de ayer (las viejas no se tocan). Son las que
+    quedaron guardadas en 0.00 antes de la regla del 14/10.
+    """
+    try:
+        fecha = _fecha_iso(c.get("fecha", ""))
+        if not fecha:
+            return False
+        hoy = datetime.strptime(A.hoy_argentina(), "%Y-%m-%d")
+        if (hoy - datetime.strptime(fecha, "%Y-%m-%d")).days > 1:
+            return False
+        con = A.db()
+        f = con.execute("SELECT participantes FROM historico WHERE url=?", (url,)).fetchone()
+        con.close()
+        if not f or not f["participantes"]:
+            return False
+        corredores = json.loads(f["participantes"])
+        return any(p.get("puesto") for p in corredores) and not _hay_pagos(corredores)
+    except Exception:
+        return False
+
+
 def _tabuladas_que_faltan(perfil):
     """
     Links de carreras de la campaña que no están guardadas, en orden
@@ -424,6 +478,11 @@ def _tabuladas_que_faltan(perfil):
         if not url or not url.startswith("http"):
             continue
         if A._sirve_para_tabulada(url):
+            # Guardada, pero si quedó en cero (hoy/ayer) se vuelve a mirar lo
+            # que trajo la relectura de la reunión y se pisa cuando hay pagos.
+            # 0 pedidos: nunca va al sitio por esto.
+            if _guardada_en_cero(url, c):
+                _tabulada_desde_lo_guardado(url, c)
             continue
         if _tabulada_desde_lo_guardado(url, c):
             continue
