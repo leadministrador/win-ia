@@ -4601,15 +4601,12 @@ def api_tabulada():
         return jsonify(ok=False, error="Dirección inválida."), 400
 
     url = _url_canonica(url)
-    clave = f"tabulada:{url}:{numero}"
-    # NADIE VA AL SITIO. Una carrera corrida no cambia nunca: la tabulada
-    # guardada vale para siempre. Antes vencia a los 30 dias, iba al Stud
-    # Book y, si el sitio fallaba, mostraba ERROR teniendola guardada
-    # (medido el 4/10/2026: 5 s de espera y error).
-    cacheado, _ = cache_get(clave, TTL_DETALLE_CARRERA)
-    if cacheado is not None:
-        return jsonify(ok=True, **cacheado)
-
+    # NADIE VA AL SITIO: se lee del historico (base de la app, 0 pedidos).
+    # Hasta el 14/10/2026 la respuesta quedaba copiada 30 dias ("una
+    # carrera corrida no cambia nunca", supuesto mio del 4/10). Falso: el
+    # Stud Book publica la llegada primero y los pagos despues, y la copia
+    # mostraba 0.00 aunque el historico ya tuviera los pagos (MEDIDO con
+    # San Isidro 14/10 11ª). Leer el historico cuesta 0,012 ms (medido).
     data = _carrera_guardada_para_tabulada(url, numero)
     if not data or not data.get("participantes"):
         # La pantalla muestra este texto y sigue; no es un error.
@@ -4653,7 +4650,6 @@ def api_tabulada():
         "competidores": len(filas),
         "filas": filas,
     }
-    cache_set(clave, resultado)
     return jsonify(ok=True, **resultado)
 
 
