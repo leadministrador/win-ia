@@ -56,6 +56,16 @@
   .tarjeta .nota{ font-size:12px; opacity:.6; margin-top:6px; }
 
   h2{ font-size:20px; margin:34px 0 14px; }
+  /* Tarjetas plegadas (Leandro, 14/10/2026): se abren con un toque. */
+  details.plegada > summary{ list-style:none; cursor:pointer; margin:34px 0 14px; }
+  details.plegada > summary::-webkit-details-marker{ display:none; }
+  details.plegada > summary h2{ display:inline; margin:0; }
+  details.plegada > summary h2::before{ content:'▸ '; opacity:.6; }
+  details.plegada[open] > summary h2::before{ content:'▾ '; }
+  details.plegada > summary .pleg-nota{ font-size:12px; opacity:.6; margin-left:8px; }
+  .aviso-motor{ background:#fde8e8; border:1px solid #e8b4b4; border-radius:10px;
+                padding:12px 14px; margin:0 0 12px; font-size:14px; }
+  .aviso-motor b{ color:#9b2c2c; }
   table{ width:100%; border-collapse:collapse; font-size:13px; }
   th{
     font-family:'Space Mono',monospace; font-size:10px; text-transform:uppercase;
@@ -430,12 +440,24 @@
     <div class="progreso-txt" id="viene-estado" style="margin-top:11px;"></div>
   </div>
 
-  <h2>Carreras listas</h2>
+  <h2>Afinar el algoritmo</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
-    Las carreras se traen de madrugada y quedan guardadas, así el usuario
-    las abre al instante. Las que todavía no corrieron se revisan cada 40
-    minutos por si hubo un retiro o cambió el jockey; siguen guardadas
-    mientras tanto. Las que ya corrieron no se tocan más.
+    Compara lo que el pronóstico hubiera dicho contra el resultado real de
+    todas las carreras del histórico y corrige los pesos. Se hace solo una
+    vez por día, de 7 a 9. Con este botón lo hacés ahora.
+  </p>
+  <div class="caja-recolector">
+    <button class="btn btn-run" style="width:100%;"
+            onclick="ajustarAhora()">Afinar el algoritmo ahora</button>
+    <div class="progreso-txt" id="ajuste-estado" style="margin-top:10px;"></div>
+  </div>
+
+  <details class="plegada" id="pleg-listas">
+  <summary><h2>Carreras listas</h2><span class="pleg-nota">vieja — el motor hace esto solo</span></summary>
+  <div class="aviso-motor" id="aviso-motor" style="display:none;"></div>
+  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
+    Tarjeta de antes del motor. Con el motor prendido no apretar estos
+    botones: se pisan con el motor. Sirve si el motor está apagado.
   </p>
 
   <div class="caja-recolector">
@@ -449,7 +471,10 @@
 
     <div class="progreso-txt" id="listas-estado" style="margin-top:11px;"></div>
   </div>
-  <h2>Histórico de años anteriores</h2>
+  </details>
+
+  <details class="plegada">
+  <summary><h2>Histórico de años anteriores</h2><span class="pleg-nota">Arrancar / Parar · chips</span></summary>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     El Stud Book no deja listar meses viejos, pero sí abrir una carrera si se
     conoce su dirección. Esas direcciones están en la campaña de cada caballo.
@@ -469,15 +494,14 @@
         Parar</button>
     </div>
 
-    <button class="btn btn-run" style="width:100%; margin-top:10px;"
-            onclick="ajustarAhora()">Afinar el algoritmo ahora</button>
-
     <button class="btn btn-borrar" style="width:100%; margin-top:10px;"
             onclick="historicoLimpiar()">Borrar todo y empezar de cero</button>
-    <div class="progreso-txt" id="ajuste-estado" style="margin-top:10px;"></div>
     <div id="hist-anios" style="margin-top:14px;"></div>
   </div>
-  <h2>Los pesos del algoritmo</h2>
+  </details>
+
+  <details class="plegada">
+  <summary><h2>Los pesos del algoritmo</h2></summary>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
     Cuánto vale cada cosa al pronosticar. Se ajustan solos con los
     resultados. Los que están en cero todavía no se pudieron medir.
@@ -485,38 +509,9 @@
   <div class="caja-recolector">
     <div id="tabla-pesos"></div>
   </div>
+  </details>
 
-  <h2>Recolección automática</h2>
-  <p style="font-size:13px; opacity:.7; margin-top:-6px;">
-    Recorre las carreras del Stud Book sola y las compara contra el resultado.
-    Podés cerrar esta página: el servidor sigue trabajando.
-  </p>
-
-  <div class="caja-recolector">
-    <div class="fila-form">
-      <div class="campo">
-        <label>Desde</label>
-        <input type="date" id="desde" value="2026-01-01">
-      </div>
-      <div class="campo">
-        <label>Hasta</label>
-        <input type="date" id="hasta">
-      </div>
-      <button class="btn btn-run" id="btn-run" onclick="arrancar()">Iniciar recolección</button>
-      <button class="btn btn-stop" id="btn-stop" onclick="detener()" disabled>Detener</button>
-      <button class="btn btn-borrar" onclick="reiniciarTodo()">Borrar y empezar de cero</button>
-    </div>
-
-    <div class="progreso">
-      <div class="progreso-bg"><div class="progreso-bar" id="barra"></div></div>
-      <div class="progreso-txt" id="progreso-txt">
-        <span class="punto" id="punto"></span>Sin actividad.
-      </div>
-      <div class="chips" id="chips"></div>
-    </div>
-  </div>
-
-
+  <!-- 'Recolección automática' (la vieja, por fechas) se sacó del panel el 14/10/2026 a pedido de Leandro. Las rutas siguen en app.py. -->
 
   <h2>Transmisiones en vivo</h2>
   <p style="font-size:13px; opacity:.7; margin-top:-6px;">
@@ -799,8 +794,10 @@
     <div class="progreso-txt" id="an-estado" style="margin-top:11px;"></div>
     <div id="lista-anuncios" style="margin-top:20px;"></div>
   </div>
-  <h2>Últimas carreras comparadas</h2>
+  <details class="plegada">
+  <summary><h2>Últimas carreras comparadas</h2></summary>
   <div id="tabla-ultimas"><div class="estado">Cargando…</div></div>
+  </details>
 
 </div>
 
@@ -905,7 +902,7 @@ function pintarPesos(pesos){
 }
 
 // ---------- Recolector automatico ----------
-document.getElementById('hasta').value = new Date().toISOString().slice(0,10);
+// (la tarjeta 'Recolección automática' se sacó el 14/10/2026; sus funciones quedan sin uso)
 
 async function arrancar(){
   const desde = document.getElementById('desde').value;
@@ -1378,7 +1375,7 @@ async function verLoQueViene(fresco){
       ${t.sin_ficha ? `<div class="chip-dato"><b>${t.sin_ficha}</b>sin ficha</div>` : ''}`;
 
     document.getElementById('viene-reuniones').innerHTML = d.reuniones.length
-      ? '<div class="previa-rot">Por reunión</div>' + d.reuniones.map(rn => {
+      ? '<div class="previa-rot">Por reunión</div>' + d.reuniones.map((rn, ri) => {
           if (rn.nota) return `<div class="dia-fila"><div><div class="dia-f">${alFechaCorta(rn.fecha)}</div>
               <div class="dia-h">${rn.hipodromo}</div></div><div class="dia-est falta">${rn.nota}</div></div>`;
           const n = rn.carreras.length, carg = rn.carreras.filter(c => c.cargada).length,
@@ -1386,15 +1383,20 @@ async function verLoQueViene(fresco){
                 comp = rn.carreras.filter(c => c.completa).length,
                 tabF = rn.carreras.reduce((s,c) => s + (c.tab_necesarias - c.tab_guardadas), 0);
           const ok = n > 0 && comp === n && pron === n;
-          const detalle = rn.carreras.map(c =>
-            `<span title="${c.corredores} corredores · tabuladas ${c.tab_guardadas}/${c.tab_necesarias}"
-                   style="display:inline-block; margin:2px 3px 0 0; padding:1px 6px; border-radius:6px; font-size:11px;
+          // Las amarillas (con tabuladas que faltan) se tocan y muestran
+          // QUÉ falta, con "Traer ahora" (Leandro, 14/10/2026).
+          const detalle = rn.carreras.map(c => {
+            const faltanC = c.tab_necesarias - c.tab_guardadas;
+            return `<span title="${c.corredores} corredores · tabuladas ${c.tab_guardadas}/${c.tab_necesarias}${faltanC ? ' · tocá para ver qué falta' : ''}"
+                   ${faltanC ? `onclick="verTabuladasDeCarrera('${rn.url}', ${c.numero}, 'tabc-${ri}')"` : ''}
+                   style="display:inline-block; margin:2px 3px 0 0; padding:1px 6px; border-radius:6px; font-size:11px; ${faltanC ? 'cursor:pointer; text-decoration:underline dotted;' : ''}
                    background:${c.completa && c.pronostico ? '#e8f4ef' : (c.cargada ? '#fff4d6' : '#fde8e8')}">
-               ${c.numero}ª${c.pronostico ? '' : ' sin pron.'}${c.tab_necesarias - c.tab_guardadas ? ' −' + (c.tab_necesarias - c.tab_guardadas) : ''}</span>`).join('');
-          return `<div class="dia-fila"><div>
+               ${c.numero}ª${c.pronostico ? '' : ' sin pron.'}${faltanC ? ' −' + faltanC : ''}</span>`; }).join('');
+          return `<div class="dia-fila" style="align-items:flex-start;"><div style="flex:1;">
               <div class="dia-f">${alFechaCorta(rn.fecha)}${rn.fecha === d.hoy ? ' · hoy' : ''}</div>
               <div class="dia-h">${rn.hipodromo} · ${carg}/${n} cargadas · ${pron}/${n} con pronóstico · ${comp}/${n} completas${tabF ? ' · faltan ' + tabF + ' tabuladas' : ''}</div>
-              <div>${detalle}</div></div>
+              <div>${detalle}</div>
+              <div id="tabc-${ri}"></div></div>
               <div class="dia-est ${ok ? 'ok' : 'falta'}">${ok ? 'lista' : 'falta'}</div></div>`;
         }).join('')
       : '<div class="progreso-txt">No hay reuniones publicadas.</div>';
@@ -1450,6 +1452,94 @@ async function traerTodo(){
   }
   document.getElementById('viene-estado').textContent = `Traídas ${bien} de ${lista.length}. Volviendo a contar…`;
   setTimeout(() => verLoQueViene(true), 1500);
+}
+
+// ---------- QUÉ TABULADAS LE FALTAN A UNA CARRERA (14/10/2026) ----------
+async function verTabuladasDeCarrera(reunion, numero, idCaja){
+  const caja = document.getElementById(idCaja);
+  if (!caja) return;
+  if (caja.dataset.abierta === numero + ''){ caja.innerHTML = ''; caja.dataset.abierta = ''; return; }   // segundo toque: cierra
+  caja.dataset.abierta = numero + '';
+  caja.innerHTML = '<div class="progreso-txt">Buscando qué le falta a la ' + numero + 'ª…</div>';
+  try{
+    const r = await fetch('/api/admin/tabuladas-de-carrera?clave=' + encodeURIComponent(clave)
+                          + '&reunion=' + encodeURIComponent(reunion) + '&numero=' + numero);
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'No se pudo');
+    window._tabc = window._tabc || {};
+    window._tabc[idCaja] = d.faltan;
+    caja.innerHTML = `<div class="previa-rot" style="margin-top:10px;">${numero}ª · ${d.PARA_LEER}</div>`
+      + (d.faltan.length ? d.faltan.map((f, i) => `
+          <div class="dia-fila" id="${idCaja}-f${i}">
+            <div><div class="dia-f">${f.caballo} · ${f.fecha} ${f.hipodromo}${f.carrera ? ' · ' + f.carrera + 'ª' : ''}${f.premio ? ' · ' + f.premio : ''}${f.distancia ? ' · ' + f.distancia + ' m' : ''}</div>
+                 <div class="dia-h">${f.motivo}</div></div>
+            <button class="btn btn-run" style="padding:6px 10px; font-size:12px;"
+                    onclick="traerUna('${idCaja}-f${i}', '${f.url}')">Traer ahora</button>
+          </div>`).join('')
+          + `<button class="btn btn-run" style="width:100%; margin-top:10px;"
+                     onclick="traerLasDeLaCarrera('${idCaja}')">Traer las ${d.faltan.length} de esta carrera, de a una</button>`
+        : '<div class="progreso-txt">No le falta ninguna.</div>');
+  }catch(e){ caja.innerHTML = '<div class="progreso-txt">No se pudo: ' + e.message + '</div>'; }
+}
+
+async function traerUna(idFila, url){
+  const fila = document.getElementById(idFila);
+  const boton = fila ? fila.querySelector('button') : null;
+  if (boton){ boton.disabled = true; boton.textContent = 'Trayendo…'; }
+  try{
+    const r = await fetch('/api/admin/traer-ahora?clave=' + encodeURIComponent(clave), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({tipo: 'tabulada', url})
+    });
+    const d = await r.json();
+    if (boton){ boton.textContent = d.ok ? '✅ Traída' : '❌ ' + (d.mensaje || 'No se pudo'); }
+    return d.ok;
+  }catch(e){
+    if (boton) boton.textContent = '❌ ' + e.message;
+    return false;
+  }
+}
+
+async function traerLasDeLaCarrera(idCaja){
+  const lista = (window._tabc && window._tabc[idCaja]) || [];
+  let bien = 0;
+  for (let i = 0; i < lista.length; i++){          // DE A UNA, como todo lo demás
+    if (await traerUna(idCaja + '-f' + i, lista[i].url)) bien++;
+  }
+  document.getElementById('viene-estado').textContent = `Traídas ${bien} de ${lista.length}. Volviendo a contar…`;
+  setTimeout(() => verLoQueViene(true), 1500);
+}
+
+// ---------- EL MOTOR, ¿ANDA? (14/10/2026) ----------
+// Si está apagado o sin latir 15 min, "Carreras listas" se abre sola con
+// el aviso y el botón para encenderlo. Cuando vuelve a latir, se pliega.
+let _listasAbiertaPorMotor = false;
+async function vigilarMotor(){
+  try{
+    const r = await fetch('/api/admin/motor?clave=' + encodeURIComponent(clave));
+    const d = await r.json();
+    if (d.ok === false) return;
+    const anda = !!(d.prendido && d.sano);
+    const aviso = document.getElementById('aviso-motor');
+    const pleg = document.getElementById('pleg-listas');
+    if (!anda){
+      aviso.style.display = 'block';
+      aviso.innerHTML = (d.prendido
+        ? `<b>El motor está prendido pero no anda</b> (último latido: ${d.latido || 'nunca'}). La búsqueda vieja está trabajando sola. `
+        : `<b>El motor está apagado.</b> La búsqueda vieja está trabajando sola. `)
+        + `<button class="btn btn-run" style="padding:6px 12px; font-size:13px; margin-left:6px;" onclick="encenderMotor()">Encender el motor</button>`;
+      if (!pleg.open){ pleg.open = true; _listasAbiertaPorMotor = true; }
+    } else {
+      aviso.style.display = 'none';
+      if (_listasAbiertaPorMotor){ pleg.open = false; _listasAbiertaPorMotor = false; }
+    }
+  }catch(e){}
+}
+async function encenderMotor(){
+  const aviso = document.getElementById('aviso-motor');
+  aviso.innerHTML = 'Encendiendo…';
+  await cambiarAjuste('motor', true);
+  setTimeout(vigilarMotor, 8000);
 }
 
 function alFechaCorta(f){
@@ -2088,8 +2178,6 @@ async function verEstado(){
   }catch(e){}
 }
 
-setInterval(verEstado, 4000);
-verEstado();
 
 cargar();
 cargarHipodromosDelDia();
@@ -2107,6 +2195,8 @@ verHistorico();
 seguirAjuste();
 verCopia();
 setInterval(verHistorico, 60000);
+vigilarMotor();
+setInterval(vigilarMotor, 60000);
 </script>
 </body>
 </html>
