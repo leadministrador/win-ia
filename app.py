@@ -11444,6 +11444,73 @@ def admin_lo_que_viene():
     return jsonify(resumen_lo_que_viene())
 
 
+@app.get("/api/admin/tabuladas-de-carrera")
+def admin_tabuladas_de_carrera():
+    """
+    Que tabuladas le faltan a UNA carrera de las que vienen (Leandro,
+    14/10/2026: "que se pueda buscar las que faltan"). Por cada corredor,
+    las carreras de su campaña que no estan en el historico con llegada.
+    0 pedidos al sitio: se lee lo guardado. Cada fila trae el link para
+    "Traer ahora".
+    """
+    if not es_admin():
+        return jsonify(ok=False, error="Acceso restringido."), 403
+    reunion = request.args.get("reunion", "").strip()
+    numero = request.args.get("numero", "").strip()
+    if not reunion.startswith(BASE) or not numero.isdigit():
+        return jsonify(ok=False, error="Datos inválidos."), 400
+    data = lo_guardado(f"carrera:{reunion}:{int(numero)}")
+    if not data:
+        return jsonify(ok=True, faltan=[], guardadas=0, nota="carrera todavía no cargada")
+    con = db()
+    motivos = {f["clave"][len("falla:"):]: f["valor"] for f in con.execute(
+        "SELECT clave, valor FROM ajustes WHERE clave LIKE 'falla:%'").fetchall()}
+    faltan, guardadas, vistos = [], 0, set()
+    for p in data.get("participantes", []):
+        perfil = p.get("perfil", "")
+        if p.get("retirado") or not perfil:
+            continue
+        ficha = con.execute("SELECT carreras FROM fichas WHERE perfil=?", (perfil,)).fetchone()
+        if not ficha:
+            continue
+        try:
+            camp = json.loads(ficha["carreras"] or "[]")
+        except Exception:
+            camp = []
+        for x in camp:
+            url = _url_canonica(x.get("enlace") or "")
+            if not url.startswith("http") or url in vistos:
+                continue
+            vistos.add(url)
+            f = con.execute("SELECT participantes FROM historico WHERE url=?", (url,)).fetchone()
+            tiene = False
+            if f and f["participantes"]:
+                try:
+                    tiene = any(q.get("puesto") for q in json.loads(f["participantes"]))
+                except Exception:
+                    tiene = False
+            if tiene:
+                guardadas += 1
+                continue
+            cola = con.execute("SELECT intentos, hecho FROM por_explorar WHERE url=?", (url,)).fetchone()
+            intentos = (cola["intentos"] or 0) if cola else 0
+            motivo = motivos.get(url[-60:], "")
+            if "404" in motivo:
+                motivo = "el Stud Book contesta 404 (link roto en el sitio)"
+            elif not motivo:
+                motivo = "todavía no se pidió (el motor la trae de 0 a 7 h)" if intentos == 0 else f"{intentos} intento(s)"
+            faltan.append({
+                "caballo": p.get("nombre", ""), "fecha": x.get("fecha", ""),
+                "hipodromo": x.get("hipodromo", ""),
+                "carrera": x.get("reunion", ""), "premio": x.get("premio", ""),
+                "distancia": x.get("distancia", ""), "url": url,
+                "intentos": intentos, "motivo": motivo,
+            })
+    con.close()
+    return jsonify(ok=True, faltan=faltan, guardadas=guardadas,
+                   PARA_LEER=f"{len(faltan)} tabuladas por traer · {guardadas} guardadas")
+
+
 @app.post("/api/admin/traer-ahora")
 def admin_traer_ahora():
     """
