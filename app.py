@@ -11361,6 +11361,10 @@ def resumen_lo_que_viene():
             data = lo_guardado(f"carrera:{bloque['url']}:{c['numero']}")
             fc = {"numero": c["numero"], "hora": c.get("hora", ""), "cargada": bool(data),
                   "pronostico": False, "corredores": 0, "tab_necesarias": 0, "tab_guardadas": 0}
+            # Una tabulada es UNA carrera: si dos corredores de esta carrera
+            # corrieron juntos antes, se cuenta una vez (MEDIDO 14/10/2026:
+            # el chip decia "-2" y la lista "1 por traer").
+            vistos_en_carrera = set()
             if data:
                 tot["cargadas"] += 1
                 listo = lo_guardado(f"listo:{bloque['url']}:{c['numero']}")
@@ -11397,8 +11401,9 @@ def resumen_lo_que_viene():
                         camp = []
                     for x in camp:
                         url = _url_canonica(x.get("enlace") or "")
-                        if not url.startswith("http"):
+                        if not url.startswith("http") or url in vistos_en_carrera:
                             continue
+                        vistos_en_carrera.add(url)
                         fc["tab_necesarias"] += 1
                         if url in con_puestos:
                             fc["tab_guardadas"] += 1
@@ -11542,9 +11547,13 @@ def admin_traer_ahora():
     con = db()
     motivo = con.execute("SELECT valor FROM ajustes WHERE clave=?", (f"falla:{url[-60:]}",)).fetchone()
     con.close()
+    texto = motivo["valor"] if motivo else "sin motivo"
+    if "404" in texto:
+        texto = "El Stud Book contesta 404 (link roto en el sitio). No se puede traer por este link."
+    elif "no se pudo conectar" in texto or "tardo demasiado" in texto:
+        texto = "El Stud Book no contestó (corte del sitio). Probá de nuevo en un rato."
     return jsonify(ok=bien, url=url,
-                   mensaje="Traída y cargada." if bien else
-                           f"No se pudo: {(motivo['valor'] if motivo else 'sin motivo')}")
+                   mensaje="Traída y cargada." if bien else f"No se pudo: {texto}")
 
 
 def avisar_a_los_admins(titulo, cuerpo, url="/admin"):
