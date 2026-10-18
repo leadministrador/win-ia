@@ -1725,6 +1725,34 @@
     background:var(--naranja); color:#fff; font-weight:800; font-size:15px;
   }
   .mini-video{ background:#141414; color:#fff; padding:3px 8px; border-radius:6px; font-size:14px; white-space:nowrap; }
+
+  /* ---------- CAMPANITA DE ANUNCIOS (18/10/2026, pedido de Leandro) ----------
+     Aparece solo si hay un anuncio vigente. Punto rojo hasta que se toca. */
+  .campana-anuncio{
+    margin-left:auto; position:relative; display:none;
+    width:44px; height:44px; border-radius:50%;
+    background:#fff; align-items:center; justify-content:center;
+    box-shadow:0 2px 8px rgba(0,0,0,.18); text-decoration:none;
+  }
+  .campana-anuncio.ver{ display:flex; }
+  /* En celular el dibujo del jinete va arriba a la derecha: la campanita
+     se pone pegada a la marca para no taparlo. */
+  @media (max-width:720px){
+    .campana-anuncio{ margin-left:14px; width:38px; height:38px; }
+    .campana-anuncio svg{ width:21px; height:21px; }
+  }
+  .campana-anuncio svg{ width:24px; height:24px; fill:#d81e2c; }
+  .campana-anuncio .punto-rojo{
+    position:absolute; top:3px; right:3px; width:12px; height:12px;
+    border-radius:50%; background:#d81e2c; border:2px solid #fff; display:none;
+    padding:0; box-sizing:border-box;   /* que no le pegue el estilo de "IA" */
+  }
+  .campana-anuncio.nuevo .punto-rojo{ display:block; }
+  .campana-anuncio.nuevo svg{ animation:campanear 1.6s ease-in-out 3; transform-origin:50% 10%; }
+  @keyframes campanear{
+    0%,60%,100%{ transform:rotate(0); } 15%{ transform:rotate(14deg); }
+    30%{ transform:rotate(-12deg); } 45%{ transform:rotate(6deg); }
+  }
 </style>
 </head>
 <body>
@@ -1738,7 +1766,13 @@
     </div>
   </div>
   <div class="hero-inner">
-    <div class="brand">LEA WIN <span>IA</span></div>
+    <div class="brand">LEA WIN <span>IA</span>
+      <a class="campana-anuncio" id="campana-anuncio" href="/aviso?ir=%2F"
+         aria-label="Ver el anuncio" onclick="marcarAnuncioVisto()">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2z"/></svg>
+        <span class="punto-rojo"></span>
+      </a>
+    </div>
     <div class="eyebrow">San Isidro · Palermo · La Plata</div>
     <h1>Lea la carrera<br><em>antes</em> de la carrera</h1>
     <p>Calendario oficial, fichas de cada ejemplar con su campaña completa, y un pronóstico transparente de los primeros cuatro puestos apenas se publica la reunión.</p>
@@ -4786,6 +4820,27 @@ function cerrarElVivo(){
   vivoAbierto = false;
 }
 
+// ---------- Campanita de anuncios ----------
+// Se muestra solo si hay un anuncio vigente. El "ya lo vi" queda en el
+// navegador de cada usuario (si borra los datos, el punto vuelve).
+let claveAnuncio = '';
+async function verAnuncio(){
+  const c = document.getElementById('campana-anuncio');
+  if (!c) return;
+  try{
+    const d = await apiGet('/api/anuncio');
+    if (!d.hay || !d.anuncio){ c.classList.remove('ver','nuevo'); return; }
+    claveAnuncio = String(d.anuncio.id || '') + '|' + (d.anuncio.creado_en || '');
+    let visto = '';
+    try{ visto = localStorage.getItem('anuncio_visto') || ''; }catch(e){}
+    c.classList.add('ver');
+    c.classList.toggle('nuevo', visto !== claveAnuncio);
+  }catch(e){ c.classList.remove('ver','nuevo'); }
+}
+function marcarAnuncioVisto(){
+  try{ if (claveAnuncio) localStorage.setItem('anuncio_visto', claveAnuncio); }catch(e){}
+}
+
 // ---------- Arranque ----------
 cargarCalendario();
 iniciarBuscador();
@@ -4793,6 +4848,7 @@ verQuienSoy().then(verSiSoyAdmin);
 verEstadoRegistro();
 iniciarBotonAtras();
 iniciarAvisos();
+verAnuncio();
 </script>
 </body>
 </html>
