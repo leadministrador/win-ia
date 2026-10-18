@@ -6622,8 +6622,10 @@ def manifiesto():
         "description": "Pronóstico de carreras del Stud Book Argentino",
         "start_url": "/",
         "display": "standalone",
-        "background_color": "#153832",
-        "theme_color": "#153832",
+        # 18/10/2026: naranja (antes verde #153832). El fondo es el mismo
+        # naranja del icono, asi la pantalla de arranque se ve toda naranja.
+        "background_color": "#ff8c00",
+        "theme_color": "#e8620c",
         "orientation": "portrait",
         "icons": [
             {"src": "/static/icono-192.png", "sizes": "192x192", "type": "image/png"},
