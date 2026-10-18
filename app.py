@@ -6557,11 +6557,12 @@ def admin_avisar_a_todos():
 
 @app.post("/api/admin/probar-aviso")
 def admin_probar_aviso():
-    """Manda un aviso de prueba a los celulares del admin."""
+    """Manda un aviso de prueba a TODOS los celulares suscriptos
+    (pedido de Leandro 18/10/2026; antes iba a los ultimos 3 de cualquiera)."""
     if not es_admin():
         return jsonify(ok=False, error="Acceso restringido."), 403
     con = db()
-    subs = con.execute("SELECT * FROM suscripciones ORDER BY creada_en DESC LIMIT 3").fetchall()
+    subs = con.execute("SELECT * FROM suscripciones ORDER BY creada_en DESC").fetchall()
     con.close()
     if not subs:
         return jsonify(ok=False,
